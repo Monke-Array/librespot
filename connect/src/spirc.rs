@@ -136,6 +136,51 @@ enum SpircCommand {
 
 const CONTEXT_FETCH_THRESHOLD: usize = 2;
 
+#[derive(Debug, PartialEq, Eq)]
+enum PlayerQueueAction {
+    Ignore,
+    Continue,
+    Preserve,
+    Advance,
+    Unavailable { track_id: SpotifyUri, advance: bool },
+}
+
+fn player_queue_action(
+    event: &PlayerEvent,
+    play_request_id: &mut Option<u64>,
+    current_uri: &str,
+) -> Result<PlayerQueueAction, Error> {
+    let is_current_request = matches! {
+        (event.get_play_request_id(), *play_request_id),
+        (Some(event_id), Some(current_id)) if event_id == current_id
+    };
+
+    if !is_current_request {
+        return Ok(PlayerQueueAction::Ignore);
+    }
+
+    Ok(match event {
+        PlayerEvent::EndOfTrack { .. } => {
+            // Consume the request before advancing. A duplicate terminal event is then stale even
+            // if the next Player command has not published its request id yet.
+            *play_request_id = None;
+            PlayerQueueAction::Advance
+        }
+        PlayerEvent::Unavailable { track_id, .. } => {
+            let advance = track_id.to_uri()? == current_uri;
+            if advance {
+                *play_request_id = None;
+            }
+            PlayerQueueAction::Unavailable {
+                track_id: track_id.clone(),
+                advance,
+            }
+        }
+        PlayerEvent::LoadFailed { .. } => PlayerQueueAction::Preserve,
+        _ => PlayerQueueAction::Continue,
+    })
+}
+
 // delay to update volume after a certain amount of time, instead on each update request
 const VOLUME_UPDATE_DELAY: Duration = Duration::from_millis(500);
 // to reduce updates to remote, we group some request by waiting for a set amount of time
@@ -697,28 +742,50 @@ impl SpircTask {
             return Ok(());
         }
 
-        let is_current_track = matches! {
-            (event.get_play_request_id(), self.play_request_id),
-            (Some(event_id), Some(current_id)) if event_id == current_id
-        };
-
         // we only process events if the play_request_id matches. If it doesn't, it is
         // an event that belongs to a previous track and only arrives now due to a race
         // condition. In this case we have updated the state already and don't want to
         // mess with it.
-        if !is_current_track {
-            return Ok(());
-        }
-
-        match event {
-            PlayerEvent::EndOfTrack { .. } => {
+        let current_uri = self.connect_state.current_track(|track| track.uri.clone());
+        match player_queue_action(&event, &mut self.play_request_id, &current_uri)? {
+            PlayerQueueAction::Ignore => return Ok(()),
+            PlayerQueueAction::Preserve => {
+                if let PlayerEvent::LoadFailed {
+                    track_id,
+                    error,
+                    is_preload,
+                    ..
+                } = event
+                {
+                    warn!(
+                        "{} of <{track_id}> failed with {error:?}; preserving the queue",
+                        if is_preload { "preload" } else { "load" }
+                    );
+                }
+                return Ok(());
+            }
+            PlayerQueueAction::Advance => {
                 let next_track = self
                     .connect_state
                     .repeat_track()
                     .then(|| self.connect_state.current_track(|t| t.uri.clone()));
 
-                self.handle_next(next_track)?
+                self.handle_next(next_track)?;
+                self.update_state = true;
+                return Ok(());
             }
+            PlayerQueueAction::Unavailable { track_id, advance } => {
+                self.handle_unavailable(&track_id)?;
+                if advance {
+                    self.handle_next(None)?;
+                }
+                self.update_state = true;
+                return Ok(());
+            }
+            PlayerQueueAction::Continue => (),
+        }
+
+        match event {
             PlayerEvent::Loading { .. } => match self.play_status {
                 SpircPlayStatus::LoadingPlay { position_ms } => {
                     self.connect_state
@@ -803,12 +870,6 @@ impl SpircTask {
             PlayerEvent::TimeToPreloadNextTrack { .. } => {
                 self.handle_preload_next_track();
                 return Ok(());
-            }
-            PlayerEvent::Unavailable { track_id, .. } => {
-                self.handle_unavailable(&track_id)?;
-                if self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri()? {
-                    self.handle_next(None)?
-                }
             }
             _ => return Ok(()),
         }
@@ -1826,5 +1887,119 @@ impl SpircTask {
 impl Drop for SpircTask {
     fn drop(&mut self) {
         debug!("drop Spirc[{}]", self.spirc_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::playback::player::PlayerLoadErrorKind;
+
+    const CURRENT_URI: &str = "spotify:track:2TpxZ7JUBn3uw46aR7qd6V";
+    const NEXT_URI: &str = "spotify:track:4cOdK2wGLETKBW3PvgPWqT";
+    const LATER_URI: &str = "spotify:track:7ouMYWpwJ422jRcDASZB7P";
+
+    fn uri(value: &str) -> SpotifyUri {
+        SpotifyUri::from_uri(value).expect("test URI should be valid")
+    }
+
+    fn transient_event(track_id: SpotifyUri, is_preload: bool) -> PlayerEvent {
+        PlayerEvent::LoadFailed {
+            play_request_id: 7,
+            track_id,
+            error: PlayerLoadErrorKind::TransientNetwork,
+            is_preload,
+        }
+    }
+
+    #[test]
+    fn transient_current_load_failure_does_not_advance_queue() {
+        let mut play_request_id = Some(7);
+        let queue = vec![CURRENT_URI, NEXT_URI, LATER_URI];
+
+        let action = player_queue_action(
+            &transient_event(uri(CURRENT_URI), false),
+            &mut play_request_id,
+            CURRENT_URI,
+        )
+        .expect("event classification should succeed");
+
+        assert_eq!(action, PlayerQueueAction::Preserve);
+        assert_eq!(play_request_id, Some(7));
+        assert_eq!(queue, vec![CURRENT_URI, NEXT_URI, LATER_URI]);
+    }
+
+    #[test]
+    fn transient_preload_failure_does_not_poison_upcoming_tracks() {
+        let mut play_request_id = Some(7);
+        let upcoming = vec![NEXT_URI, LATER_URI];
+
+        let action = player_queue_action(
+            &transient_event(uri(NEXT_URI), true),
+            &mut play_request_id,
+            CURRENT_URI,
+        )
+        .expect("event classification should succeed");
+
+        assert_eq!(action, PlayerQueueAction::Preserve);
+        assert_eq!(play_request_id, Some(7));
+        assert_eq!(upcoming, vec![NEXT_URI, LATER_URI]);
+    }
+
+    #[test]
+    fn permanent_unavailable_current_track_advances_once() {
+        let mut play_request_id = Some(7);
+        let event = PlayerEvent::Unavailable {
+            play_request_id: 7,
+            track_id: uri(CURRENT_URI),
+        };
+
+        let action = player_queue_action(&event, &mut play_request_id, CURRENT_URI)
+            .expect("event classification should succeed");
+
+        assert!(matches!(
+            action,
+            PlayerQueueAction::Unavailable { advance: true, .. }
+        ));
+        assert_eq!(play_request_id, None);
+    }
+
+    #[test]
+    fn duplicate_terminal_event_does_not_advance_twice() {
+        let mut play_request_id = Some(7);
+        let event = PlayerEvent::Unavailable {
+            play_request_id: 7,
+            track_id: uri(CURRENT_URI),
+        };
+        let mut advances = 0;
+
+        for _ in 0..2 {
+            let action = player_queue_action(&event, &mut play_request_id, CURRENT_URI)
+                .expect("event classification should succeed");
+            if matches!(action, PlayerQueueAction::Unavailable { advance: true, .. }) {
+                advances += 1;
+            }
+        }
+
+        assert_eq!(advances, 1);
+    }
+
+    #[test]
+    fn transient_event_preserves_current_uri_and_queue_position() {
+        let mut play_request_id = Some(7);
+        let current_uri = CURRENT_URI.to_owned();
+        let queue_position = 11;
+
+        let action = player_queue_action(
+            &transient_event(uri(CURRENT_URI), false),
+            &mut play_request_id,
+            &current_uri,
+        )
+        .expect("event classification should succeed");
+
+        assert_eq!(action, PlayerQueueAction::Preserve);
+        assert_eq!(current_uri, CURRENT_URI);
+        assert_eq!(queue_position, 11);
+        assert_eq!(play_request_id, Some(7));
     }
 }
