@@ -4,7 +4,7 @@ use std::{
     slice::Iter,
 };
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Range {
     pub start: usize,
     pub length: usize,

@@ -73,7 +73,7 @@ impl CdnUrl {
 
         let cdn_url = Self { file_id, urls };
 
-        trace!("Resolved CDN storage: {cdn_url:#?}");
+        trace!("Resolved {} CDN storage candidates", cdn_url.urls.len());
 
         Ok(cdn_url)
     }
@@ -201,12 +201,10 @@ impl TryFrom<CdnUrlMessage> for MaybeExpiringUrls {
                                 expiry = Some(Date::from(with_margin));
                             }
                         } else {
-                            warn!(
-                                "Cannot parse CDN URL expiry timestamp '{exp_str}' from '{cdn_url}'"
-                            );
+                            warn!("Cannot parse CDN URL expiry timestamp '{exp_str}'");
                         }
                     } else {
-                        warn!("Unknown CDN URL format: {cdn_url}");
+                        warn!("Unknown CDN URL format; treating it as non-expiring");
                     }
                 }
                 Ok(MaybeExpiringUrl(cdn_url.to_owned(), expiry))

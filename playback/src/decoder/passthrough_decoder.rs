@@ -14,16 +14,21 @@ use crate::{
     metadata::audio::{AudioFileFormat, AudioFiles},
 };
 
+fn map_ogg_read_error(error: OggReadError) -> DecoderError {
+    match error {
+        OggReadError::ReadError(error) => DecoderError::from_io(error),
+        error => DecoderError::PassthroughDecoder(error.to_string()),
+    }
+}
+
 fn get_header<T>(code: u8, rdr: &mut PacketReader<T>) -> DecoderResult<Vec<u8>>
 where
     T: Read + Seek,
 {
-    let pck: Packet = rdr
-        .read_packet_expected()
-        .map_err(|e| DecoderError::PassthroughDecoder(e.to_string()))?;
+    let pck: Packet = rdr.read_packet_expected().map_err(map_ogg_read_error)?;
 
     let pkt_type = pck.data[0];
-    debug!("Vorbis header type {}", &pkt_type);
+    debug!("Vorbis header type {}", pkt_type);
 
     if pkt_type != code {
         return Err(DecoderError::PassthroughDecoder("Invalid Data".into()));
@@ -117,10 +122,7 @@ impl<R: Read + Seek> AudioDecoder for PassthroughDecoder<R> {
         match self.rdr.seek_absgp(None, absgp) {
             Ok(_) => {
                 // need to set some offset for next_page()
-                let pck = self
-                    .rdr
-                    .read_packet()
-                    .map_err(|e| DecoderError::PassthroughDecoder(e.to_string()))?;
+                let pck = self.rdr.read_packet().map_err(map_ogg_read_error)?;
                 match pck {
                     Some(pck) => {
                         let new_page = pck.absgp_page();
@@ -132,7 +134,7 @@ impl<R: Read + Seek> AudioDecoder for PassthroughDecoder<R> {
                     None => Err(DecoderError::PassthroughDecoder("Packet is None".into())),
                 }
             }
-            Err(e) => Err(DecoderError::PassthroughDecoder(e.to_string())),
+            Err(e) => Err(map_ogg_read_error(e)),
         }
     }
 
@@ -174,7 +176,7 @@ impl<R: Read + Seek> AudioDecoder for PassthroughDecoder<R> {
                     info!("end of streaming");
                     return Ok(None);
                 }
-                Err(e) => return Err(DecoderError::PassthroughDecoder(e.to_string())),
+                Err(e) => return Err(map_ogg_read_error(e)),
             };
 
             let pckgp_page = pck.absgp_page();

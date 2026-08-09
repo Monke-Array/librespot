@@ -1,6 +1,6 @@
 use crate::{
     LoadContextOptions, LoadRequestOptions, PlayContext,
-    context_resolver::{ContextAction, ContextResolver, ResolveContext},
+    context_resolver::{ContextAction, ContextFailureKind, ContextResolver, ResolveContext},
     core::{
         Error, Session, SpotifyUri,
         authentication::Credentials,
@@ -41,7 +41,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::{sync::mpsc, time::sleep};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::sleep,
+};
 
 #[derive(Debug, Error)]
 enum SpircError {
@@ -96,6 +99,8 @@ struct SpircTask {
 
     shutdown: bool,
     session: Session,
+    credentials: Credentials,
+    retain_on_session_failure: bool,
 
     /// is set when transferring, and used after resolving the contexts to finish the transfer
     pub transfer_state: Option<TransferState>,
@@ -113,7 +118,6 @@ struct SpircTask {
 
 static SPIRC_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Debug)]
 enum SpircCommand {
     Play,
     PlayPause,
@@ -126,12 +130,55 @@ enum SpircCommand {
     Shuffle(bool),
     Repeat(bool),
     RepeatTrack(bool),
-    Disconnect { pause: bool },
+    Disconnect {
+        pause: bool,
+    },
     SetPosition(u32),
     SetVolume(u16),
     Activate,
     Transfer(Option<TransferRequest>),
     Load(LoadRequest),
+    ReplaceSession {
+        session: Session,
+        result: oneshot::Sender<Result<(), Error>>,
+    },
+}
+
+impl SpircCommand {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Play => "Play",
+            Self::PlayPause => "PlayPause",
+            Self::Pause => "Pause",
+            Self::Prev => "Prev",
+            Self::Next => "Next",
+            Self::VolumeUp => "VolumeUp",
+            Self::VolumeDown => "VolumeDown",
+            Self::Shutdown => "Shutdown",
+            Self::Shuffle(_) => "Shuffle",
+            Self::Repeat(_) => "Repeat",
+            Self::RepeatTrack(_) => "RepeatTrack",
+            Self::Disconnect { .. } => "Disconnect",
+            Self::SetPosition(_) => "SetPosition",
+            Self::SetVolume(_) => "SetVolume",
+            Self::Activate => "Activate",
+            Self::Transfer(_) => "Transfer",
+            Self::Load(_) => "Load",
+            Self::ReplaceSession { .. } => "ReplaceSession",
+        }
+    }
+}
+
+struct SpircSessionBindings {
+    connection_id_update: BoxedStreamResult<String>,
+    connect_state_update: BoxedStreamResult<ClusterUpdate>,
+    connect_state_volume_update: BoxedStreamResult<SetVolumeCommand>,
+    connect_state_logout_request: BoxedStreamResult<LogoutCommand>,
+    playlist_update: BoxedStreamResult<PlaylistModificationInfo>,
+    session_update: BoxedStreamResult<FallbackWrapper<SessionUpdate>>,
+    connect_state_command: BoxedStream<RequestReply>,
+    user_attributes_update: BoxedStreamResult<UserAttributesUpdate>,
+    user_attributes_mutation: BoxedStreamResult<UserAttributesMutation>,
 }
 
 const CONTEXT_FETCH_THRESHOLD: usize = 2;
@@ -205,64 +252,37 @@ impl Spirc {
         player: Arc<Player>,
         mixer: Arc<dyn Mixer>,
     ) -> Result<(Spirc, impl Future<Output = ()>), Error> {
-        fn extract_connection_id(msg: Message) -> Result<String, Error> {
-            let connection_id = msg
-                .headers
-                .get("Spotify-Connection-Id")
-                .ok_or_else(|| SpircError::InvalidUri(msg.uri.clone()))?;
-            Ok(connection_id.to_owned())
-        }
+        Self::new_inner(config, session, credentials, player, mixer, false).await
+    }
 
+    /// Initializes a Connect device whose Player and Connect state can survive AP replacement.
+    ///
+    /// Unlike [`Spirc::new`], the returned task remains alive when its Session fails and waits for
+    /// [`Spirc::replace_session`]. Consumers must monitor their current Session and provide a new,
+    /// unconnected Session when it becomes invalid.
+    pub async fn new_reconnectable(
+        config: ConnectConfig,
+        session: Session,
+        credentials: Credentials,
+        player: Arc<Player>,
+        mixer: Arc<dyn Mixer>,
+    ) -> Result<(Spirc, impl Future<Output = ()>), Error> {
+        Self::new_inner(config, session, credentials, player, mixer, true).await
+    }
+
+    async fn new_inner(
+        config: ConnectConfig,
+        session: Session,
+        credentials: Credentials,
+        player: Arc<Player>,
+        mixer: Arc<dyn Mixer>,
+        retain_on_session_failure: bool,
+    ) -> Result<(Spirc, impl Future<Output = ()>), Error> {
         let spirc_id = SPIRC_COUNTER.fetch_add(1, Ordering::AcqRel);
         debug!("new Spirc[{spirc_id}]");
 
         let connect_state = ConnectState::new(config, &session);
-
-        let connection_id_update = session
-            .dealer()
-            .listen_for("hm://pusher/v1/connections/", extract_connection_id)?;
-
-        let connect_state_update = session
-            .dealer()
-            .listen_for("hm://connect-state/v1/cluster", Message::from_raw)?;
-
-        let connect_state_volume_update = session
-            .dealer()
-            .listen_for("hm://connect-state/v1/connect/volume", Message::from_raw)?;
-
-        let connect_state_logout_request = session
-            .dealer()
-            .listen_for("hm://connect-state/v1/connect/logout", Message::from_raw)?;
-
-        let playlist_update = session
-            .dealer()
-            .listen_for("hm://playlist/v2/playlist/", Message::from_raw)?;
-
-        let session_update = session
-            .dealer()
-            .listen_for("social-connect/v2/session_update", Message::try_from_json)?;
-
-        let user_attributes_update = session
-            .dealer()
-            .listen_for("spotify:user:attributes:update", Message::from_raw)?;
-
-        // can be trigger by toggling autoplay in a desktop client
-        let user_attributes_mutation = session
-            .dealer()
-            .listen_for("spotify:user:attributes:mutated", Message::from_raw)?;
-
-        let connect_state_command = session
-            .dealer()
-            .handle_for("hm://connect-state/v1/player/command")?;
-
-        // pre-acquire client_token, preventing multiple request while running
-        let _ = session.spclient().client_token().await?;
-
-        // Connect *after* all message listeners are registered
-        session.connect(credentials, true).await?;
-
-        // pre-acquire access_token (we need to be authenticated to retrieve a token)
-        let _ = session.login5().auth_token().await?;
+        let bindings = SpircTask::connect_session(&session, credentials.clone()).await?;
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
@@ -278,15 +298,15 @@ impl Spirc {
             play_request_id: None,
             play_status: SpircPlayStatus::Stopped,
 
-            connection_id_update,
-            connect_state_update,
-            connect_state_volume_update,
-            connect_state_logout_request,
-            playlist_update,
-            session_update,
-            connect_state_command,
-            user_attributes_update,
-            user_attributes_mutation,
+            connection_id_update: bindings.connection_id_update,
+            connect_state_update: bindings.connect_state_update,
+            connect_state_volume_update: bindings.connect_state_volume_update,
+            connect_state_logout_request: bindings.connect_state_logout_request,
+            playlist_update: bindings.playlist_update,
+            session_update: bindings.session_update,
+            connect_state_command: bindings.connect_state_command,
+            user_attributes_update: bindings.user_attributes_update,
+            user_attributes_mutation: bindings.user_attributes_mutation,
             commands: Some(cmd_rx),
             player_events: Some(player_events),
 
@@ -294,6 +314,8 @@ impl Spirc {
 
             shutdown: false,
             session,
+            credentials,
+            retain_on_session_failure,
 
             transfer_state: None,
             update_volume: false,
@@ -318,6 +340,20 @@ impl Spirc {
         };
 
         Ok((spirc, task.run()))
+    }
+
+    /// Replace a failed AP session without reconstructing the player or Connect state.
+    ///
+    /// The Spirc task keeps its queue, context, play request, transfer, and playback bookkeeping.
+    /// The replacement session is authenticated with the credentials used to create this Spirc,
+    /// then installed into both Spirc and the retained [`Player`].
+    pub async fn replace_session(&self, session: Session) -> Result<(), Error> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.commands.send(SpircCommand::ReplaceSession {
+            session,
+            result: result_tx,
+        })?;
+        result_rx.await?
     }
 
     /// Safely shutdowns the spirc.
@@ -457,7 +493,102 @@ impl Spirc {
     }
 }
 
+fn extract_connection_id(msg: Message) -> Result<String, Error> {
+    let connection_id = msg
+        .headers
+        .get("Spotify-Connection-Id")
+        .ok_or_else(|| SpircError::InvalidUri(msg.uri.clone()))?;
+    Ok(connection_id.to_owned())
+}
+
+fn preserve_session_identity(current: &Session, replacement: &Session) {
+    replacement.set_session_id(&current.session_id());
+}
+
 impl SpircTask {
+    async fn connect_session(
+        session: &Session,
+        credentials: Credentials,
+    ) -> Result<SpircSessionBindings, Error> {
+        let bindings = SpircSessionBindings {
+            connection_id_update: session
+                .dealer()
+                .listen_for("hm://pusher/v1/connections/", extract_connection_id)?,
+            connect_state_update: session
+                .dealer()
+                .listen_for("hm://connect-state/v1/cluster", Message::from_raw)?,
+            connect_state_volume_update: session
+                .dealer()
+                .listen_for("hm://connect-state/v1/connect/volume", Message::from_raw)?,
+            connect_state_logout_request: session
+                .dealer()
+                .listen_for("hm://connect-state/v1/connect/logout", Message::from_raw)?,
+            playlist_update: session
+                .dealer()
+                .listen_for("hm://playlist/v2/playlist/", Message::from_raw)?,
+            session_update: session
+                .dealer()
+                .listen_for("social-connect/v2/session_update", Message::try_from_json)?,
+            connect_state_command: session
+                .dealer()
+                .handle_for("hm://connect-state/v1/player/command")?,
+            user_attributes_update: session
+                .dealer()
+                .listen_for("spotify:user:attributes:update", Message::from_raw)?,
+            user_attributes_mutation: session
+                .dealer()
+                .listen_for("spotify:user:attributes:mutated", Message::from_raw)?,
+        };
+
+        // Pre-acquire client_token, preventing multiple requests while running.
+        let _ = session.spclient().client_token().await?;
+
+        // Connect only after all Dealer message listeners are registered.
+        session.connect(credentials, true).await?;
+
+        // Pre-acquire access_token after authentication.
+        let _ = session.login5().auth_token().await?;
+
+        Ok(bindings)
+    }
+
+    async fn replace_session(&mut self, session: Session) -> Result<(), Error> {
+        preserve_session_identity(&self.session, &session);
+
+        let bindings = match Self::connect_session(&session, self.credentials.clone()).await {
+            Ok(bindings) => bindings,
+            Err(why) => {
+                session.shutdown();
+                return Err(why);
+            }
+        };
+        if let Err(why) = session.dealer().start().await {
+            session.shutdown();
+            return Err(why);
+        }
+
+        if !self.session.is_invalid() {
+            self.session.shutdown();
+        }
+
+        self.player.set_session(session.clone());
+        self.context_resolver.set_session(session.clone());
+        self.connection_id_update = bindings.connection_id_update;
+        self.connect_state_update = bindings.connect_state_update;
+        self.connect_state_volume_update = bindings.connect_state_volume_update;
+        self.connect_state_logout_request = bindings.connect_state_logout_request;
+        self.playlist_update = bindings.playlist_update;
+        self.session_update = bindings.session_update;
+        self.connect_state_command = bindings.connect_state_command;
+        self.user_attributes_update = bindings.user_attributes_update;
+        self.user_attributes_mutation = bindings.user_attributes_mutation;
+        self.session = session;
+        self.connect_established = false;
+
+        debug!("Spirc session replaced in place; retained Connect state and player recovery state");
+        Ok(())
+    }
+
     async fn run(mut self) {
         // simplify unwrapping of received item or parsed result
         macro_rules! unwrap {
@@ -480,146 +611,202 @@ impl SpircTask {
 
         if let Err(why) = self.session.dealer().start().await {
             error!("starting dealer failed: {why}");
-            return;
+            self.session.shutdown();
         }
 
-        while !self.session.is_invalid() && !self.shutdown {
-            let commands = self.commands.as_mut();
-            let player_events = self.player_events.as_mut();
+        'session: loop {
+            while !self.session.is_invalid() && !self.shutdown {
+                let commands = self.commands.as_mut();
+                let player_events = self.player_events.as_mut();
 
-            // when state and volume update have a higher priority than context resolving
-            // because of that the context resolving has to wait, so that the other tasks can finish
-            let allow_context_resolving = !self.update_state && !self.update_volume;
+                // when state and volume update have a higher priority than context resolving
+                // because of that the context resolving has to wait, so that the other tasks can finish
+                let allow_context_resolving = !self.update_state && !self.update_volume;
 
-            tokio::select! {
-                // startup of the dealer requires a connection_id, which is retrieved at the very beginning
-                connection_id_update = self.connection_id_update.next() => unwrap! {
-                    connection_id_update,
-                    match |connection_id| if let Err(why) = self.handle_connection_id_update(connection_id).await {
-                        error!("failed handling connection id update: {why}");
-                        break;
-                    }
-                },
-                // main dealer update of any remote device updates
-                cluster_update = self.connect_state_update.next() => unwrap! {
-                    cluster_update,
-                    match |cluster_update| if let Err(e) = self.handle_cluster_update(cluster_update).await {
-                        error!("could not dispatch connect state update: {e}");
-                    }
-                },
-                // main dealer request handling (dealer expects an answer)
-                request = self.connect_state_command.next() => unwrap! {
-                    request,
-                    |request| if let Err(e) = self.handle_connect_state_request(request).await {
-                        error!("couldn't handle connect state command: {e}");
-                    }
-                },
-                // volume request handling is send separately (it's more like a fire forget)
-                volume_update = self.connect_state_volume_update.next() => unwrap! {
-                    volume_update,
-                    match |volume_update| match volume_update.volume.try_into() {
-                        Ok(volume) => self.set_volume(volume),
-                        Err(why) => error!("can't update volume, failed to parse i32 to u16: {why}")
-                    }
-                },
-                logout_request = self.connect_state_logout_request.next() => unwrap! {
-                    logout_request,
-                    |logout_request| {
-                        error!("received logout request, currently not supported: {logout_request:#?}");
-                        // todo: call logout handling
-                    }
-                },
-                playlist_update = self.playlist_update.next() => unwrap! {
-                    playlist_update,
-                    match |playlist_update| if let Err(why) = self.handle_playlist_modification(playlist_update) {
-                        error!("failed to handle playlist modification: {why}")
-                    }
-                },
-                user_attributes_update = self.user_attributes_update.next() => unwrap! {
-                    user_attributes_update,
-                    match |attributes| self.handle_user_attributes_update(attributes)
-                },
-                user_attributes_mutation = self.user_attributes_mutation.next() => unwrap! {
-                    user_attributes_mutation,
-                    match |attributes| self.handle_user_attributes_mutation(attributes)
-                },
-                session_update = self.session_update.next() => unwrap! {
-                    session_update,
-                    match |session_update| self.handle_session_update(session_update)
-                },
-                cmd = async { commands?.recv().await }, if commands.is_some() && self.connect_established => if let Some(cmd) = cmd {
-                    if let Err(e) = self.handle_command(cmd).await {
-                        debug!("could not dispatch command: {e}");
-                    }
-                },
-                event = async { player_events?.recv().await }, if player_events.is_some() => if let Some(event) = event {
-                    if let Err(e) = self.handle_player_event(event) {
-                        error!("could not dispatch player event: {e}");
-                    }
-                },
-                _ = async { sleep(UPDATE_STATE_DELAY).await }, if self.update_state => {
-                    self.update_state = false;
+                tokio::select! {
+                    // startup of the dealer requires a connection_id, which is retrieved at the very beginning
+                    connection_id_update = self.connection_id_update.next() => unwrap! {
+                        connection_id_update,
+                        match |connection_id| if let Err(why) = self.handle_connection_id_update(connection_id).await {
+                            error!("failed handling connection id update: {why}");
+                            break;
+                        }
+                    },
+                    // main dealer update of any remote device updates
+                    cluster_update = self.connect_state_update.next() => unwrap! {
+                        cluster_update,
+                        match |cluster_update| if let Err(e) = self.handle_cluster_update(cluster_update).await {
+                            error!("could not dispatch connect state update: {e}");
+                        }
+                    },
+                    // main dealer request handling (dealer expects an answer)
+                    request = self.connect_state_command.next() => unwrap! {
+                        request,
+                        |request| if let Err(e) = self.handle_connect_state_request(request).await {
+                            error!("couldn't handle connect state command: {e}");
+                        }
+                    },
+                    // volume request handling is send separately (it's more like a fire forget)
+                    volume_update = self.connect_state_volume_update.next() => unwrap! {
+                        volume_update,
+                        match |volume_update| match volume_update.volume.try_into() {
+                            Ok(volume) => self.set_volume(volume),
+                            Err(why) => error!("can't update volume, failed to parse i32 to u16: {why}")
+                        }
+                    },
+                    logout_request = self.connect_state_logout_request.next() => unwrap! {
+                        logout_request,
+                        |logout_request| {
+                            error!("received logout request, currently not supported: {logout_request:#?}");
+                            // todo: call logout handling
+                        }
+                    },
+                    playlist_update = self.playlist_update.next() => unwrap! {
+                        playlist_update,
+                        match |playlist_update| if let Err(why) = self.handle_playlist_modification(playlist_update) {
+                            error!("failed to handle playlist modification: {why}")
+                        }
+                    },
+                    user_attributes_update = self.user_attributes_update.next() => unwrap! {
+                        user_attributes_update,
+                        match |attributes| self.handle_user_attributes_update(attributes)
+                    },
+                    user_attributes_mutation = self.user_attributes_mutation.next() => unwrap! {
+                        user_attributes_mutation,
+                        match |attributes| self.handle_user_attributes_mutation(attributes)
+                    },
+                    session_update = self.session_update.next() => unwrap! {
+                        session_update,
+                        match |session_update| self.handle_session_update(session_update)
+                    },
+                    cmd = async { commands?.recv().await }, if commands.is_some() => if let Some(cmd) = cmd {
+                        if let Err(e) = self.handle_command(cmd).await {
+                            debug!("could not dispatch command: {e}");
+                        }
+                    },
+                    event = async { player_events?.recv().await }, if player_events.is_some() => if let Some(event) = event {
+                        if let Err(e) = self.handle_player_event(event) {
+                            error!("could not dispatch player event: {e}");
+                        }
+                    },
+                    _ = async { sleep(UPDATE_STATE_DELAY).await }, if self.update_state => {
+                        self.update_state = false;
 
-                    if let Err(why) = self.notify().await {
-                        error!("state update: {why}")
-                    }
-                },
-                _ = async { sleep(VOLUME_UPDATE_DELAY).await }, if self.update_volume => {
-                    self.update_volume = false;
-
-                    info!("delayed volume update for all devices: volume is now {}", self.connect_state.device_info().volume);
-                    if let Err(why) = self.connect_state.notify_volume_changed(&self.session).await {
-                        error!("error updating connect state for volume update: {why}")
-                    }
-
-                    // for some reason the web-player does need two separate updates, so that the
-                    // position of the current track is retained, other clients also send a state
-                    // update before they send the volume update
-                    if let Err(why) = self.notify().await {
-                        error!("error updating connect state for volume update: {why}")
-                    }
-                },
-                // context resolver handling, the idea/reason behind it the following:
-                //
-                // when we request a context that has multiple pages (for example an artist)
-                // resolving all pages at once can take around ~1-30sec, when we resolve
-                // everything at once that would block our main loop for that time
-                //
-                // to circumvent this behavior, we request each context separately here and
-                // finish after we received our last item of a type
-                next_context = async {
-                    self.context_resolver.get_next_context(|| {
-                        // Sending local file URIs to this endpoint results in a Bad Request status.
-                        // It's likely appropriate to filter them out anyway; Spotify's backend
-                        // has no knowledge about these tracks and so can't do anything with them.
-                        self.connect_state.recent_track_uris()
-                            .into_iter()
-                            .filter(|t| !t.starts_with("spotify:local"))
-                            .collect::<Vec<_>>()
-                    }).await
-                }, if allow_context_resolving && self.context_resolver.has_next() => {
-                    let update_state = self.handle_next_context(next_context);
-                    if update_state {
                         if let Err(why) = self.notify().await {
-                            error!("update after context resolving failed: {why}")
+                            error!("state update: {why}")
+                        }
+                    },
+                    _ = async { sleep(VOLUME_UPDATE_DELAY).await }, if self.update_volume => {
+                        self.update_volume = false;
+
+                        info!("delayed volume update for all devices: volume is now {}", self.connect_state.device_info().volume);
+                        if let Err(why) = self.connect_state.notify_volume_changed(&self.session).await {
+                            error!("error updating connect state for volume update: {why}")
+                        }
+
+                        // for some reason the web-player does need two separate updates, so that the
+                        // position of the current track is retained, other clients also send a state
+                        // update before they send the volume update
+                        if let Err(why) = self.notify().await {
+                            error!("error updating connect state for volume update: {why}")
+                        }
+                    },
+                    // context resolver handling, the idea/reason behind it the following:
+                    //
+                    // when we request a context that has multiple pages (for example an artist)
+                    // resolving all pages at once can take around ~1-30sec, when we resolve
+                    // everything at once that would block our main loop for that time
+                    //
+                    // to circumvent this behavior, we request each context separately here and
+                    // finish after we received our last item of a type
+                    next_context = async {
+                        self.context_resolver.get_next_context(|| {
+                            // Sending local file URIs to this endpoint results in a Bad Request status.
+                            // It's likely appropriate to filter them out anyway; Spotify's backend
+                            // has no knowledge about these tracks and so can't do anything with them.
+                            self.connect_state.recent_track_uris()
+                                .into_iter()
+                                .filter(|t| !t.starts_with("spotify:local"))
+                                .collect::<Vec<_>>()
+                        }).await
+                    }, if allow_context_resolving && self.context_resolver.has_next() => {
+                        let update_state = self.handle_next_context(next_context);
+                        if update_state {
+                            if let Err(why) = self.notify().await {
+                                error!("update after context resolving failed: {why}")
+                            }
+                        }
+                    },
+                    else => break
+                }
+            }
+
+            if self.shutdown {
+                break;
+            }
+
+            if !self.retain_on_session_failure {
+                if self.connect_state.is_active() {
+                    warn!("unexpected shutdown");
+                    if let Err(why) = self.handle_disconnect().await {
+                        error!("error during disconnecting: {why}")
+                    }
+                }
+                break;
+            }
+
+            if !self.session.is_invalid() {
+                warn!("Spirc session streams ended unexpectedly; invalidating the old session");
+                self.session.shutdown();
+            }
+            self.connect_established = false;
+            debug!("Spirc is retaining Connect state while waiting for a replacement Session");
+
+            loop {
+                let command = match self.commands.as_mut() {
+                    Some(commands) => commands.recv().await,
+                    None => None,
+                };
+                let Some(command) = command else {
+                    self.shutdown = true;
+                    break;
+                };
+
+                match command {
+                    SpircCommand::ReplaceSession { session, result } => {
+                        let replacement = self.replace_session(session).await;
+                        let succeeded = replacement.is_ok();
+                        let _ = result.send(replacement);
+                        if succeeded {
+                            continue 'session;
                         }
                     }
-                },
-                else => break
+                    SpircCommand::Shutdown => {
+                        self.handle_pause();
+                        self.shutdown = true;
+                        if let Some(commands) = self.commands.as_mut() {
+                            commands.close();
+                        }
+                        break;
+                    }
+                    command => warn!(
+                        "SpircCommand::{} ignored while waiting for a replacement Session",
+                        command.name()
+                    ),
+                }
             }
-        }
 
-        if !self.shutdown && self.connect_state.is_active() {
-            warn!("unexpected shutdown");
-            if let Err(why) = self.handle_disconnect().await {
-                error!("error during disconnecting: {why}")
+            if self.shutdown {
+                break;
             }
         }
 
         // this should clear the active session id, leaving an empty state
-        if let Err(why) = self.session.spclient().delete_connect_state_request().await {
-            error!("error during connect state deletion: {why}")
-        };
+        if !self.session.is_invalid() {
+            if let Err(why) = self.session.spclient().delete_connect_state_request().await {
+                error!("error during connect state deletion: {why}")
+            }
+        }
 
         self.session.dealer().close().await;
     }
@@ -627,13 +814,18 @@ impl SpircTask {
     fn handle_next_context(&mut self, next_context: Result<Context, Error>) -> bool {
         let next_context = match next_context {
             Err(why) => {
-                self.context_resolver.mark_next_unavailable();
-                self.context_resolver.remove_used_and_invalid();
-                error!("{why}");
+                let kind = self.context_resolver.classify_failure(&why);
+                self.context_resolver.mark_next_unavailable(kind);
+                if kind == ContextFailureKind::Permanent {
+                    self.context_resolver.remove_used_and_invalid();
+                }
+                debug!("Context resolution failed as {kind:?}: {why}");
                 return false;
             }
             Ok(ctx) => ctx,
         };
+
+        self.context_resolver.mark_next_resolved();
 
         debug!("handling next context {:?}", next_context.uri);
 
@@ -675,8 +867,14 @@ impl SpircTask {
     }
 
     async fn handle_command(&mut self, cmd: SpircCommand) -> Result<(), Error> {
-        trace!("Received SpircCommand::{cmd:?}");
+        let command_name = cmd.name();
+        trace!("Received SpircCommand::{command_name}");
         match cmd {
+            SpircCommand::ReplaceSession { session, result } => {
+                let replacement = self.replace_session(session).await;
+                let _ = result.send(replacement);
+                return Ok(());
+            }
             SpircCommand::Shutdown => {
                 trace!("Received SpircCommand::Shutdown");
                 self.handle_pause();
@@ -695,15 +893,15 @@ impl SpircTask {
                 return Ok(());
             }
             SpircCommand::Activate if !self.connect_state.is_active() => {
-                trace!("Received SpircCommand::{cmd:?}");
+                trace!("Received SpircCommand::{command_name}");
                 self.handle_activate();
                 return self.notify().await;
             }
             SpircCommand::Transfer(..) | SpircCommand::Activate => {
-                warn!("SpircCommand::{cmd:?} will be ignored while already active")
+                warn!("SpircCommand::{command_name} will be ignored while already active")
             }
             _ if !self.connect_state.is_active() => {
-                warn!("SpircCommand::{cmd:?} will be ignored while Not Active")
+                warn!("SpircCommand::{command_name} will be ignored while Not Active")
             }
             SpircCommand::Disconnect { pause } => {
                 if pause {
@@ -1893,11 +2091,47 @@ impl Drop for SpircTask {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playback::player::PlayerLoadErrorKind;
+    use crate::{core::config::SessionConfig, playback::player::PlayerLoadErrorKind};
 
     const CURRENT_URI: &str = "spotify:track:2TpxZ7JUBn3uw46aR7qd6V";
     const NEXT_URI: &str = "spotify:track:4cOdK2wGLETKBW3PvgPWqT";
     const LATER_URI: &str = "spotify:track:7ouMYWpwJ422jRcDASZB7P";
+
+    #[test]
+    fn replace_session_api_delivers_replacement_to_retained_task() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        runtime.block_on(async {
+            let (commands, mut command_rx) = mpsc::unbounded_channel();
+            let spirc = Spirc { commands };
+            let replacement = Session::new(SessionConfig::default(), None);
+            let replacement_id = replacement.session_id();
+
+            let acknowledge = async {
+                let command = command_rx.recv().await.expect("replacement command");
+                let SpircCommand::ReplaceSession { session, result } = command else {
+                    panic!("expected replacement command")
+                };
+                assert_eq!(session.session_id(), replacement_id);
+                result.send(Ok(())).expect("receiver should remain alive");
+            };
+
+            let (result, ()) = tokio::join!(spirc.replace_session(replacement), acknowledge);
+            result.expect("replacement acknowledgement should propagate");
+        });
+    }
+
+    #[test]
+    fn replacement_session_inherits_existing_connect_session_identity() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let _guard = runtime.enter();
+        let current = Session::new(SessionConfig::default(), None);
+        let replacement = Session::new(SessionConfig::default(), None);
+        assert_ne!(current.session_id(), replacement.session_id());
+
+        preserve_session_identity(&current, &replacement);
+
+        assert_eq!(current.session_id(), replacement.session_id());
+    }
 
     fn uri(value: &str) -> SpotifyUri {
         SpotifyUri::from_uri(value).expect("test URI should be valid")
@@ -1947,6 +2181,25 @@ mod tests {
     }
 
     #[test]
+    fn repeated_preload_failures_do_not_walk_the_queue() {
+        let mut play_request_id = Some(7);
+        let upcoming = vec![NEXT_URI, LATER_URI];
+
+        for _ in 0..5 {
+            let action = player_queue_action(
+                &transient_event(uri(NEXT_URI), true),
+                &mut play_request_id,
+                CURRENT_URI,
+            )
+            .expect("event classification should succeed");
+            assert_eq!(action, PlayerQueueAction::Preserve);
+        }
+
+        assert_eq!(play_request_id, Some(7));
+        assert_eq!(upcoming, vec![NEXT_URI, LATER_URI]);
+    }
+
+    #[test]
     fn permanent_unavailable_current_track_advances_once() {
         let mut play_request_id = Some(7);
         let event = PlayerEvent::Unavailable {
@@ -1982,6 +2235,47 @@ mod tests {
         }
 
         assert_eq!(advances, 1);
+    }
+
+    #[test]
+    fn duplicate_end_of_track_does_not_advance_twice() {
+        let mut play_request_id = Some(7);
+        let event = PlayerEvent::EndOfTrack {
+            play_request_id: 7,
+            track_id: uri(CURRENT_URI),
+        };
+        let mut advances = 0;
+
+        for _ in 0..2 {
+            if player_queue_action(&event, &mut play_request_id, CURRENT_URI)
+                .expect("event classification should succeed")
+                == PlayerQueueAction::Advance
+            {
+                advances += 1;
+            }
+        }
+
+        assert_eq!(advances, 1);
+    }
+
+    #[test]
+    fn session_invalid_preserves_queue_and_current_request() {
+        let mut play_request_id = Some(7);
+        let queue = vec![CURRENT_URI, NEXT_URI, LATER_URI];
+        let event = PlayerEvent::LoadFailed {
+            play_request_id: 7,
+            track_id: uri(CURRENT_URI),
+            error: PlayerLoadErrorKind::SessionInvalid,
+            is_preload: false,
+        };
+
+        assert_eq!(
+            player_queue_action(&event, &mut play_request_id, CURRENT_URI)
+                .expect("event classification should succeed"),
+            PlayerQueueAction::Preserve
+        );
+        assert_eq!(play_request_id, Some(7));
+        assert_eq!(queue, vec![CURRENT_URI, NEXT_URI, LATER_URI]);
     }
 
     #[test]

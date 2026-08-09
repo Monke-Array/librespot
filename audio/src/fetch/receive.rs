@@ -1,24 +1,30 @@
 use std::{
     cmp::{max, min},
     io::{Seek, SeekFrom, Write},
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{Future, StreamExt, stream::FuturesUnordered};
 use http_body_util::BodyExt;
 use hyper::StatusCode;
 use tempfile::NamedTempFile;
 use tokio::sync::{mpsc, oneshot};
 
-use librespot_core::{Error, http_client::HttpClient, session::Session};
+use librespot_core::{
+    Error,
+    cdn_url::CdnUrl,
+    http_client::{HttpClient, HttpClientError},
+    session::Session,
+};
 
 use crate::range_set::{Range, RangeSet};
 
 use super::{
-    AudioFetchParams, AudioFileError, AudioFileResult, AudioFileShared, StreamLoaderCommand,
-    StreamingRequest,
+    AudioFetchParams, AudioFileError, AudioFileErrorKind, AudioFileFailure, AudioFileResult,
+    AudioFileShared, StreamLoaderCommand, StreamingRequest,
 };
 
 struct PartialFileData {
@@ -32,131 +38,241 @@ enum ReceivedData {
     Data(PartialFileData),
 }
 
+struct RequestFailure {
+    source: Error,
+    retry_after: Option<Duration>,
+    refresh_urls: bool,
+}
+
+enum RangeRequestOutcome {
+    Complete,
+    Failed {
+        range: Range,
+        attempt: usize,
+        failure: RequestFailure,
+    },
+    Retry {
+        range: Range,
+        attempt: usize,
+        refresh_urls: bool,
+    },
+}
+
+type RangeRequestFuture = Pin<Box<dyn Future<Output = RangeRequestOutcome> + Send>>;
+
 const ONE_SECOND: Duration = Duration::from_secs(1);
 const DOWNLOAD_STATUS_POISON_MSG: &str = "audio download status mutex should not be poisoned";
 
 async fn receive_data(
     shared: Arc<AudioFileShared>,
-    file_data_tx: mpsc::UnboundedSender<ReceivedData>,
+    file_data_tx: mpsc::Sender<ReceivedData>,
     mut request: StreamingRequest,
-) -> AudioFileResult {
+) -> RangeRequestOutcome {
     let mut offset = request.offset;
     let mut actual_length = 0;
 
-    let permit = shared.download_slots.acquire().await?;
-
-    let request_time = Instant::now();
-    let mut measure_ping_time = true;
-    let mut measure_throughput = true;
-
-    let result: Result<_, Error> = loop {
-        let response = match request.initial_response.take() {
-            Some(data) => {
-                // the request was already made outside of this function
-                measure_ping_time = false;
-                measure_throughput = false;
-
-                data
-            }
-            None => match request.streamer.next().await {
-                Some(Ok(response)) => response,
-                Some(Err(e)) => break Err(e.into()),
-                None => {
-                    if actual_length != request.length {
-                        let msg = format!("did not expect body to contain {actual_length} bytes");
-                        break Err(Error::data_loss(msg));
-                    }
-
-                    break Ok(());
-                }
-            },
-        };
-
-        if measure_ping_time {
-            let duration = Instant::now().duration_since(request_time);
-            // may be zero if we are handling an initial response
-            if duration.as_millis() > 0 {
-                file_data_tx.send(ReceivedData::ResponseTime(duration))?;
-                measure_ping_time = false;
-            }
+    let permit = match shared.download_slots.acquire().await {
+        Ok(permit) => permit,
+        Err(error) => {
+            return RangeRequestOutcome::Failed {
+                range: Range::new(request.offset, request.length),
+                attempt: request.attempt,
+                failure: RequestFailure {
+                    source: error.into(),
+                    retry_after: None,
+                    refresh_urls: false,
+                },
+            };
         }
-
-        let code = response.status();
-        if code != StatusCode::PARTIAL_CONTENT {
-            if code == StatusCode::TOO_MANY_REQUESTS {
-                if let Some(duration) = HttpClient::get_retry_after(response.headers()) {
-                    warn!(
-                        "Rate limiting, retrying in {} seconds...",
-                        duration.as_secs()
-                    );
-                    // sleeping here means we hold onto this streamer "slot"
-                    // (we don't decrease the number of open requests)
-                    tokio::time::sleep(duration).await;
-                }
-            }
-
-            break Err(AudioFileError::StatusCode(code).into());
-        }
-
-        let body = response.into_body();
-        let data = match body.collect().await.map(|b| b.to_bytes()) {
-            Ok(bytes) => bytes,
-            Err(e) => break Err(e.into()),
-        };
-
-        let data_size = data.len();
-        file_data_tx.send(ReceivedData::Data(PartialFileData { offset, data }))?;
-
-        actual_length += data_size;
-        offset += data_size;
     };
 
-    drop(request.streamer);
+    let request_time = Instant::now();
+    let initial_response = request.initial_response.take();
+    let measure_network = initial_response.is_none();
+    let response_result = match initial_response {
+        Some(response) => Ok(response),
+        None => match tokio::time::timeout(
+            AudioFetchParams::get().download_timeout,
+            request.streamer.next(),
+        )
+        .await
+        {
+            Ok(Some(Ok(response))) => Ok(response),
+            Ok(Some(Err(error))) => Err(error.into()),
+            Ok(None) => Err(AudioFileError::NoData.into()),
+            Err(_) => Err(AudioFileError::WaitTimeout.into()),
+        },
+    };
 
-    if measure_throughput {
-        let duration = Instant::now().duration_since(request_time).as_millis();
-        if actual_length > 0 && duration > 0 {
-            let throughput = ONE_SECOND.as_millis() as usize * actual_length / duration as usize;
-            file_data_tx.send(ReceivedData::Throughput(throughput))?;
+    let mut response = match response_result {
+        Ok(response) => response,
+        Err(source) => {
+            return RangeRequestOutcome::Failed {
+                range: Range::new(request.offset, request.length),
+                attempt: request.attempt,
+                failure: RequestFailure {
+                    source,
+                    retry_after: None,
+                    refresh_urls: false,
+                },
+            };
+        }
+    };
+
+    if measure_network {
+        let duration = Instant::now().duration_since(request_time);
+        if duration.as_millis() > 0 {
+            let _ = file_data_tx
+                .send(ReceivedData::ResponseTime(duration))
+                .await;
         }
     }
 
-    let bytes_remaining = request.length - actual_length;
-    if bytes_remaining > 0 {
+    let code = response.status();
+    if code != StatusCode::PARTIAL_CONTENT {
+        let retry_after = (code == StatusCode::TOO_MANY_REQUESTS)
+            .then(|| HttpClient::get_retry_after(response.headers()))
+            .flatten();
+        return RangeRequestOutcome::Failed {
+            range: Range::new(request.offset, request.length),
+            attempt: request.attempt,
+            failure: RequestFailure {
+                source: HttpClientError::StatusCode(code).into(),
+                retry_after,
+                refresh_urls: matches!(
+                    code,
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE
+                ),
+            },
+        };
+    }
+
+    while actual_length < request.length {
+        if shared.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return RangeRequestOutcome::Complete;
+        }
+
+        let frame = match tokio::time::timeout(
+            AudioFetchParams::get().download_timeout,
+            response.body_mut().frame(),
+        )
+        .await
         {
-            let missing_range = Range::new(offset, bytes_remaining);
-            let mut download_status = shared
-                .download_status
-                .lock()
-                .expect(DOWNLOAD_STATUS_POISON_MSG);
-            download_status.requested.subtract_range(&missing_range);
-            shared.cond.notify_all();
+            Ok(Some(Ok(frame))) => frame,
+            Ok(Some(Err(error))) => {
+                return RangeRequestOutcome::Failed {
+                    range: Range::new(offset, request.length - actual_length),
+                    attempt: request.attempt,
+                    failure: RequestFailure {
+                        source: error.into(),
+                        retry_after: None,
+                        refresh_urls: false,
+                    },
+                };
+            }
+            Ok(None) => break,
+            Err(_) => {
+                return RangeRequestOutcome::Failed {
+                    range: Range::new(offset, request.length - actual_length),
+                    attempt: request.attempt,
+                    failure: RequestFailure {
+                        source: AudioFileError::WaitTimeout.into(),
+                        retry_after: None,
+                        refresh_urls: false,
+                    },
+                };
+            }
+        };
+
+        let Ok(mut data) = frame.into_data() else {
+            continue;
+        };
+        let remaining = request.length - actual_length;
+        if data.len() > remaining {
+            data.truncate(remaining);
+        }
+        let data_size = data.len();
+        if data_size == 0 {
+            continue;
+        }
+        if file_data_tx
+            .send(ReceivedData::Data(PartialFileData { offset, data }))
+            .await
+            .is_err()
+        {
+            return RangeRequestOutcome::Complete;
+        }
+        actual_length += data_size;
+        offset += data_size;
+    }
+
+    if measure_network {
+        let duration = Instant::now().duration_since(request_time).as_millis();
+        if actual_length > 0 && duration > 0 {
+            let throughput = ONE_SECOND.as_millis() as usize * actual_length / duration as usize;
+            let _ = file_data_tx
+                .send(ReceivedData::Throughput(throughput))
+                .await;
         }
     }
 
     drop(permit);
 
-    if let Err(e) = result {
-        error!(
-            "Streamer error requesting range {} +{}: {:?}",
-            request.offset, request.length, e
-        );
-        return Err(e);
+    if actual_length != request.length {
+        let missing = Range::new(offset, request.length - actual_length);
+        return RangeRequestOutcome::Failed {
+            range: missing,
+            attempt: request.attempt,
+            failure: RequestFailure {
+                source: Error::data_loss(format!(
+                    "incomplete CDN body: received {actual_length} of {} bytes",
+                    request.length
+                )),
+                retry_after: None,
+                refresh_urls: false,
+            },
+        };
     }
 
-    Ok(())
+    RangeRequestOutcome::Complete
 }
 
 struct AudioFileFetch {
     session: Session,
+    cdn_url: CdnUrl,
     shared: Arc<AudioFileShared>,
     output: Option<NamedTempFile>,
 
-    file_data_tx: mpsc::UnboundedSender<ReceivedData>,
+    file_data_tx: mpsc::Sender<ReceivedData>,
     complete_tx: Option<oneshot::Sender<NamedTempFile>>,
     network_response_times: Vec<Duration>,
+    requests: FuturesUnordered<RangeRequestFuture>,
+    next_cdn_candidate: usize,
 
     params: AudioFetchParams,
+}
+
+const MAX_RANGE_RETRIES: usize = 5;
+const MAX_RANGE_RETRY_DELAY: Duration = Duration::from_secs(8);
+const MAX_RANGE_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+fn range_retry_delay(range: Range, next_attempt: usize, retry_after: Option<Duration>) -> Duration {
+    let exponent = next_attempt.saturating_sub(1).min(5) as u32;
+    let base_ms = 250_u64.saturating_mul(1_u64 << exponent);
+    let jitter_ms =
+        ((range.start as u64).wrapping_mul(31) ^ (next_attempt as u64).wrapping_mul(97)) % 200;
+    let backoff = Duration::from_millis(base_ms + jitter_ms).min(MAX_RANGE_RETRY_DELAY);
+    retry_after.map_or(backoff, |retry_after| {
+        retry_after.min(MAX_RANGE_RETRY_AFTER).max(backoff)
+    })
+}
+
+fn cdn_candidate_index(next_candidate: usize, candidate_count: usize) -> usize {
+    next_candidate % candidate_count.max(1)
+}
+
+fn range_retry_allowed(attempt: usize, kind: AudioFileErrorKind, closed: bool) -> bool {
+    attempt < MAX_RANGE_RETRIES && kind != AudioFileErrorKind::SessionInvalid && !closed
 }
 
 // Might be replaced by enum from std once stable
@@ -171,7 +287,30 @@ impl AudioFileFetch {
         self.shared.download_slots.available_permits() > 0
     }
 
-    fn download_range(&mut self, offset: usize, mut length: usize) -> AudioFileResult {
+    async fn download_range(
+        &mut self,
+        offset: usize,
+        mut length: usize,
+        attempt: usize,
+        refresh_urls: bool,
+    ) -> AudioFileResult {
+        if offset >= self.shared.file_size
+            || self
+                .shared
+                .closed
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+
+        if refresh_urls {
+            debug!("Refreshing CDN candidates before retrying range at offset {offset}");
+            self.cdn_url = CdnUrl::new(self.cdn_url.file_id)
+                .resolve_audio(&self.session)
+                .await?;
+            self.next_cdn_candidate = 0;
+        }
+
         if length < self.params.minimum_download_size {
             length = self.params.minimum_download_size;
         }
@@ -202,35 +341,64 @@ impl AudioFileFetch {
         ranges_to_request.subtract_range_set(&download_status.downloaded);
         ranges_to_request.subtract_range_set(&download_status.requested);
 
-        // TODO : refresh cdn_url when the token expired
-
         for range in ranges_to_request.iter() {
+            let candidates = self.cdn_url.try_get_urls()?;
+            let candidate_count = candidates.len();
+            let candidate_index = cdn_candidate_index(self.next_cdn_candidate, candidate_count);
+            self.next_cdn_candidate = self.next_cdn_candidate.wrapping_add(1);
             let streamer = self.session.spclient().stream_from_cdn(
-                &self.shared.cdn_url,
+                candidates[candidate_index],
                 range.start,
                 range.length,
-            )?;
+            );
 
             download_status.requested.add_range(range);
 
-            let streaming_request = StreamingRequest {
-                streamer,
-                initial_response: None,
-                offset: range.start,
-                length: range.length,
-            };
+            debug!(
+                "Fetching compressed range {} using CDN candidate {}/{} (attempt {})",
+                range,
+                candidate_index + 1,
+                candidate_count,
+                attempt + 1
+            );
 
-            self.session.spawn(receive_data(
-                self.shared.clone(),
-                self.file_data_tx.clone(),
-                streaming_request,
-            ));
+            match streamer {
+                Ok(streamer) => {
+                    let streaming_request = StreamingRequest {
+                        streamer,
+                        initial_response: None,
+                        offset: range.start,
+                        length: range.length,
+                        attempt,
+                    };
+
+                    self.requests.push(Box::pin(receive_data(
+                        self.shared.clone(),
+                        self.file_data_tx.clone(),
+                        streaming_request,
+                    )));
+                }
+                Err(source) => {
+                    let range = *range;
+                    self.requests.push(Box::pin(async move {
+                        RangeRequestOutcome::Failed {
+                            range,
+                            attempt,
+                            failure: RequestFailure {
+                                source,
+                                retry_after: None,
+                                refresh_urls: false,
+                            },
+                        }
+                    }));
+                }
+            }
         }
 
         Ok(())
     }
 
-    fn pre_fetch_more_data(&mut self, bytes: usize) -> AudioFileResult {
+    async fn pre_fetch_more_data(&mut self, bytes: usize) -> AudioFileResult {
         // determine what is still missing
         let mut missing_data = RangeSet::new();
         missing_data.add_range(&Range::new(0, self.shared.file_size));
@@ -257,13 +425,13 @@ impl AudioFileFetch {
             let range = tail_end.get_range(0);
             let offset = range.start;
             let length = min(range.length, bytes);
-            self.download_range(offset, length)?;
+            self.download_range(offset, length, 0, false).await?;
         } else if !missing_data.is_empty() {
             // ok, the tail is downloaded, download something fom the beginning.
             let range = missing_data.get_range(0);
             let offset = range.start;
             let length = min(range.length, bytes);
-            self.download_range(offset, length)?;
+            self.download_range(offset, length, 0, false).await?;
         }
 
         Ok(())
@@ -360,6 +528,9 @@ impl AudioFileFetch {
 
                 let received_range = Range::new(data.offset, data.data.len());
 
+                self.shared
+                    .degraded
+                    .store(false, std::sync::atomic::Ordering::Release);
                 let full = {
                     let mut download_status = self
                         .shared
@@ -373,6 +544,16 @@ impl AudioFileFetch {
                         >= self.shared.file_size
                 };
 
+                for failure in [&self.shared.latest_failure, &self.shared.last_failure] {
+                    let mut failure = failure.lock().expect(DOWNLOAD_STATUS_POISON_MSG);
+                    if failure.as_ref().is_some_and(|failure| {
+                        failure.range.start < received_range.end()
+                            && received_range.start < failure.range.end()
+                    }) {
+                        *failure = None;
+                    }
+                }
+
                 if full {
                     self.finish()?;
                     return Ok(ControlFlow::Break);
@@ -383,18 +564,136 @@ impl AudioFileFetch {
         Ok(ControlFlow::Continue)
     }
 
-    fn handle_stream_loader_command(
+    async fn handle_stream_loader_command(
         &mut self,
         cmd: StreamLoaderCommand,
     ) -> Result<ControlFlow, Error> {
         match cmd {
             StreamLoaderCommand::Fetch(request) => {
-                self.download_range(request.start, request.length)?
+                self.download_range(request.start, request.length, 0, false)
+                    .await?
             }
-            StreamLoaderCommand::Close => return Ok(ControlFlow::Break),
+            StreamLoaderCommand::Close => {
+                self.shared
+                    .closed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                self.shared.cond.notify_all();
+                return Ok(ControlFlow::Break);
+            }
         }
 
         Ok(ControlFlow::Continue)
+    }
+
+    async fn handle_request_outcome(&mut self, outcome: RangeRequestOutcome) {
+        match outcome {
+            RangeRequestOutcome::Complete => {}
+            RangeRequestOutcome::Retry {
+                range,
+                attempt,
+                refresh_urls,
+            } => {
+                {
+                    let mut status = self
+                        .shared
+                        .download_status
+                        .lock()
+                        .expect(DOWNLOAD_STATUS_POISON_MSG);
+                    status.requested.subtract_range(&range);
+                }
+                if let Err(source) = self
+                    .download_range(range.start, range.length, attempt, refresh_urls)
+                    .await
+                {
+                    self.shared
+                        .download_status
+                        .lock()
+                        .expect(DOWNLOAD_STATUS_POISON_MSG)
+                        .requested
+                        .add_range(&range);
+                    self.requests.push(Box::pin(async move {
+                        RangeRequestOutcome::Failed {
+                            range,
+                            attempt,
+                            failure: RequestFailure {
+                                source,
+                                retry_after: None,
+                                refresh_urls: true,
+                            },
+                        }
+                    }));
+                }
+            }
+            RangeRequestOutcome::Failed {
+                range,
+                attempt,
+                failure,
+            } => {
+                let classified = AudioFileFailure::classify(&self.session, range, failure.source);
+                *self
+                    .shared
+                    .latest_failure
+                    .lock()
+                    .expect(DOWNLOAD_STATUS_POISON_MSG) = Some(classified.clone());
+                self.shared
+                    .degraded
+                    .store(true, std::sync::atomic::Ordering::Release);
+
+                if range_retry_allowed(
+                    attempt,
+                    classified.kind,
+                    self.shared
+                        .closed
+                        .load(std::sync::atomic::Ordering::Acquire),
+                ) {
+                    let next_attempt = attempt + 1;
+                    let delay = range_retry_delay(range, next_attempt, failure.retry_after);
+                    let candidate_count = self
+                        .cdn_url
+                        .try_get_urls()
+                        .map_or(1, |candidates| candidates.len());
+                    let refresh_urls = failure.refresh_urls || next_attempt % candidate_count == 0;
+                    debug!(
+                        "Compressed range {} failed as {:?}; retry {} in {:?}{}",
+                        range,
+                        classified.kind,
+                        next_attempt,
+                        delay,
+                        if refresh_urls {
+                            " after refreshing CDN candidates"
+                        } else {
+                            " with CDN failover"
+                        }
+                    );
+                    self.shared.cond.notify_all();
+                    self.requests.push(Box::pin(async move {
+                        tokio::time::sleep(delay).await;
+                        RangeRequestOutcome::Retry {
+                            range,
+                            attempt: next_attempt,
+                            refresh_urls,
+                        }
+                    }));
+                } else {
+                    debug!(
+                        "Compressed range {} exhausted retries with classification {:?}",
+                        range, classified.kind
+                    );
+                    let mut status = self
+                        .shared
+                        .download_status
+                        .lock()
+                        .expect(DOWNLOAD_STATUS_POISON_MSG);
+                    status.requested.subtract_range(&range);
+                    *self
+                        .shared
+                        .last_failure
+                        .lock()
+                        .expect(DOWNLOAD_STATUS_POISON_MSG) = Some(classified);
+                    self.shared.cond.notify_all();
+                }
+            }
+        }
     }
 
     fn finish(&mut self) -> AudioFileResult {
@@ -417,19 +716,19 @@ impl AudioFileFetch {
 
 pub(super) async fn audio_file_fetch(
     session: Session,
+    cdn_url: CdnUrl,
     shared: Arc<AudioFileShared>,
     initial_request: StreamingRequest,
     output: NamedTempFile,
     mut stream_loader_command_rx: mpsc::UnboundedReceiver<StreamLoaderCommand>,
     complete_tx: oneshot::Sender<NamedTempFile>,
 ) -> AudioFileResult {
-    let (file_data_tx, mut file_data_rx) = mpsc::unbounded_channel();
+    // Keep body-to-disk handoff bounded. This makes each response future yield after a few frames,
+    // so received compressed audio becomes readable instead of accumulating a full range in RAM.
+    let (file_data_tx, mut file_data_rx) = mpsc::channel(8);
 
     {
-        let requested_range = Range::new(
-            initial_request.offset,
-            initial_request.offset + initial_request.length,
-        );
+        let requested_range = Range::new(initial_request.offset, initial_request.length);
 
         let mut download_status = shared
             .download_status
@@ -438,22 +737,26 @@ pub(super) async fn audio_file_fetch(
         download_status.requested.add_range(&requested_range);
     }
 
-    session.spawn(receive_data(
+    let params = AudioFetchParams::get();
+
+    let requests = FuturesUnordered::new();
+    requests.push(Box::pin(receive_data(
         shared.clone(),
         file_data_tx.clone(),
         initial_request,
-    ));
-
-    let params = AudioFetchParams::get();
+    )) as RangeRequestFuture);
 
     let mut fetch = AudioFileFetch {
         session: session.clone(),
+        cdn_url,
         shared,
         output: Some(output),
 
         file_data_tx,
         complete_tx: Some(complete_tx),
         network_response_times: Vec::with_capacity(3),
+        requests,
+        next_cdn_candidate: 1,
 
         params: params.clone(),
     };
@@ -463,7 +766,7 @@ pub(super) async fn audio_file_fetch(
             cmd = stream_loader_command_rx.recv() => {
                 match cmd {
                         Some(cmd) => {
-                            if fetch.handle_stream_loader_command(cmd)? == ControlFlow::Break {
+                            if fetch.handle_stream_loader_command(cmd).await? == ControlFlow::Break {
                                 break;
                             }
                         }
@@ -478,6 +781,11 @@ pub(super) async fn audio_file_fetch(
                         }
                     }
                     None => break,
+                }
+            },
+            outcome = fetch.requests.next(), if !fetch.requests.is_empty() => {
+                if let Some(outcome) = outcome {
+                    fetch.handle_request_outcome(outcome).await;
                 }
             },
             else => (),
@@ -508,10 +816,85 @@ pub(super) async fn audio_file_fetch(
             );
 
             if bytes_pending < desired_pending_bytes {
-                fetch.pre_fetch_more_data(desired_pending_bytes - bytes_pending)?;
+                fetch
+                    .pre_fetch_more_data(desired_pending_bytes - bytes_pending)
+                    .await?;
             }
         }
     }
 
+    fetch
+        .shared
+        .closed
+        .store(true, std::sync::atomic::Ordering::Release);
+    fetch.shared.cond.notify_all();
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_retry_backoff_is_bounded_and_increases() {
+        let range = Range::new(64 * 1024, 64 * 1024);
+        let first = range_retry_delay(range, 1, None);
+        let later = range_retry_delay(range, 5, None);
+        let bounded = range_retry_delay(range, 100, None);
+
+        assert!(first < later);
+        assert!(bounded <= MAX_RANGE_RETRY_DELAY);
+    }
+
+    #[test]
+    fn retry_after_is_respected_by_range_retry() {
+        let range = Range::new(0, 64 * 1024);
+        let retry_after = Duration::from_secs(3);
+
+        assert!(range_retry_delay(range, 1, Some(retry_after)) >= retry_after);
+    }
+
+    #[test]
+    fn pathological_retry_after_is_bounded() {
+        let range = Range::new(0, 64 * 1024);
+
+        assert_eq!(
+            range_retry_delay(range, 1, Some(Duration::from_secs(24 * 60 * 60))),
+            MAX_RANGE_RETRY_AFTER
+        );
+    }
+
+    #[test]
+    fn retryable_host_failure_rotates_to_alternate_candidate() {
+        let candidates = 3;
+        let sequence: Vec<_> = (0..6)
+            .map(|next| cdn_candidate_index(next, candidates))
+            .collect();
+
+        assert_eq!(sequence, vec![0, 1, 2, 0, 1, 2]);
+    }
+
+    #[test]
+    fn retry_budget_is_finite() {
+        assert!(range_retry_allowed(
+            MAX_RANGE_RETRIES - 1,
+            AudioFileErrorKind::TransientNetwork,
+            false
+        ));
+        assert!(!range_retry_allowed(
+            MAX_RANGE_RETRIES,
+            AudioFileErrorKind::TransientNetwork,
+            false
+        ));
+    }
+
+    #[test]
+    fn invalid_session_is_not_retried_by_range_layer() {
+        assert!(!range_retry_allowed(
+            0,
+            AudioFileErrorKind::SessionInvalid,
+            false
+        ));
+    }
 }

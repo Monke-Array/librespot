@@ -20,13 +20,116 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
-use librespot_core::{Error, FileId, Session, cdn_url::CdnUrl};
+use librespot_core::{
+    Error, FileId, Session,
+    cdn_url::CdnUrl,
+    error::ErrorKind,
+    http_client::{HttpClient, HttpClientError},
+};
 
 use self::receive::audio_file_fetch;
 
 use crate::range_set::{Range, RangeSet};
 
 pub type AudioFileResult = Result<(), librespot_core::Error>;
+const MAX_INITIAL_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// Classification retained for streaming failures which cross the synchronous `Read` boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioFileErrorKind {
+    TransientNetwork,
+    TransientService,
+    SessionInvalid,
+    Cancelled,
+    PermanentMedia,
+}
+
+/// A cloneable, structured range failure suitable for embedding in `std::io::Error`.
+#[derive(Clone, Debug)]
+pub struct AudioFileFailure {
+    pub kind: AudioFileErrorKind,
+    pub range: Range,
+    source: Arc<Error>,
+}
+
+impl AudioFileFailure {
+    pub(crate) fn new(kind: AudioFileErrorKind, range: Range, source: Error) -> Self {
+        Self {
+            kind,
+            range,
+            source: Arc::new(source),
+        }
+    }
+
+    pub(crate) fn classify(session: &Session, range: Range, source: Error) -> Self {
+        let kind = if session.is_invalid() {
+            AudioFileErrorKind::SessionInvalid
+        } else if let Some(HttpClientError::StatusCode(status)) =
+            source.error.downcast_ref::<HttpClientError>()
+        {
+            classify_http_status(status.as_u16())
+        } else if source.kind == ErrorKind::Unauthenticated {
+            AudioFileErrorKind::SessionInvalid
+        } else {
+            match source.kind {
+                ErrorKind::Cancelled => AudioFileErrorKind::Cancelled,
+                ErrorKind::DeadlineExceeded
+                | ErrorKind::Aborted
+                | ErrorKind::DataLoss
+                | ErrorKind::Unavailable => AudioFileErrorKind::TransientNetwork,
+                ErrorKind::ResourceExhausted => AudioFileErrorKind::TransientService,
+                ErrorKind::OutOfRange => AudioFileErrorKind::TransientService,
+                _ => AudioFileErrorKind::TransientService,
+            }
+        };
+
+        Self::new(kind, range, source)
+    }
+
+    fn io_kind(&self) -> io::ErrorKind {
+        match self.kind {
+            AudioFileErrorKind::TransientNetwork => io::ErrorKind::TimedOut,
+            AudioFileErrorKind::TransientService => io::ErrorKind::WouldBlock,
+            AudioFileErrorKind::SessionInvalid => io::ErrorKind::NotConnected,
+            AudioFileErrorKind::Cancelled => io::ErrorKind::Interrupted,
+            AudioFileErrorKind::PermanentMedia => io::ErrorKind::InvalidData,
+        }
+    }
+
+    fn into_core_error(self) -> Error {
+        match self.kind {
+            AudioFileErrorKind::TransientNetwork => Error::unavailable(self),
+            AudioFileErrorKind::TransientService => Error::resource_exhausted(self),
+            AudioFileErrorKind::SessionInvalid => Error::unauthenticated(self),
+            AudioFileErrorKind::Cancelled => Error::cancelled(self),
+            AudioFileErrorKind::PermanentMedia => Error::data_loss(self),
+        }
+    }
+}
+
+fn classify_http_status(status: u16) -> AudioFileErrorKind {
+    let _ = status;
+    // A status from the media CDN can describe an expired signed URL or edge failure. It is not
+    // positive evidence that the AP session or media item is invalid; range retry will refresh the
+    // resolved URL candidates for authentication and expiry statuses.
+    AudioFileErrorKind::TransientService
+}
+
+impl std::fmt::Display for AudioFileFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} while fetching range {}: {}",
+            self.kind, self.range, self.source
+        )
+    }
+}
+
+impl std::error::Error for AudioFileFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
 
 const DOWNLOAD_STATUS_POISON_MSG: &str = "audio download status mutex should not be poisoned";
 
@@ -89,6 +192,10 @@ pub struct AudioFetchParams {
     /// of audio data may be larger or smaller.
     pub read_ahead_during_playback: Duration,
 
+    /// Minimum compressed bytes requested ahead of the current read position. This complements
+    /// the time targets for low-bitrate media without allocating an in-memory audio buffer.
+    pub minimum_read_ahead_bytes: usize,
+
     /// If the amount of data that is pending (requested but not received) is less than a certain amount,
     /// data is pre-fetched in addition to the read ahead settings above. The threshold for requesting more
     /// data is calculated as `<pending bytes> < PREFETCH_THRESHOLD_FACTOR * <ping time> * <nominal data rate>`
@@ -107,8 +214,9 @@ impl Default for AudioFetchParams {
             minimum_throughput,
             initial_ping_time_estimate: Duration::from_millis(500),
             maximum_assumed_ping_time: Duration::from_millis(1500),
-            read_ahead_before_playback: Duration::from_secs(1),
+            read_ahead_before_playback: Duration::from_secs(5),
             read_ahead_during_playback: Duration::from_secs(5),
+            minimum_read_ahead_bytes: 256 * 1024,
             prefetch_threshold_factor: 4.0,
             download_timeout: Duration::from_secs(
                 (minimum_download_size / minimum_throughput) as u64,
@@ -140,6 +248,7 @@ pub struct StreamingRequest {
     initial_response: Option<Response<Incoming>>,
     offset: usize,
     length: usize,
+    attempt: usize,
 }
 
 #[derive(Debug)]
@@ -194,6 +303,12 @@ impl StreamLoaderController {
         self.stream_shared.as_ref().map(|shared| shared.ping_time())
     }
 
+    pub fn is_degraded(&self) -> bool {
+        self.stream_shared
+            .as_ref()
+            .is_some_and(|shared| shared.degraded.load(Ordering::Acquire))
+    }
+
     fn send_stream_loader_command(&self, command: StreamLoaderCommand) {
         if let Some(ref channel) = self.channel_tx {
             // Ignore the error in case the channel has been closed already.
@@ -231,6 +346,13 @@ impl StreamLoaderController {
                     .downloaded
                     .contained_length_from_value(range.start)
             {
+                if shared.closed.load(Ordering::Acquire) {
+                    return Err(Error::cancelled("audio range request was closed"));
+                }
+                if let Some(failure) = shared.failure_at(range.start) {
+                    return Err(failure.into_core_error());
+                }
+
                 let (new_download_status, wait_result) = shared
                     .cond
                     .wait_timeout(download_status, download_timeout)
@@ -238,6 +360,12 @@ impl StreamLoaderController {
 
                 download_status = new_download_status;
                 if wait_result.timed_out() {
+                    if let Some(failure) = shared
+                        .failure_at(range.start)
+                        .or_else(|| shared.latest_failure_at(range.start))
+                    {
+                        return Err(failure.into_core_error());
+                    }
                     return Err(AudioFileError::WaitTimeout.into());
                 }
 
@@ -323,7 +451,6 @@ struct AudioFileDownloadStatus {
 }
 
 struct AudioFileShared {
-    cdn_url: String,
     file_size: usize,
     bytes_per_second: usize,
     cond: Condvar,
@@ -333,6 +460,10 @@ struct AudioFileShared {
     ping_time_ms: AtomicUsize,
     read_position: AtomicUsize,
     throughput: AtomicUsize,
+    degraded: AtomicBool,
+    closed: AtomicBool,
+    latest_failure: Mutex<Option<AudioFileFailure>>,
+    last_failure: Mutex<Option<AudioFileFailure>>,
 }
 
 impl AudioFileShared {
@@ -374,6 +505,28 @@ impl AudioFileShared {
         self.read_position
             .store(position as usize, Ordering::Release)
     }
+
+    fn failure_at(&self, position: usize) -> Option<AudioFileFailure> {
+        self.last_failure
+            .lock()
+            .expect(DOWNLOAD_STATUS_POISON_MSG)
+            .as_ref()
+            .filter(|failure| range_contains_position(failure.range, position))
+            .cloned()
+    }
+
+    fn latest_failure_at(&self, position: usize) -> Option<AudioFileFailure> {
+        self.latest_failure
+            .lock()
+            .expect(DOWNLOAD_STATUS_POISON_MSG)
+            .as_ref()
+            .filter(|failure| range_contains_position(failure.range, position))
+            .cloned()
+    }
+}
+
+fn range_contains_position(range: Range, position: usize) -> bool {
+    range.start <= position && position < range.end()
 }
 
 impl AudioFile {
@@ -445,50 +598,88 @@ impl AudioFileStreaming {
 
         let minimum_download_size = AudioFetchParams::get().minimum_download_size;
 
-        let mut response_streamer_url = None;
+        let mut initial_request = None;
+        let mut last_error = None;
         let urls = cdn_url.try_get_urls()?;
-        for url in &urls {
+        for (candidate_index, url) in urls.iter().enumerate() {
             // When the audio file is really small, this `download_size` may turn out to be
             // larger than the audio file we're going to stream later on. This is OK; requesting
             // `Content-Range` > `Content-Length` will return the complete file with status code
             // 206 Partial Content.
-            let mut streamer =
-                session
-                    .spclient()
-                    .stream_from_cdn(*url, 0, minimum_download_size)?;
+            for status_attempt in 0..2 {
+                let mut streamer =
+                    match session
+                        .spclient()
+                        .stream_from_cdn(*url, 0, minimum_download_size)
+                    {
+                        Ok(streamer) => streamer,
+                        Err(error) => {
+                            last_error = Some(error);
+                            break;
+                        }
+                    };
 
-            // Get the first chunk with the headers to get the file size.
-            // The remainder of that chunk with possibly also a response body is then
-            // further processed in `audio_file_fetch`.
-            let streamer_result = tokio::time::timeout(Duration::from_secs(10), streamer.next())
-                .await
-                .map_err(|_| AudioFileError::WaitTimeout.into())
-                .and_then(|x| x.ok_or_else(|| AudioFileError::NoData.into()))
-                .and_then(|x| x.map_err(Error::from));
+                // Get the headers to learn the file size. The body remains streaming and is
+                // consumed by `audio_file_fetch` so startup bytes become usable immediately.
+                let streamer_result =
+                    tokio::time::timeout(Duration::from_secs(10), streamer.next())
+                        .await
+                        .map_err(|_| AudioFileError::WaitTimeout.into())
+                        .and_then(|x| x.ok_or_else(|| AudioFileError::NoData.into()))
+                        .and_then(|x| x.map_err(Error::from));
 
-            match streamer_result {
-                Ok(r) => {
-                    response_streamer_url = Some((r, streamer, url));
-                    break;
+                match streamer_result {
+                    Ok(response) if response.status() == StatusCode::PARTIAL_CONTENT => {
+                        debug!(
+                            "Opened audio stream using CDN candidate {}/{}",
+                            candidate_index + 1,
+                            urls.len()
+                        );
+                        initial_request = Some((response, streamer));
+                        break;
+                    }
+                    Ok(response) => {
+                        let status = response.status();
+                        if status == StatusCode::TOO_MANY_REQUESTS && status_attempt == 0 {
+                            if let Some(delay) = HttpClient::get_retry_after(response.headers()) {
+                                let delay = delay.min(MAX_INITIAL_RETRY_AFTER);
+                                debug!(
+                                    "Initial CDN candidate was rate limited; retrying after {delay:?}"
+                                );
+                                tokio::time::sleep(delay).await;
+                                continue;
+                            }
+                        }
+                        debug!(
+                            "CDN candidate {}/{} returned retryable status {status}; failing over",
+                            candidate_index + 1,
+                            urls.len()
+                        );
+                        last_error = Some(HttpClientError::StatusCode(status).into());
+                        break;
+                    }
+                    Err(error) => {
+                        debug!(
+                            "CDN candidate {}/{} failed before streaming; failing over",
+                            candidate_index + 1,
+                            urls.len()
+                        );
+                        last_error = Some(error);
+                        break;
+                    }
                 }
-                Err(e) => warn!("Fetching {url} failed with error {e:?}, trying next"),
+            }
+
+            if initial_request.is_some() {
+                break;
             }
         }
 
-        let Some((response, streamer, url)) = response_streamer_url else {
-            return Err(Error::unavailable(format!(
-                "{} URLs failed, none left to try",
-                urls.len()
-            )));
+        let Some((response, streamer)) = initial_request else {
+            return Err(last_error.unwrap_or_else(|| {
+                Error::unavailable(format!("{} CDN candidates failed", urls.len()))
+            }));
         };
-
-        trace!("Streaming from {url}");
-
-        let code = response.status();
-        if code != StatusCode::PARTIAL_CONTENT {
-            debug!("Opening audio file expected partial content but got: {code}");
-            return Err(AudioFileError::StatusCode(code).into());
-        }
 
         let header_value = response
             .headers()
@@ -505,10 +696,10 @@ impl AudioFileStreaming {
             initial_response: Some(response),
             offset: 0,
             length: upper_bound + 1,
+            attempt: 0,
         };
 
         let shared = Arc::new(AudioFileShared {
-            cdn_url: url.to_string(),
             file_size,
             bytes_per_second,
             cond: Condvar::new(),
@@ -521,6 +712,10 @@ impl AudioFileStreaming {
             ping_time_ms: AtomicUsize::new(0),
             read_position: AtomicUsize::new(0),
             throughput: AtomicUsize::new(0),
+            degraded: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            latest_failure: Mutex::new(None),
+            last_failure: Mutex::new(None),
         });
 
         let write_file = NamedTempFile::new_in(session.config().tmp_dir.clone())?;
@@ -533,6 +728,7 @@ impl AudioFileStreaming {
 
         session.spawn(audio_file_fetch(
             session.clone(),
+            cdn_url,
             shared.clone(),
             initial_request,
             write_file,
@@ -562,11 +758,12 @@ impl Read for AudioFileStreaming {
             return Ok(0);
         }
 
-        let read_ahead_during_playback = AudioFetchParams::get().read_ahead_during_playback;
+        let params = AudioFetchParams::get();
+        let read_ahead_during_playback = params.read_ahead_during_playback;
         let length_to_request = if self.shared.is_download_streaming() {
-            let length_to_request = length
-                + (read_ahead_during_playback.as_secs_f32() * self.shared.bytes_per_second as f32)
-                    as usize;
+            let time_target = (read_ahead_during_playback.as_secs_f32()
+                * self.shared.bytes_per_second as f32) as usize;
+            let length_to_request = length + time_target.max(params.minimum_read_ahead_bytes);
 
             // Due to the read-ahead stuff, we potentially request more than the actual request demanded.
             min(length_to_request, self.shared.file_size - offset)
@@ -594,6 +791,18 @@ impl Read for AudioFileStreaming {
 
         let download_timeout = AudioFetchParams::get().download_timeout;
         while !download_status.downloaded.contains(offset) {
+            if self.shared.closed.load(Ordering::Acquire) {
+                let failure = AudioFileFailure::new(
+                    AudioFileErrorKind::Cancelled,
+                    Range::new(offset, length),
+                    Error::cancelled("audio stream was closed"),
+                );
+                return Err(io::Error::new(failure.io_kind(), failure));
+            }
+            if let Some(failure) = self.shared.failure_at(offset) {
+                return Err(io::Error::new(failure.io_kind(), failure));
+            }
+
             let (new_download_status, wait_result) = self
                 .shared
                 .cond
@@ -602,6 +811,13 @@ impl Read for AudioFileStreaming {
 
             download_status = new_download_status;
             if wait_result.timed_out() {
+                if let Some(failure) = self
+                    .shared
+                    .failure_at(offset)
+                    .or_else(|| self.shared.latest_failure_at(offset))
+                {
+                    return Err(io::Error::new(failure.io_kind(), failure));
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     Error::deadline_exceeded(AudioFileError::WaitTimeout),
@@ -622,6 +838,16 @@ impl Read for AudioFileStreaming {
         self.shared.set_read_position(self.position);
 
         Ok(read_len)
+    }
+}
+
+impl Drop for AudioFileStreaming {
+    fn drop(&mut self) {
+        self.shared.closed.store(true, Ordering::Release);
+        let _ = self
+            .stream_loader_command_tx
+            .send(StreamLoaderCommand::Close);
+        self.shared.cond.notify_all();
     }
 }
 
@@ -684,6 +910,38 @@ impl Seek for AudioFile {
         match *self {
             AudioFile::Cached(ref mut file) => file.seek(pos),
             AudioFile::Streaming(ref mut file) => file.seek(pos),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_ahead_range_does_not_apply_to_buffered_position() {
+        let failed_ahead = Range::new(512 * 1024, 64 * 1024);
+
+        assert!(!range_contains_position(failed_ahead, 128 * 1024));
+        assert!(range_contains_position(failed_ahead, 512 * 1024));
+    }
+
+    #[test]
+    fn default_buffer_policy_has_time_and_byte_floors() {
+        let params = AudioFetchParams::default();
+
+        assert!(params.read_ahead_before_playback >= Duration::from_secs(5));
+        assert!(params.read_ahead_during_playback >= Duration::from_secs(5));
+        assert!(params.minimum_read_ahead_bytes >= 256 * 1024);
+    }
+
+    #[test]
+    fn cdn_status_alone_never_permanently_poisons_media() {
+        for status in [401, 403, 408, 416, 429, 500, 503] {
+            assert_eq!(
+                classify_http_status(status),
+                AudioFileErrorKind::TransientService
+            );
         }
     }
 }

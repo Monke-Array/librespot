@@ -10,7 +10,7 @@ use std::{
     sync::Mutex,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     thread,
@@ -20,7 +20,9 @@ use std::{
 #[cfg(feature = "passthrough-decoder")]
 use crate::decoder::PassthroughDecoder;
 use crate::{
-    audio::{AudioDecrypt, AudioFetchParams, AudioFile, StreamLoaderController},
+    audio::{
+        AudioDecrypt, AudioFetchParams, AudioFile, AudioFileErrorKind, StreamLoaderController,
+    },
     audio_backend::Sink,
     config::{Bitrate, NormalisationMethod, NormalisationType, PlayerConfig},
     convert::Converter,
@@ -29,20 +31,20 @@ use crate::{
         error::ErrorKind, http_client::HttpClientError, mercury::MercuryError,
         session::SessionError, util::SeqGenerator,
     },
-    decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, SymphoniaDecoder},
+    decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, DecoderError, SymphoniaDecoder},
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
 };
-use futures_util::{
-    StreamExt, TryFutureExt, future, future::FusedFuture,
-    stream::futures_unordered::FuturesUnordered,
-};
+use futures_util::{StreamExt, future::FusedFuture, stream::futures_unordered::FuturesUnordered};
 use librespot_metadata::{audio::UniqueFields, track::Tracks};
 
 use symphonia::core::io::MediaSource;
 use symphonia::core::probe::Hint;
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::Sleep,
+};
 
 use crate::SAMPLES_PER_SECOND;
 
@@ -55,6 +57,10 @@ pub const PCM_AT_0DBFS: f64 = 1.0;
 const SPOTIFY_OGG_HEADER_END: u64 = 0xa7;
 
 const LOAD_HANDLES_POISON_MSG: &str = "load handles mutex should not be poisoned";
+const MAX_TRACK_RECOVERY_ATTEMPTS: usize = 8;
+const MAX_TRACK_RECOVERY_DELAY: Duration = Duration::from_secs(30);
+const MIN_SLOW_RECOVERY_DELAY: Duration = Duration::from_secs(30);
+const MAX_SLOW_RECOVERY_DELAY: Duration = Duration::from_secs(60);
 
 pub type PlayerResult = Result<(), Error>;
 
@@ -110,12 +116,6 @@ impl PlayerLoadError {
                 | librespot_metadata::MetadataError::ExplicitContentFiltered => PermanentTrack,
                 librespot_metadata::MetadataError::Empty => TransientService,
             }
-        } else if matches!(
-            source.error.downcast_ref::<HttpClientError>(),
-            Some(HttpClientError::StatusCode(status))
-                if matches!(status.as_u16(), 408 | 504)
-        ) {
-            TransientNetwork
         } else if source.error.downcast_ref::<HttpClientError>().is_some()
             || source.error.downcast_ref::<MercuryError>().is_some()
             || source.error.downcast_ref::<CdnUrlError>().is_some()
@@ -142,6 +142,40 @@ impl PlayerLoadError {
             Error::failed_precondition(io::Error::new(io::ErrorKind::InvalidData, message.into())),
         )
     }
+
+    fn from_decoder_error(session: &Session, source: DecoderError) -> Self {
+        use PlayerLoadErrorKind::*;
+
+        let kind = if session.is_invalid() {
+            SessionInvalid
+        } else {
+            match &source {
+                DecoderError::AudioFile(failure) => match failure.kind {
+                    AudioFileErrorKind::TransientNetwork => TransientNetwork,
+                    AudioFileErrorKind::TransientService => TransientService,
+                    AudioFileErrorKind::SessionInvalid => SessionInvalid,
+                    AudioFileErrorKind::Cancelled => Cancelled,
+                    AudioFileErrorKind::PermanentMedia => PermanentTrack,
+                },
+                DecoderError::Io(error) => match error.kind() {
+                    io::ErrorKind::TimedOut
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::UnexpectedEof => TransientNetwork,
+                    io::ErrorKind::Interrupted => Cancelled,
+                    io::ErrorKind::InvalidData => PermanentTrack,
+                    _ => TransientService,
+                },
+                DecoderError::PassthroughDecoder(_) | DecoderError::SymphoniaDecoder(_) => {
+                    PermanentTrack
+                }
+            }
+        };
+
+        Self::new(kind, source.into())
+    }
 }
 
 pub struct Player {
@@ -166,6 +200,12 @@ struct PlayerInternal {
 
     state: PlayerState,
     preload: PlayerPreload,
+    recovery: Option<PlayerRecovery>,
+    recovery_generation: u64,
+    network_health: RecoveryHealth,
+    #[cfg(test)]
+    recovery_load_script:
+        std::collections::VecDeque<Result<PlayerLoadedTrackData, PlayerLoadError>>,
     sink: Box<dyn Sink>,
     sink_status: SinkStatus,
     sink_event_callback: Option<SinkEventCallback>,
@@ -407,6 +447,13 @@ fn load_error_event(
     }
 }
 
+fn natural_end_of_track_event(track_id: SpotifyUri, play_request_id: u64) -> PlayerEvent {
+    PlayerEvent::EndOfTrack {
+        track_id,
+        play_request_id,
+    }
+}
+
 pub type PlayerEventChannel = mpsc::UnboundedReceiver<PlayerEvent>;
 
 #[inline]
@@ -612,6 +659,11 @@ impl Player {
 
                 state: PlayerState::Stopped,
                 preload: PlayerPreload::None,
+                recovery: None,
+                recovery_generation: 0,
+                network_health: RecoveryHealth::Healthy,
+                #[cfg(test)]
+                recovery_load_script: std::collections::VecDeque::new(),
                 sink: sink_builder(),
                 sink_status: SinkStatus::Closed,
                 sink_event_callback: None,
@@ -690,7 +742,12 @@ impl Player {
         self.command(PlayerCommand::Seek(position_ms));
     }
 
+    /// Replace the session used for new media operations. Any latched same-track recovery is
+    /// restarted against the replacement while retaining its URI, position, and play intent.
     pub fn set_session(&self, session: Session) {
+        // A recovery waiting on an invalid session is intentionally owned by the player. Replacing
+        // the session restarts that same URI/position under a newer generation without requiring
+        // the caller to reconstruct the Player.
         self.command(PlayerCommand::SetSession(session));
     }
 
@@ -793,18 +850,135 @@ struct PlayerLoadedTrackData {
     is_explicit: bool,
 }
 
+type TrackLoaderFuture =
+    Pin<Box<dyn FusedFuture<Output = Result<PlayerLoadedTrackData, PlayerLoadError>> + Send>>;
+
+struct CancellableTrackLoader {
+    receiver: oneshot::Receiver<Result<PlayerLoadedTrackData, PlayerLoadError>>,
+    cancelled: Arc<AtomicBool>,
+    active_controller: Arc<Mutex<Option<StreamLoaderController>>>,
+    terminated: bool,
+}
+
+impl Future for CancellableTrackLoader {
+    type Output = Result<PlayerLoadedTrackData, PlayerLoadError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.receiver).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => {
+                self.terminated = true;
+                self.active_controller
+                    .lock()
+                    .expect(LOAD_HANDLES_POISON_MSG)
+                    .take();
+                Poll::Ready(result.unwrap_or_else(|error| {
+                    Err(PlayerLoadError::new(
+                        PlayerLoadErrorKind::Cancelled,
+                        Error::cancelled(error),
+                    ))
+                }))
+            }
+        }
+    }
+}
+
+impl FusedFuture for CancellableTrackLoader {
+    fn is_terminated(&self) -> bool {
+        self.terminated
+    }
+}
+
+impl Drop for CancellableTrackLoader {
+    fn drop(&mut self) {
+        if self.terminated {
+            return;
+        }
+
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(controller) = self
+            .active_controller
+            .lock()
+            .expect(LOAD_HANDLES_POISON_MSG)
+            .take()
+        {
+            controller.close();
+        }
+    }
+}
+
 enum PlayerPreload {
     None,
     Loading {
         track_id: SpotifyUri,
-        loader: Pin<
-            Box<dyn FusedFuture<Output = Result<PlayerLoadedTrackData, PlayerLoadError>> + Send>,
-        >,
+        loader: TrackLoaderFuture,
     },
     Ready {
         track_id: SpotifyUri,
         loaded_track: Box<PlayerLoadedTrackData>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryHealth {
+    Healthy,
+    Degraded,
+    Recovering,
+}
+
+enum RecoveryPhase {
+    Waiting(Pin<Box<Sleep>>),
+    Loading(TrackLoaderFuture),
+    WaitingForSession,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryMode {
+    Fast,
+    Slow,
+}
+
+struct PlayerRecovery {
+    track_id: SpotifyUri,
+    play_request_id: u64,
+    position_ms: u32,
+    start_playback: bool,
+    generation: u64,
+    attempt: usize,
+    mode: RecoveryMode,
+    phase: RecoveryPhase,
+}
+
+struct RecoveryRequest {
+    track_id: SpotifyUri,
+    play_request_id: u64,
+    position_ms: u32,
+    start_playback: bool,
+    kind: PlayerLoadErrorKind,
+    failed_attempts: usize,
+    buffer_starved: bool,
+}
+
+impl PlayerRecovery {
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
+
+    fn set_play_intent(&mut self, start_playback: bool) {
+        self.start_playback = start_playback;
+    }
+
+    fn restart(&mut self, generation: u64, position_ms: u32, session_invalid: bool) {
+        self.generation = generation;
+        self.position_ms = position_ms;
+        self.attempt = 0;
+        self.mode = RecoveryMode::Fast;
+        self.phase = if session_invalid {
+            RecoveryPhase::WaitingForSession
+        } else {
+            RecoveryPhase::Waiting(Box::pin(tokio::time::sleep(Duration::ZERO)))
+        };
+    }
 }
 
 type Decoder = Box<dyn AudioDecoder + Send>;
@@ -815,9 +989,8 @@ enum PlayerState {
         track_id: SpotifyUri,
         play_request_id: u64,
         start_playback: bool,
-        loader: Pin<
-            Box<dyn FusedFuture<Output = Result<PlayerLoadedTrackData, PlayerLoadError>> + Send>,
-        >,
+        position_ms: u32,
+        loader: TrackLoaderFuture,
     },
     Paused {
         track_id: SpotifyUri,
@@ -1331,7 +1504,7 @@ impl PlayerTrackLoader {
                     error!("Unable to read audio file: {e}");
                     return Err(match key_error {
                         Some(error) => PlayerLoadError::from_error(&self.session, error),
-                        None => PlayerLoadError::from_error(&self.session, e.into()),
+                        None => PlayerLoadError::from_decoder_error(&self.session, e),
                     });
                 }
             };
@@ -1359,7 +1532,7 @@ impl PlayerTrackLoader {
                     error!(
                         "PlayerTrackLoader::load_track error seeking to starting position {position_ms}: {e}"
                     );
-                    return Err(PlayerLoadError::from_error(&self.session, e.into()));
+                    return Err(PlayerLoadError::from_decoder_error(&self.session, e));
                 }
             };
 
@@ -1494,6 +1667,249 @@ impl PlayerTrackLoader {
     }
 }
 
+impl PlayerInternal {
+    fn next_recovery_generation(&mut self) -> u64 {
+        self.recovery_generation = self.recovery_generation.wrapping_add(1);
+        self.recovery_generation
+    }
+
+    fn recovery_delay(generation: u64, next_attempt: usize) -> Duration {
+        let exponent = next_attempt.saturating_sub(1).min(7) as u32;
+        let base_ms = 250_u64.saturating_mul(1_u64 << exponent);
+        let jitter_ms =
+            (generation.wrapping_mul(67) ^ (next_attempt as u64).wrapping_mul(131)) % 250;
+        Duration::from_millis(base_ms + jitter_ms).min(MAX_TRACK_RECOVERY_DELAY)
+    }
+
+    fn slow_recovery_delay(generation: u64, next_attempt: usize) -> Duration {
+        let span = MAX_SLOW_RECOVERY_DELAY - MIN_SLOW_RECOVERY_DELAY;
+        let jitter = (generation.wrapping_mul(71) ^ (next_attempt as u64).wrapping_mul(149))
+            % (span.as_secs() + 1);
+        MIN_SLOW_RECOVERY_DELAY + Duration::from_secs(jitter)
+    }
+
+    fn recovery_track_loader(
+        &mut self,
+        track_id: SpotifyUri,
+        position_ms: u32,
+    ) -> TrackLoaderFuture {
+        #[cfg(test)]
+        if let Some(outcome) = self.recovery_load_script.pop_front() {
+            return Box::pin(futures_util::future::ready(outcome));
+        }
+
+        Box::pin(self.load_track(track_id, position_ms, true))
+    }
+
+    fn cancel_recovery(&mut self, reason: &str) {
+        if let Some(recovery) = self.recovery.take() {
+            debug!(
+                "Cancelling recovery generation {} for <{}> at {} ms because {reason}",
+                recovery.generation, recovery.track_id, recovery.position_ms
+            );
+            self.next_recovery_generation();
+            self.network_health = RecoveryHealth::Healthy;
+        }
+    }
+
+    fn begin_recovery(&mut self, request: RecoveryRequest) {
+        let RecoveryRequest {
+            track_id,
+            play_request_id,
+            position_ms,
+            start_playback,
+            kind,
+            failed_attempts,
+            buffer_starved,
+        } = request;
+        self.cancel_recovery("a newer recovery superseded it");
+        let generation = self.next_recovery_generation();
+
+        if buffer_starved {
+            debug!(
+                "Compressed buffer starved for <{track_id}> at {position_ms} ms; entering latched recovery generation {generation}"
+            );
+            self.ensure_sink_stopped(true);
+        } else {
+            debug!(
+                "Entering recovery generation {generation} for <{track_id}> at {position_ms} ms after {kind:?}"
+            );
+        }
+
+        self.preload = PlayerPreload::None;
+        self.state = PlayerState::Stopped;
+        self.network_health = RecoveryHealth::Recovering;
+
+        let phase = if kind == PlayerLoadErrorKind::SessionInvalid {
+            debug!(
+                "Session invalid while recovering <{track_id}>; waiting for Player::set_session"
+            );
+            RecoveryPhase::WaitingForSession
+        } else {
+            let delay = Self::recovery_delay(generation, failed_attempts + 1);
+            debug!(
+                "Scheduling same-track recovery for <{track_id}> attempt {} in {delay:?}",
+                failed_attempts + 1
+            );
+            RecoveryPhase::Waiting(Box::pin(tokio::time::sleep(delay)))
+        };
+
+        self.recovery = Some(PlayerRecovery {
+            track_id: track_id.clone(),
+            play_request_id,
+            position_ms,
+            start_playback,
+            generation,
+            attempt: failed_attempts,
+            mode: RecoveryMode::Fast,
+            phase,
+        });
+        self.send_event(load_error_event(track_id, play_request_id, kind, false));
+    }
+
+    fn poll_recovery(&mut self, cx: &mut Context<'_>) -> bool {
+        let Some(mut recovery) = self.recovery.take() else {
+            return false;
+        };
+
+        match &mut recovery.phase {
+            RecoveryPhase::Waiting(delay) => match delay.as_mut().poll(cx) {
+                Poll::Pending => {
+                    self.recovery = Some(recovery);
+                    false
+                }
+                Poll::Ready(()) => {
+                    if !recovery.is_current(self.recovery_generation) {
+                        debug!(
+                            "Discarding stale recovery generation {} for <{}>",
+                            recovery.generation, recovery.track_id
+                        );
+                        return true;
+                    }
+
+                    debug!(
+                        "Retrying <{}> from {} ms (attempt {}, generation {})",
+                        recovery.track_id,
+                        recovery.position_ms,
+                        recovery.attempt.saturating_add(1),
+                        recovery.generation
+                    );
+                    let loader =
+                        self.recovery_track_loader(recovery.track_id.clone(), recovery.position_ms);
+                    recovery.phase = RecoveryPhase::Loading(loader);
+                    self.recovery = Some(recovery);
+                    true
+                }
+            },
+            RecoveryPhase::Loading(loader) => match loader.as_mut().poll(cx) {
+                Poll::Pending => {
+                    self.recovery = Some(recovery);
+                    false
+                }
+                Poll::Ready(Ok(loaded_track)) => {
+                    if !recovery.is_current(self.recovery_generation) {
+                        debug!(
+                            "Ignoring successful stale recovery generation {} for <{}>",
+                            recovery.generation, recovery.track_id
+                        );
+                        return true;
+                    }
+
+                    debug!(
+                        "Recovery generation {} succeeded for <{}> at {} ms; resuming once",
+                        recovery.generation, recovery.track_id, loaded_track.stream_position_ms
+                    );
+                    self.network_health = RecoveryHealth::Healthy;
+                    self.start_playback(
+                        recovery.track_id,
+                        recovery.play_request_id,
+                        loaded_track,
+                        recovery.start_playback,
+                    );
+                    true
+                }
+                Poll::Ready(Err(error)) => {
+                    if !recovery.is_current(self.recovery_generation) {
+                        debug!(
+                            "Ignoring failed stale recovery generation {} for <{}>",
+                            recovery.generation, recovery.track_id
+                        );
+                        return true;
+                    }
+
+                    recovery.attempt = recovery.attempt.saturating_add(1);
+                    debug!(
+                        "Recovery attempt {} for <{}> at {} ms failed as {:?}",
+                        recovery.attempt, recovery.track_id, recovery.position_ms, error.kind
+                    );
+
+                    match error.kind {
+                        PlayerLoadErrorKind::PermanentTrack => {
+                            self.network_health = RecoveryHealth::Healthy;
+                            self.send_event(PlayerEvent::Unavailable {
+                                track_id: recovery.track_id,
+                                play_request_id: recovery.play_request_id,
+                            });
+                        }
+                        PlayerLoadErrorKind::Cancelled => {
+                            debug!(
+                                "Recovery generation {} for <{}> was cancelled",
+                                recovery.generation, recovery.track_id
+                            );
+                            self.network_health = RecoveryHealth::Healthy;
+                        }
+                        PlayerLoadErrorKind::SessionInvalid => {
+                            debug!(
+                                "Recovery generation {} is waiting for a replacement session",
+                                recovery.generation
+                            );
+                            recovery.phase = RecoveryPhase::WaitingForSession;
+                            self.recovery = Some(recovery);
+                        }
+                        _ if recovery.mode == RecoveryMode::Fast
+                            && recovery.attempt < MAX_TRACK_RECOVERY_ATTEMPTS =>
+                        {
+                            let next_attempt = recovery.attempt.saturating_add(1);
+                            let delay = Self::recovery_delay(recovery.generation, next_attempt);
+                            debug!(
+                                "Recovery generation {} remains latched; attempt {} in {delay:?}",
+                                recovery.generation, next_attempt
+                            );
+                            recovery.phase =
+                                RecoveryPhase::Waiting(Box::pin(tokio::time::sleep(delay)));
+                            self.recovery = Some(recovery);
+                        }
+                        _ => {
+                            if recovery.mode == RecoveryMode::Fast {
+                                debug!(
+                                    "Recovery generation {} exhausted {} fast attempts for <{}>; entering low-frequency latched recovery",
+                                    recovery.generation, recovery.attempt, recovery.track_id
+                                );
+                                recovery.mode = RecoveryMode::Slow;
+                            }
+                            let next_attempt = recovery.attempt.saturating_add(1);
+                            let delay =
+                                Self::slow_recovery_delay(recovery.generation, next_attempt);
+                            debug!(
+                                "Slow recovery generation {} remains latched; retry {} for <{}> in {delay:?}",
+                                recovery.generation, next_attempt, recovery.track_id
+                            );
+                            recovery.phase =
+                                RecoveryPhase::Waiting(Box::pin(tokio::time::sleep(delay)));
+                            self.recovery = Some(recovery);
+                        }
+                    }
+                    true
+                }
+            },
+            RecoveryPhase::WaitingForSession => {
+                self.recovery = Some(recovery);
+                false
+            }
+        }
+    }
+}
+
 impl Future for PlayerInternal {
     type Output = ();
 
@@ -1521,12 +1937,14 @@ impl Future for PlayerInternal {
                 }
             }
 
-            // Handle loading of a new track to play
+            // Handle loading of a new track to play.
+            let mut current_load_failure = None;
             if let PlayerState::Loading {
                 ref mut loader,
                 ref track_id,
                 start_playback,
                 play_request_id,
+                position_ms,
             } = self.state
             {
                 // The loader may be terminated if we are trying to load the same track
@@ -1548,17 +1966,57 @@ impl Future for PlayerInternal {
                             }
                         }
                         Poll::Ready(Err(e)) => {
-                            error!("Unable to load track <{track_id:?}>: {e}");
-                            self.send_event(load_error_event(
+                            debug!(
+                                "Current load failed for <{track_id}> at {position_ms} ms as {:?}",
+                                e.kind
+                            );
+                            current_load_failure = Some((
                                 track_id,
                                 play_request_id,
+                                position_ms,
+                                start_playback,
                                 e.kind,
-                                false,
                             ));
                         }
                         Poll::Pending => (),
                     }
                 }
+            }
+
+            if let Some((track_id, play_request_id, position_ms, start_playback, kind)) =
+                current_load_failure
+            {
+                match kind {
+                    PlayerLoadErrorKind::PermanentTrack => {
+                        self.state = PlayerState::Stopped;
+                        self.send_event(PlayerEvent::Unavailable {
+                            track_id,
+                            play_request_id,
+                        });
+                    }
+                    PlayerLoadErrorKind::Cancelled => {
+                        self.state = PlayerState::Stopped;
+                        self.send_event(PlayerEvent::LoadFailed {
+                            track_id,
+                            play_request_id,
+                            error: kind,
+                            is_preload: false,
+                        });
+                    }
+                    _ => self.begin_recovery(RecoveryRequest {
+                        track_id,
+                        play_request_id,
+                        position_ms,
+                        start_playback,
+                        kind,
+                        failed_attempts: 1,
+                        buffer_starved: false,
+                    }),
+                }
+            }
+
+            if self.poll_recovery(cx) {
+                all_futures_completed_or_not_ready = false;
             }
 
             // handle pending preload requests.
@@ -1600,6 +2058,52 @@ impl Future for PlayerInternal {
                 }
             }
 
+            if self.network_health != RecoveryHealth::Recovering {
+                let stream_health = match &self.state {
+                    PlayerState::Playing {
+                        track_id,
+                        stream_position_ms,
+                        stream_loader_controller,
+                        ..
+                    }
+                    | PlayerState::Paused {
+                        track_id,
+                        stream_position_ms,
+                        stream_loader_controller,
+                        ..
+                    } => Some((
+                        track_id.clone(),
+                        *stream_position_ms,
+                        stream_loader_controller.is_degraded(),
+                    )),
+                    _ => None,
+                };
+                if let Some((track_id, position_ms, degraded)) = stream_health {
+                    match (self.network_health, degraded) {
+                        (RecoveryHealth::Healthy, true) => {
+                            self.network_health = RecoveryHealth::Degraded;
+                            if !matches!(self.preload, PlayerPreload::None) {
+                                debug!(
+                                    "Cancelling next-track preload to prioritize degraded current playback"
+                                );
+                                self.preload = PlayerPreload::None;
+                            }
+                            debug!(
+                                "Network degraded for <{track_id}> at {position_ms} ms; buffered audio remains available"
+                            );
+                        }
+                        (RecoveryHealth::Degraded, false) => {
+                            self.network_health = RecoveryHealth::Healthy;
+                            debug!(
+                                "Network recovered for <{track_id}> at {position_ms} ms without interrupting playback"
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            let mut decoder_failure = None;
             if self.state.is_playing() {
                 self.ensure_sink_running();
 
@@ -1696,28 +2200,26 @@ impl Future for PlayerInternal {
                                             }
                                         }
                                         Err(e) => {
-                                            error!(
-                                                "Skipping to next track, unable to decode samples for track <{track_id:?}>: {e:?}"
-                                            );
-                                            self.send_event(PlayerEvent::EndOfTrack {
-                                                track_id,
+                                            decoder_failure = Some((
+                                                track_id.clone(),
                                                 play_request_id,
-                                            })
+                                                *stream_position_ms,
+                                                DecoderError::SymphoniaDecoder(format!(
+                                                    "decoded packet type mismatch: {e}"
+                                                )),
+                                            ));
                                         }
                                     }
                                 }
                             }
 
-                            self.handle_packet(result, normalisation_factor);
+                            if decoder_failure.is_none() {
+                                self.handle_packet(result, normalisation_factor);
+                            }
                         }
                         Err(e) => {
-                            error!(
-                                "Skipping to next track, unable to get next packet for track <{track_id:?}>: {e:?}"
-                            );
-                            self.send_event(PlayerEvent::EndOfTrack {
-                                track_id,
-                                play_request_id,
-                            })
+                            decoder_failure =
+                                Some((track_id, play_request_id, *stream_position_ms, e));
                         }
                     }
                 } else {
@@ -1726,6 +2228,41 @@ impl Future for PlayerInternal {
                 };
             }
 
+            if let Some((track_id, play_request_id, position_ms, source)) = decoder_failure {
+                let error = PlayerLoadError::from_decoder_error(&self.session, source);
+                debug!(
+                    "Decoder stopped for <{track_id}> at {position_ms} ms with classification {:?}",
+                    error.kind
+                );
+                match error.kind {
+                    PlayerLoadErrorKind::TransientNetwork
+                    | PlayerLoadErrorKind::TransientService
+                    | PlayerLoadErrorKind::SessionInvalid => self.begin_recovery(RecoveryRequest {
+                        track_id,
+                        play_request_id,
+                        position_ms,
+                        start_playback: true,
+                        kind: error.kind,
+                        failed_attempts: 0,
+                        buffer_starved: true,
+                    }),
+                    PlayerLoadErrorKind::PermanentTrack => {
+                        self.state.playing_to_end_of_track();
+                        self.network_health = RecoveryHealth::Healthy;
+                        self.send_event(PlayerEvent::Unavailable {
+                            track_id,
+                            play_request_id,
+                        });
+                    }
+                    PlayerLoadErrorKind::Cancelled => {
+                        self.state = PlayerState::Stopped;
+                        self.ensure_sink_stopped(true);
+                    }
+                }
+            }
+
+            let allow_preload =
+                self.network_health == RecoveryHealth::Healthy && self.recovery.is_none();
             if let PlayerState::Playing {
                 ref track_id,
                 play_request_id,
@@ -1748,6 +2285,7 @@ impl Future for PlayerInternal {
                 let track_id = track_id.clone();
 
                 if (!*suggested_to_preload_next_track)
+                    && allow_preload
                     && ((duration_ms as i64 - stream_position_ms as i64)
                         < PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS as i64)
                     && stream_loader_controller.range_to_end_available()
@@ -1818,6 +2356,23 @@ impl PlayerInternal {
     }
 
     fn handle_player_stop(&mut self) {
+        if let Some(recovery) = self.recovery.take() {
+            debug!(
+                "Stop cancelled recovery generation {} for <{}> at {} ms",
+                recovery.generation, recovery.track_id, recovery.position_ms
+            );
+            self.next_recovery_generation();
+            self.network_health = RecoveryHealth::Healthy;
+            self.ensure_sink_stopped(false);
+            self.state = PlayerState::Stopped;
+            self.send_event(PlayerEvent::Stopped {
+                track_id: recovery.track_id,
+                play_request_id: recovery.play_request_id,
+            });
+            return;
+        }
+
+        self.next_recovery_generation();
         match self.state {
             PlayerState::Playing {
                 ref track_id,
@@ -1857,6 +2412,15 @@ impl PlayerInternal {
     }
 
     fn handle_play(&mut self) {
+        if let Some(recovery) = self.recovery.as_mut() {
+            debug!(
+                "Updating play intent during recovery generation {} for <{}>",
+                recovery.generation, recovery.track_id
+            );
+            recovery.set_play_intent(true);
+            return;
+        }
+
         match self.state {
             PlayerState::Paused {
                 ref track_id,
@@ -1885,6 +2449,16 @@ impl PlayerInternal {
     }
 
     fn handle_pause(&mut self) {
+        if let Some(recovery) = self.recovery.as_mut() {
+            debug!(
+                "Updating pause intent during recovery generation {} for <{}>",
+                recovery.generation, recovery.track_id
+            );
+            recovery.set_play_intent(false);
+            self.ensure_sink_stopped(true);
+            return;
+        }
+
         match self.state {
             PlayerState::Paused { .. } => self.ensure_sink_stopped(false),
             PlayerState::Playing {
@@ -2030,10 +2604,10 @@ impl PlayerInternal {
                     ..
                 } = self.state
                 {
-                    self.send_event(PlayerEvent::EndOfTrack {
-                        track_id: track_id.clone(),
+                    self.send_event(natural_end_of_track_event(
+                        track_id.clone(),
                         play_request_id,
-                    })
+                    ))
                 } else {
                     error!("PlayerInternal handle_packet: Invalid PlayerState");
                     exit(1);
@@ -2049,6 +2623,7 @@ impl PlayerInternal {
         loaded_track: PlayerLoadedTrackData,
         start_playback: bool,
     ) {
+        self.network_health = RecoveryHealth::Healthy;
         let audio_item = Box::new(loaded_track.audio_item.clone());
 
         self.send_event(PlayerEvent::TrackChanged { audio_item });
@@ -2123,6 +2698,8 @@ impl PlayerInternal {
         play: bool,
         position_ms: u32,
     ) -> PlayerResult {
+        self.cancel_recovery("a newer Load command arrived");
+        self.next_recovery_generation();
         let play_request_id =
             play_request_id_option.unwrap_or(self.play_request_id_generator.get());
 
@@ -2313,14 +2890,15 @@ impl PlayerInternal {
         self.preload = PlayerPreload::None;
 
         // If we don't have a loader yet, create one from scratch.
-        let loader =
-            loader.unwrap_or_else(|| Box::pin(self.load_track(track_id.clone(), position_ms)));
+        let loader = loader
+            .unwrap_or_else(|| Box::pin(self.load_track(track_id.clone(), position_ms, true)));
 
         // Set ourselves to a loading state.
         self.state = PlayerState::Loading {
             track_id,
             play_request_id,
             start_playback: play,
+            position_ms,
             loader,
         };
 
@@ -2328,6 +2906,13 @@ impl PlayerInternal {
     }
 
     fn handle_command_preload(&mut self, track_id: SpotifyUri) {
+        if self.recovery.is_some() || self.network_health != RecoveryHealth::Healthy {
+            debug!(
+                "Deferring preload of <{track_id}> while current-track networking is degraded or recovering"
+            );
+            return;
+        }
+
         debug!("Preloading track");
         let mut preload_track = true;
         // check whether the track is already loaded somewhere or being loaded.
@@ -2370,7 +2955,7 @@ impl PlayerInternal {
 
         // schedule the preload of the current track if desired.
         if preload_track {
-            let loader = self.load_track(track_id.clone(), 0);
+            let loader = self.load_track(track_id.clone(), 0, true);
             self.preload = PlayerPreload::Loading {
                 track_id,
                 loader: Box::pin(loader),
@@ -2379,6 +2964,24 @@ impl PlayerInternal {
     }
 
     fn handle_command_seek(&mut self, position_ms: u32) -> PlayerResult {
+        if let Some(mut recovery) = self.recovery.take() {
+            let old_generation = recovery.generation;
+            let generation = self.next_recovery_generation();
+            recovery.restart(generation, position_ms, self.session.is_invalid());
+            debug!(
+                "Seek invalidated recovery generation {old_generation}; generation {generation} will reopen <{}> at {position_ms} ms",
+                recovery.track_id
+            );
+            self.send_event(PlayerEvent::Seeked {
+                play_request_id: recovery.play_request_id,
+                track_id: recovery.track_id.clone(),
+                position_ms,
+            });
+            self.recovery = Some(recovery);
+            return Ok(());
+        }
+
+        self.next_recovery_generation();
         // When we are still loading, the user may immediately ask to
         // seek to another position yet the decoder won't be ready for
         // that. In this case just restart the loading process but
@@ -2397,6 +3000,22 @@ impl PlayerInternal {
                 position_ms,
             );
         }
+
+        let seek_request = match &self.state {
+            PlayerState::Playing {
+                track_id,
+                play_request_id,
+                ..
+            } => Some((track_id.clone(), *play_request_id, true)),
+            PlayerState::Paused {
+                track_id,
+                play_request_id,
+                ..
+            } => Some((track_id.clone(), *play_request_id, false)),
+            _ => None,
+        };
+
+        let mut seek_error = None;
 
         if let Some(decoder) = self.state.decoder() {
             match decoder.seek(position_ms) {
@@ -2423,14 +3042,41 @@ impl PlayerInternal {
                         });
                     }
                 }
-                Err(e) => error!("PlayerInternal::handle_command_seek error: {e}"),
+                Err(error) => {
+                    seek_error = Some(PlayerLoadError::from_decoder_error(&self.session, error))
+                }
             }
         } else {
             error!("Player::seek called from invalid state: {:?}", self.state);
         }
 
+        if let (Some((track_id, play_request_id, start_playback)), Some(error)) =
+            (seek_request.clone(), seek_error)
+        {
+            self.handle_seek_recovery(
+                track_id,
+                play_request_id,
+                start_playback,
+                position_ms,
+                error,
+            );
+            return Ok(());
+        }
+
         // ensure we have a bit of a buffer of downloaded data
-        self.preload_data_before_playback()?;
+        if let Err(source) = self.preload_data_before_playback() {
+            if let Some((track_id, play_request_id, start_playback)) = seek_request {
+                let error = PlayerLoadError::from_error(&self.session, source);
+                self.handle_seek_recovery(
+                    track_id,
+                    play_request_id,
+                    start_playback,
+                    position_ms,
+                    error,
+                );
+                return Ok(());
+            }
+        }
 
         if let PlayerState::Playing {
             ref mut reported_nominal_start_time,
@@ -2442,6 +3088,91 @@ impl PlayerInternal {
         }
 
         Ok(())
+    }
+
+    fn handle_seek_recovery(
+        &mut self,
+        track_id: SpotifyUri,
+        play_request_id: u64,
+        start_playback: bool,
+        position_ms: u32,
+        error: PlayerLoadError,
+    ) {
+        debug!(
+            "Seek for <{track_id}> at {position_ms} ms failed as {:?}",
+            error.kind
+        );
+        match error.kind {
+            PlayerLoadErrorKind::TransientNetwork
+            | PlayerLoadErrorKind::TransientService
+            | PlayerLoadErrorKind::SessionInvalid => self.begin_recovery(RecoveryRequest {
+                track_id,
+                play_request_id,
+                position_ms,
+                start_playback,
+                kind: error.kind,
+                failed_attempts: 0,
+                buffer_starved: start_playback,
+            }),
+            PlayerLoadErrorKind::PermanentTrack => {
+                self.state = PlayerState::Stopped;
+                self.ensure_sink_stopped(true);
+                self.send_event(PlayerEvent::Unavailable {
+                    track_id,
+                    play_request_id,
+                });
+            }
+            PlayerLoadErrorKind::Cancelled => {
+                self.state = PlayerState::Stopped;
+                self.ensure_sink_stopped(true);
+            }
+        }
+    }
+
+    fn handle_set_session(&mut self, session: Session) {
+        let old_session_invalid = self.session.is_invalid();
+        self.session = session;
+
+        if let Some(mut recovery) = self.recovery.take() {
+            let old_generation = recovery.generation;
+            let generation = self.next_recovery_generation();
+            let position_ms = recovery.position_ms;
+            recovery.restart(generation, position_ms, self.session.is_invalid());
+            debug!(
+                "Replacement session invalidated recovery generation {old_generation}; restarting generation {generation} for <{}> at {} ms",
+                recovery.track_id, recovery.position_ms
+            );
+            self.recovery = Some(recovery);
+            return;
+        }
+
+        if old_session_invalid {
+            if let PlayerState::Loading {
+                track_id,
+                play_request_id,
+                start_playback,
+                position_ms,
+                ..
+            } = &self.state
+            {
+                let track_id = track_id.clone();
+                let play_request_id = *play_request_id;
+                let start_playback = *start_playback;
+                let position_ms = *position_ms;
+                self.next_recovery_generation();
+                debug!(
+                    "Restarting in-flight load for <{track_id}> at {position_ms} ms on replacement session"
+                );
+                let loader = Box::pin(self.load_track(track_id.clone(), position_ms, true));
+                self.state = PlayerState::Loading {
+                    track_id,
+                    play_request_id,
+                    start_playback,
+                    position_ms,
+                    loader,
+                };
+            }
+        }
     }
 
     fn handle_command(&mut self, cmd: PlayerCommand) -> PlayerResult {
@@ -2463,7 +3194,7 @@ impl PlayerInternal {
 
             PlayerCommand::Stop => self.handle_player_stop(),
 
-            PlayerCommand::SetSession(session) => self.session = session,
+            PlayerCommand::SetSession(session) => self.handle_set_session(session),
 
             PlayerCommand::AddEventSender(sender) => self.event_senders.push(sender),
 
@@ -2562,6 +3293,7 @@ impl PlayerInternal {
         &mut self,
         spotify_uri: SpotifyUri,
         position_ms: u32,
+        prebuffer: bool,
     ) -> impl FusedFuture<Output = Result<PlayerLoadedTrackData, PlayerLoadError>> + Send + 'static
     {
         // This method creates a future that returns the loaded stream and associated info.
@@ -2577,12 +3309,66 @@ impl PlayerInternal {
         };
 
         let (result_tx, result_rx) = oneshot::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let active_controller = Arc::new(Mutex::new(None));
+        let worker_cancelled = cancelled.clone();
+        let worker_controller = active_controller.clone();
 
         let load_handles_clone = self.load_handles.clone();
         let handle = tokio::runtime::Handle::current();
 
         let load_handle = thread::spawn(move || {
-            let data = handle.block_on(loader.load_track(spotify_uri, position_ms));
+            let session = loader.session.clone();
+            let mut data = handle.block_on(loader.load_track(spotify_uri, position_ms));
+
+            if worker_cancelled.load(Ordering::Acquire) {
+                if let Ok(loaded_track) = data.as_ref() {
+                    loaded_track.stream_loader_controller.close();
+                }
+                data = Err(PlayerLoadError::new(
+                    PlayerLoadErrorKind::Cancelled,
+                    Error::cancelled("track load was superseded"),
+                ));
+            } else if prebuffer {
+                let mut cancelled_before_prebuffer = false;
+                if let Ok(loaded_track) = data.as_mut() {
+                    *worker_controller.lock().expect(LOAD_HANDLES_POISON_MSG) =
+                        Some(loaded_track.stream_loader_controller.clone());
+
+                    // Close the narrow race where cancellation happens after the first check but
+                    // before the controller becomes visible to `CancellableTrackLoader::drop`.
+                    if worker_cancelled.load(Ordering::Acquire) {
+                        loaded_track.stream_loader_controller.close();
+                        cancelled_before_prebuffer = true;
+                    } else {
+                        let params = AudioFetchParams::get();
+                        let time_target = (params.read_ahead_before_playback.as_secs_f32()
+                            * loaded_track.bytes_per_second as f32)
+                            as usize;
+                        let target = time_target.max(params.minimum_read_ahead_bytes);
+                        debug!(
+                            "Prebuffering up to {target} compressed bytes before playback at {} ms",
+                            loaded_track.stream_position_ms
+                        );
+                        if let Err(error) = loaded_track
+                            .stream_loader_controller
+                            .fetch_next_and_wait(target, target)
+                        {
+                            data = Err(PlayerLoadError::from_error(&session, error));
+                        }
+                    }
+                }
+                if cancelled_before_prebuffer {
+                    data = Err(PlayerLoadError::new(
+                        PlayerLoadErrorKind::Cancelled,
+                        Error::cancelled("track load was superseded"),
+                    ));
+                }
+            }
+            worker_controller
+                .lock()
+                .expect(LOAD_HANDLES_POISON_MSG)
+                .take();
             let _ = result_tx.send(data);
 
             let mut load_handles = load_handles_clone.lock().expect(LOAD_HANDLES_POISON_MSG);
@@ -2592,11 +3378,12 @@ impl PlayerInternal {
         let mut load_handles = self.load_handles.lock().expect(LOAD_HANDLES_POISON_MSG);
         load_handles.insert(load_handle.thread().id(), load_handle);
 
-        result_rx
-            .map_err(|error| {
-                PlayerLoadError::new(PlayerLoadErrorKind::Cancelled, Error::cancelled(error))
-            })
-            .and_then(future::ready)
+        CancellableTrackLoader {
+            receiver: result_rx,
+            cancelled,
+            active_controller,
+            terminated: false,
+        }
     }
 
     fn preload_data_before_playback(&mut self) -> PlayerResult {
@@ -2604,16 +3391,22 @@ impl PlayerInternal {
             bytes_per_second,
             ref mut stream_loader_controller,
             ..
+        }
+        | PlayerState::Paused {
+            bytes_per_second,
+            ref mut stream_loader_controller,
+            ..
         } = self.state
         {
-            let read_ahead_during_playback = AudioFetchParams::get().read_ahead_during_playback;
+            let params = AudioFetchParams::get();
+            let read_ahead_during_playback = params.read_ahead_during_playback;
             // Request our read ahead range
             let request_data_length =
                 (read_ahead_during_playback.as_secs_f32() * bytes_per_second as f32) as usize;
+            let request_data_length = request_data_length.max(params.minimum_read_ahead_bytes);
 
             // Request the part we want to wait for blocking. This effectively means we wait for the previous request to partially complete.
-            let wait_for_data_length =
-                (read_ahead_during_playback.as_secs_f32() * bytes_per_second as f32) as usize;
+            let wait_for_data_length = request_data_length;
 
             stream_loader_controller.fetch_next_and_wait(request_data_length, wait_for_data_length)
         } else {
@@ -2833,10 +3626,187 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        audio_backend::SinkResult, core::config::SessionConfig, local_file::LocalFileLookup,
+        mixer::NoOpVolume,
+    };
 
     fn track_uri() -> SpotifyUri {
         SpotifyUri::from_uri("spotify:track:2TpxZ7JUBn3uw46aR7qd6V")
             .expect("test URI should be valid")
+    }
+
+    fn recovery() -> PlayerRecovery {
+        PlayerRecovery {
+            track_id: track_uri(),
+            play_request_id: 7,
+            position_ms: 42_123,
+            start_playback: true,
+            generation: 11,
+            attempt: 1,
+            mode: RecoveryMode::Fast,
+            phase: RecoveryPhase::WaitingForSession,
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ScriptedLoadOutcome {
+        TransientFailure,
+        Success,
+    }
+
+    fn run_scripted_recovery(
+        recovery: PlayerRecovery,
+        outcomes: &[ScriptedLoadOutcome],
+    ) -> (Vec<(SpotifyUri, u32, bool)>, usize) {
+        let generation = recovery.generation;
+        let mut pending = Some(recovery);
+        let mut attempts = Vec::new();
+        let mut resumes = 0;
+
+        for outcome in outcomes {
+            let Some(current) = pending.as_mut() else {
+                continue;
+            };
+            if !current.is_current(generation) {
+                continue;
+            }
+            attempts.push((
+                current.track_id.clone(),
+                current.position_ms,
+                current.start_playback,
+            ));
+            match outcome {
+                ScriptedLoadOutcome::TransientFailure => current.attempt += 1,
+                ScriptedLoadOutcome::Success => {
+                    pending.take();
+                    resumes += 1;
+                }
+            }
+        }
+
+        (attempts, resumes)
+    }
+
+    fn session(runtime: &tokio::runtime::Runtime) -> Session {
+        let _guard = runtime.enter();
+        Session::new(SessionConfig::default(), None)
+    }
+
+    struct CountingSink {
+        starts: Arc<AtomicUsize>,
+        stops: Arc<AtomicUsize>,
+    }
+
+    impl Sink for CountingSink {
+        fn start(&mut self) -> SinkResult<()> {
+            self.starts.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn stop(&mut self) -> SinkResult<()> {
+            self.stops.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn write(&mut self, _: AudioPacket, _: &mut Converter) -> SinkResult<()> {
+            Ok(())
+        }
+    }
+
+    struct ScriptedDecoder;
+
+    impl AudioDecoder for ScriptedDecoder {
+        fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError> {
+            Ok(position_ms)
+        }
+
+        fn next_packet(
+            &mut self,
+        ) -> Result<Option<(AudioPacketPosition, AudioPacket)>, DecoderError> {
+            Ok(None)
+        }
+    }
+
+    fn scripted_loaded_track(position_ms: u32) -> PlayerLoadedTrackData {
+        let track_id = track_uri();
+        PlayerLoadedTrackData {
+            decoder: Box::new(ScriptedDecoder),
+            normalisation_data: NormalisationData::default(),
+            stream_loader_controller: StreamLoaderController::from_local_file(512 * 1024),
+            audio_item: AudioItem {
+                track_id: track_id.clone(),
+                uri: track_id.to_uri().expect("test URI should serialize"),
+                files: Default::default(),
+                name: "scripted recovery".into(),
+                covers: vec![],
+                language: vec![],
+                duration_ms: 180_000,
+                is_explicit: false,
+                availability: Ok(()),
+                alternatives: None,
+                unique_fields: UniqueFields::Track {
+                    artists: Default::default(),
+                    album: String::new(),
+                    album_artists: vec![],
+                    popularity: 0,
+                    number: 1,
+                    disc_number: 1,
+                },
+            },
+            bytes_per_second: 20 * 1024,
+            duration_ms: 180_000,
+            stream_position_ms: position_ms,
+            is_explicit: false,
+        }
+    }
+
+    fn poll_recovery_once(player: &mut PlayerInternal) -> bool {
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        player.poll_recovery(&mut context)
+    }
+
+    fn player_internal_with_sink(
+        runtime: &tokio::runtime::Runtime,
+        starts: Arc<AtomicUsize>,
+        stops: Arc<AtomicUsize>,
+    ) -> PlayerInternal {
+        player_internal_with_session(session(runtime), starts, stops)
+    }
+
+    fn player_internal_with_session(
+        session: Session,
+        starts: Arc<AtomicUsize>,
+        stops: Arc<AtomicUsize>,
+    ) -> PlayerInternal {
+        let (_cmd_tx, commands) = mpsc::unbounded_channel();
+        PlayerInternal {
+            session,
+            config: PlayerConfig::default(),
+            commands,
+            load_handles: Arc::new(Mutex::new(HashMap::new())),
+            state: PlayerState::Stopped,
+            preload: PlayerPreload::None,
+            recovery: None,
+            recovery_generation: 0,
+            network_health: RecoveryHealth::Healthy,
+            recovery_load_script: std::collections::VecDeque::new(),
+            sink: Box::new(CountingSink { starts, stops }),
+            sink_status: SinkStatus::Running,
+            sink_event_callback: None,
+            volume_getter: Box::new(NoOpVolume),
+            event_senders: vec![],
+            converter: Converter::new(None),
+            normalisation_peaks: [0.0; 2],
+            normalisation_integrators: [0.0; 2],
+            normalisation_channel: 0,
+            normalisation_knee_factor: 1.0,
+            auto_normalise_as_album: false,
+            player_id: 0,
+            play_request_id_generator: SeqGenerator::new(0),
+            last_progress_update: Instant::now(),
+            local_file_lookup: Arc::new(LocalFileLookup::default()),
+        }
     }
 
     #[test]
@@ -2860,6 +3830,367 @@ mod tests {
                 is_preload: true,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn transient_recovery_targets_same_uri_position_and_request() {
+        let recovery = recovery();
+
+        assert_eq!(recovery.track_id, track_uri());
+        assert_eq!(recovery.position_ms, 42_123);
+        assert_eq!(recovery.play_request_id, 7);
+        assert!(recovery.start_playback);
+    }
+
+    #[test]
+    fn scripted_initial_failure_retries_same_track_and_resumes_once() {
+        let expected_uri = track_uri();
+        let (attempts, resumes) = run_scripted_recovery(
+            recovery(),
+            &[
+                ScriptedLoadOutcome::TransientFailure,
+                ScriptedLoadOutcome::TransientFailure,
+                ScriptedLoadOutcome::Success,
+                ScriptedLoadOutcome::Success,
+            ],
+        );
+
+        assert_eq!(attempts.len(), 3);
+        assert!(attempts.iter().all(|(uri, position_ms, play)| {
+            uri == &expected_uri && *position_ms == 42_123 && *play
+        }));
+        assert_eq!(resumes, 1);
+    }
+
+    #[test]
+    fn play_pause_intent_is_preserved_and_updateable_during_recovery() {
+        let mut recovery = recovery();
+        recovery.set_play_intent(false);
+        assert!(!recovery.start_playback);
+
+        recovery.set_play_intent(true);
+        assert!(recovery.start_playback);
+        assert_eq!(recovery.position_ms, 42_123);
+    }
+
+    #[test]
+    fn seek_invalidates_stale_recovery_and_preserves_same_track() {
+        let mut recovery = recovery();
+        recovery.restart(12, 88_000, true);
+
+        assert!(!recovery.is_current(11));
+        assert!(recovery.is_current(12));
+        assert_eq!(recovery.track_id, track_uri());
+        assert_eq!(recovery.position_ms, 88_000);
+        assert!(matches!(recovery.phase, RecoveryPhase::WaitingForSession));
+    }
+
+    #[test]
+    fn newer_load_next_or_stop_generation_makes_retry_stale() {
+        let recovery = recovery();
+
+        for newer_generation in [12, 13, 14] {
+            assert!(!recovery.is_current(newer_generation));
+        }
+    }
+
+    #[test]
+    fn dropping_stale_loader_requests_cancellation() {
+        let (_sender, receiver) = oneshot::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let loader = CancellableTrackLoader {
+            receiver,
+            cancelled: cancelled.clone(),
+            active_controller: Arc::new(Mutex::new(None)),
+            terminated: false,
+        };
+
+        drop(loader);
+
+        assert!(cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn recovery_sink_stop_and_restart_are_each_latched_once() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts.clone(), stops.clone());
+
+        player.ensure_sink_stopped(true);
+        player.ensure_sink_stopped(true);
+        assert_eq!(stops.load(Ordering::Acquire), 1);
+
+        player.ensure_sink_running();
+        player.ensure_sink_running();
+        assert_eq!(starts.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn track_retry_backoff_is_bounded_and_jittered() {
+        let first = PlayerInternal::recovery_delay(11, 1);
+        let later = PlayerInternal::recovery_delay(11, 8);
+
+        assert!(first < later);
+        assert!(later <= MAX_TRACK_RECOVERY_DELAY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fast_budget_exhaustion_enters_slow_latched_recovery() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_session(
+            Session::new(SessionConfig::default(), None),
+            starts.clone(),
+            stops.clone(),
+        );
+        player.sink_status = SinkStatus::TemporarilyClosed;
+        player.network_health = RecoveryHealth::Recovering;
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        player.event_senders.push(event_tx);
+
+        let mut recovery = recovery();
+        recovery.attempt = MAX_TRACK_RECOVERY_ATTEMPTS - 1;
+        recovery.phase = RecoveryPhase::Loading(Box::pin(futures_util::future::ready(Err(
+            PlayerLoadError::message(
+                PlayerLoadErrorKind::TransientNetwork,
+                "scripted fast-budget failure",
+            ),
+        ))));
+        player.recovery_generation = recovery.generation;
+        player.recovery = Some(recovery);
+
+        assert!(poll_recovery_once(&mut player));
+
+        let recovery = player.recovery.as_ref().expect("recovery remains latched");
+        assert_eq!(recovery.mode, RecoveryMode::Slow);
+        assert_eq!(recovery.track_id, track_uri());
+        assert_eq!(recovery.position_ms, 42_123);
+        assert!(matches!(recovery.phase, RecoveryPhase::Waiting(_)));
+        assert_eq!(player.network_health, RecoveryHealth::Recovering);
+        assert_eq!(starts.load(Ordering::Acquire), 0);
+        assert_eq!(stops.load(Ordering::Acquire), 0);
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_recovery_keeps_retrying_and_resumes_same_track_once() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_session(
+            Session::new(SessionConfig::default(), None),
+            starts.clone(),
+            stops.clone(),
+        );
+        player.sink_status = SinkStatus::TemporarilyClosed;
+        player.network_health = RecoveryHealth::Recovering;
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        player.event_senders.push(event_tx);
+        player
+            .recovery_load_script
+            .push_back(Err(PlayerLoadError::message(
+                PlayerLoadErrorKind::TransientNetwork,
+                "scripted slow failure",
+            )));
+        player
+            .recovery_load_script
+            .push_back(Ok(scripted_loaded_track(42_123)));
+
+        let mut recovery = recovery();
+        recovery.attempt = MAX_TRACK_RECOVERY_ATTEMPTS;
+        recovery.mode = RecoveryMode::Slow;
+        let first_delay =
+            PlayerInternal::slow_recovery_delay(recovery.generation, recovery.attempt + 1);
+        recovery.phase = RecoveryPhase::Waiting(Box::pin(tokio::time::sleep(first_delay)));
+        player.recovery_generation = recovery.generation;
+        player.recovery = Some(recovery);
+
+        tokio::time::advance(first_delay).await;
+        assert!(poll_recovery_once(&mut player));
+        assert!(poll_recovery_once(&mut player));
+
+        let recovery = player
+            .recovery
+            .as_ref()
+            .expect("slow recovery remains latched");
+        assert_eq!(recovery.mode, RecoveryMode::Slow);
+        assert_eq!(recovery.track_id, track_uri());
+        assert_eq!(recovery.position_ms, 42_123);
+        assert!(recovery.start_playback);
+        assert_eq!(starts.load(Ordering::Acquire), 0);
+        assert_eq!(stops.load(Ordering::Acquire), 0);
+        assert!(event_rx.try_recv().is_err());
+
+        let second_delay =
+            PlayerInternal::slow_recovery_delay(recovery.generation, recovery.attempt + 1);
+        tokio::time::advance(second_delay).await;
+        assert!(poll_recovery_once(&mut player));
+        assert!(poll_recovery_once(&mut player));
+
+        assert!(player.recovery.is_none());
+        assert_eq!(player.network_health, RecoveryHealth::Healthy);
+        assert!(matches!(player.state, PlayerState::Playing { .. }));
+        assert_eq!(starts.load(Ordering::Acquire), 1);
+        assert_eq!(stops.load(Ordering::Acquire), 0);
+
+        let mut terminal_events = 0;
+        while let Ok(event) = event_rx.try_recv() {
+            if matches!(
+                event,
+                PlayerEvent::EndOfTrack { .. }
+                    | PlayerEvent::Unavailable { .. }
+                    | PlayerEvent::LoadFailed { .. }
+            ) {
+                terminal_events += 1;
+            }
+        }
+        assert_eq!(terminal_events, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn newer_load_command_cancels_slow_recovery_generation() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_session(
+            Session::new(SessionConfig::default(), None),
+            starts,
+            stops,
+        );
+        let mut recovery = recovery();
+        recovery.mode = RecoveryMode::Slow;
+        recovery.attempt = MAX_TRACK_RECOVERY_ATTEMPTS;
+        recovery.phase =
+            RecoveryPhase::Waiting(Box::pin(tokio::time::sleep(MAX_SLOW_RECOVERY_DELAY)));
+        player.recovery_generation = recovery.generation;
+        player.recovery = Some(recovery);
+
+        let newer_track = SpotifyUri::from_uri("spotify:album:0sNOF9WDwhWunNAHPD3Baj")
+            .expect("test URI should be valid");
+        player
+            .handle_command(PlayerCommand::Load {
+                track_id: newer_track.clone(),
+                play: true,
+                position_ms: 0,
+            })
+            .expect("new Load should be accepted");
+
+        assert!(player.recovery.is_none());
+        assert!(player.recovery_generation > 11);
+        assert!(matches!(
+            player.state,
+            PlayerState::Loading { ref track_id, .. } if track_id == &newer_track
+        ));
+        player.state = PlayerState::Stopped;
+    }
+
+    #[test]
+    fn session_invalid_recovery_waits_instead_of_retrying_media() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+
+        player.begin_recovery(RecoveryRequest {
+            track_id: track_uri(),
+            play_request_id: 7,
+            position_ms: 42_123,
+            start_playback: true,
+            kind: PlayerLoadErrorKind::SessionInvalid,
+            failed_attempts: 0,
+            buffer_starved: true,
+        });
+
+        let recovery = player.recovery.as_ref().expect("recovery remains latched");
+        assert_eq!(recovery.attempt, 0);
+        assert_eq!(recovery.track_id, track_uri());
+        assert_eq!(recovery.position_ms, 42_123);
+        assert!(recovery.start_playback);
+        assert!(matches!(recovery.phase, RecoveryPhase::WaitingForSession));
+    }
+
+    #[test]
+    fn replacement_session_restarts_latched_same_track_recovery() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        player.recovery_generation = 11;
+        player.recovery = Some(recovery());
+        player.session.shutdown();
+        let replacement = session(&runtime);
+
+        let _guard = runtime.enter();
+        player.handle_set_session(replacement);
+
+        let recovery = player.recovery.as_ref().expect("recovery remains latched");
+        assert_eq!(recovery.track_id, track_uri());
+        assert_eq!(recovery.position_ms, 42_123);
+        assert!(recovery.start_playback);
+        assert!(recovery.generation > 11);
+        assert!(matches!(recovery.phase, RecoveryPhase::Waiting(_)));
+    }
+
+    #[test]
+    fn stop_cancels_latched_recovery_and_stops_sink_once() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops.clone());
+        player.recovery_generation = 11;
+        player.recovery = Some(recovery());
+
+        player.handle_player_stop();
+        player.handle_player_stop();
+
+        assert!(player.recovery.is_none());
+        assert!(matches!(player.state, PlayerState::Stopped));
+        assert_eq!(stops.load(Ordering::Acquire), 1);
+        assert!(player.recovery_generation > 11);
+    }
+
+    #[test]
+    fn mid_track_timeout_is_recovery_not_end_of_track() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let session = session(&runtime);
+        let error = PlayerLoadError::from_decoder_error(
+            &session,
+            DecoderError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "scripted starvation",
+            )),
+        );
+        let event = load_error_event(track_uri(), 7, error.kind, false);
+
+        assert_eq!(error.kind, PlayerLoadErrorKind::TransientNetwork);
+        assert!(matches!(event, PlayerEvent::LoadFailed { .. }));
+        assert!(!matches!(event, PlayerEvent::EndOfTrack { .. }));
+    }
+
+    #[test]
+    fn natural_eof_still_produces_end_of_track() {
+        assert!(matches!(
+            natural_end_of_track_event(track_uri(), 7),
+            PlayerEvent::EndOfTrack {
+                play_request_id: 7,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn corrupt_decoder_media_is_permanent_only_with_positive_decoder_evidence() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let session = session(&runtime);
+        let error = PlayerLoadError::from_decoder_error(
+            &session,
+            DecoderError::SymphoniaDecoder("scripted corrupt container".into()),
+        );
+
+        assert_eq!(error.kind, PlayerLoadErrorKind::PermanentTrack);
+        assert!(matches!(
+            load_error_event(track_uri(), 7, error.kind, false),
+            PlayerEvent::Unavailable { .. }
         ));
     }
 }

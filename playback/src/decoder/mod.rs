@@ -1,5 +1,6 @@
-use std::ops::Deref;
+use std::{io, ops::Deref};
 
+use librespot_audio::AudioFileFailure;
 use thiserror::Error;
 
 #[cfg(feature = "passthrough-decoder")]
@@ -16,6 +17,23 @@ pub enum DecoderError {
     PassthroughDecoder(String),
     #[error("Symphonia Decoder Error: {0}")]
     SymphoniaDecoder(String),
+    #[error("Decoder I/O error: {0}")]
+    Io(#[source] io::Error),
+    #[error("Audio streaming error: {0}")]
+    AudioFile(#[source] AudioFileFailure),
+}
+
+impl DecoderError {
+    fn from_io(error: io::Error) -> Self {
+        if let Some(failure) = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<AudioFileFailure>())
+        {
+            Self::AudioFile(failure.clone())
+        } else {
+            Self::Io(error)
+        }
+    }
 }
 
 pub type DecoderResult<T> = Result<T, DecoderError>;
@@ -87,6 +105,9 @@ impl From<DecoderError> for librespot_core::error::Error {
 
 impl From<symphonia::core::errors::Error> for DecoderError {
     fn from(err: symphonia::core::errors::Error) -> Self {
-        Self::SymphoniaDecoder(err.to_string())
+        match err {
+            symphonia::core::errors::Error::IoError(error) => Self::from_io(error),
+            error => Self::SymphoniaDecoder(error.to_string()),
+        }
     }
 }
