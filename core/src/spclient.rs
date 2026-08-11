@@ -887,10 +887,11 @@ impl SpClient {
             Err(SpClientError::NoData)?
         }
 
+        crate::mix_debug::log_context_json("context-resolve-http", &ctx_json);
         let ctx = protobuf_json_mapping::parse_from_str::<Context>(&ctx_json);
 
-        if ctx.is_err() {
-            trace!("failed parsing context: {ctx_json}")
+        if let Err(why) = &ctx {
+            trace!("failed parsing context response: {why}")
         }
 
         Ok(ctx?)
@@ -915,10 +916,11 @@ impl SpClient {
             Err(SpClientError::NoData)?
         }
 
+        crate::mix_debug::log_context_json("autoplay-context-resolve-http", &ctx_json);
         let ctx = protobuf_json_mapping::parse_from_str::<Context>(&ctx_json);
 
-        if ctx.is_err() {
-            trace!("failed parsing context: {ctx_json}")
+        if let Err(why) = &ctx {
+            trace!("failed parsing autoplay context response: {why}")
         }
 
         Ok(ctx?)

@@ -11,6 +11,7 @@ use crate::{
         session::UserAttributes,
         spclient::TransferRequest,
     },
+    mix_debug,
     model::{LoadRequest, PlayingTrack, SpircPlayStatus},
     playback::{
         mixer::Mixer,
@@ -1098,6 +1099,8 @@ impl SpircTask {
             self.session.device_id()
         );
 
+        mix_debug::log_cluster("initial-put-state-response", &cluster);
+
         self.connect_established = true;
 
         let same_session = cluster.player_state.session_id == self.session.session_id()
@@ -1178,6 +1181,7 @@ impl SpircTask {
         &mut self,
         mut cluster_update: ClusterUpdate,
     ) -> Result<(), Error> {
+        mix_debug::log_cluster_update(&cluster_update);
         let reason = cluster_update.update_reason.enum_value();
 
         let device_ids = cluster_update.devices_that_changed.join(", ");
@@ -1350,6 +1354,7 @@ impl SpircTask {
     }
 
     fn handle_transfer(&mut self, mut transfer: TransferState) -> Result<(), Error> {
+        mix_debug::log_transfer(&transfer);
         let mut ctx_uri = match transfer.current_session.context.uri {
             None => Err(SpircError::NoUri("transfer context"))?,
             // can apparently happen when a state is transferred and was started with "uris" via the api
@@ -1936,6 +1941,7 @@ impl SpircTask {
         &mut self,
         playlist_modification_info: PlaylistModificationInfo,
     ) -> Result<(), Error> {
+        mix_debug::log_playlist_modification(&playlist_modification_info);
         let uri = playlist_modification_info
             .uri
             .ok_or(SpircError::NoUri("playlist modification"))?;

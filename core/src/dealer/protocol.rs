@@ -155,12 +155,9 @@ impl WebsocketRequest {
         let payload = handle_transfer_encoding(&self.headers, payload_bytes)?;
         let payload = String::from_utf8(payload)?;
 
+        crate::mix_debug::log_player_command_json(&payload);
         if log::max_level() >= LevelFilter::Trace {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&payload) {
-                trace!("websocket request: {json:#?}");
-            } else {
-                trace!("websocket request: {payload}");
-            }
+            trace!("websocket request received ({} bytes)", payload.len());
         }
 
         serde_json::from_str(&payload)

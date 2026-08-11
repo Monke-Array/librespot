@@ -25,6 +25,7 @@ pub mod file_id;
 pub mod http_client;
 pub mod login5;
 pub mod mercury;
+mod mix_debug;
 pub mod packet;
 mod proxytunnel;
 pub mod session;

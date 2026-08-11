@@ -9,6 +9,7 @@ use librespot_playback as playback;
 use librespot_protocol as protocol;
 
 mod context_resolver;
+mod mix_debug;
 mod model;
 mod shuffle_vec;
 mod spirc;
