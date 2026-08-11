@@ -252,6 +252,11 @@ impl SpClient {
             }
         }
 
+        debug!(
+            "[spotify-capability-debug] client-token identity client-version={} client-id={} os={os} platform-specific-data-present=true device-id-present=true",
+            client_data.client_version, client_data.client_id,
+        );
+
         let mut response = self.client_token_request(&request).await?;
         let mut count = 0;
         const MAX_TRIES: u8 = 3;

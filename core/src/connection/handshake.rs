@@ -2,7 +2,7 @@ use std::{env::consts::ARCH, io};
 
 use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
 use hmac::{Hmac, Mac};
-use protobuf::Message;
+use protobuf::{Enum, Message};
 use rand::RngCore;
 use rsa::{BigUint, Pkcs1v15Sign, RsaPublicKey};
 use sha1::{Digest, Sha1};
@@ -150,13 +150,22 @@ where
     #[cfg(not(debug_assertions))]
     const PRODUCT_FLAGS: ProductFlags = ProductFlags::PRODUCT_FLAG_NONE;
 
+    let product = protocol::keyexchange::Product::PRODUCT_CLIENT;
+    debug!(
+        "[spotify-capability-debug] ap-client-hello product={product:?}({}) product-flags={PRODUCT_FLAGS:?}({}) platform={platform:?}({}) client-version={} feature-set-present=false feature-flags=[] cryptosuites=[CRYPTO_SUITE_SHANNON]",
+        product.value(),
+        PRODUCT_FLAGS.value(),
+        platform.value(),
+        version::SPOTIFY_VERSION,
+    );
+
     let mut packet = ClientHello::new();
     packet
         .build_info
         .mut_or_insert_default()
         // ProductInfo won't push autoplay and perhaps other settings
         // when set to anything else than PRODUCT_CLIENT
-        .set_product(protocol::keyexchange::Product::PRODUCT_CLIENT);
+        .set_product(product);
     packet
         .build_info
         .mut_or_insert_default()

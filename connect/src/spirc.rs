@@ -1,5 +1,5 @@
 use crate::{
-    LoadContextOptions, LoadRequestOptions, PlayContext,
+    LoadContextOptions, LoadRequestOptions, PlayContext, capability_debug,
     context_resolver::{ContextAction, ContextFailureKind, ContextResolver, ResolveContext},
     core::{
         Error, Session, SpotifyUri,
@@ -1100,6 +1100,7 @@ impl SpircTask {
         );
 
         mix_debug::log_cluster("initial-put-state-response", &cluster);
+        capability_debug::log_cluster_devices("initial-put-state-response", &cluster);
 
         self.connect_established = true;
 
@@ -1182,6 +1183,9 @@ impl SpircTask {
         mut cluster_update: ClusterUpdate,
     ) -> Result<(), Error> {
         mix_debug::log_cluster_update(&cluster_update);
+        if let Some(cluster) = cluster_update.cluster.as_ref() {
+            capability_debug::log_cluster_devices("cluster-update", cluster);
+        }
         let reason = cluster_update.update_reason.enum_value();
 
         let device_ids = cluster_update.devices_that_changed.join(", ");

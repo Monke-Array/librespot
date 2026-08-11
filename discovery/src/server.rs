@@ -84,6 +84,14 @@ impl RequestHandler {
             "NONE"
         };
 
+        debug!(
+            "[spotify-capability-debug] zeroconf-get-info version=2.9.0 device-type={device_type} remote-name-present={} brand=librespot model=librespot library-version={} resolver-version=1 group-status={group_status} token-type=default client-id={} product-id=0 scope=streaming availability=<unset> supported-drm-media-formats=[] supported-capabilities=1 account-requirement=PREMIUM aliases={}",
+            !self.config.name.is_empty(),
+            crate::core::version::SEMVER,
+            self.config.client_id,
+            self.config.aliases.len(),
+        );
+
         // See: https://developer.spotify.com/documentation/commercial-hardware/implementation/guides/zeroconf/
         let body = json!({
             "status": 101,

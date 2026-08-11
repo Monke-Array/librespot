@@ -491,6 +491,7 @@ impl ConnectState {
 
     /// Sends the connect state for the connect session to the remote server
     pub async fn send_state(&self, session: &Session) -> SpClientResult {
+        crate::capability_debug::log_put_state(&self.request);
         session
             .spclient()
             .put_connect_state_request(&self.request)

@@ -7,7 +7,7 @@ use std::{io, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use num_traits::FromPrimitive;
-use protobuf::Message;
+use protobuf::{Enum, Message};
 use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
@@ -158,6 +158,13 @@ pub async fn authenticate(
         .mut_or_insert_default()
         .set_device_id(device_id.to_string());
     packet.set_version_string(format!("librespot {}", version::SEMVER));
+
+    debug!(
+        "[spotify-capability-debug] ap-login system-info cpu-family={cpu_family:?}({}) os={os:?}({}) system-information=librespot-<revision>-<build-id> device-id-present=true version-string={} platform-model-present=false client-info-present=false",
+        cpu_family.value(),
+        os.value(),
+        packet.version_string(),
+    );
 
     let cmd = PacketType::Login;
     let data = packet.write_to_bytes()?;

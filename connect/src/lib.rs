@@ -8,6 +8,7 @@ use librespot_core as core;
 use librespot_playback as playback;
 use librespot_protocol as protocol;
 
+mod capability_debug;
 mod context_resolver;
 mod mix_debug;
 mod model;

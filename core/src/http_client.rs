@@ -124,6 +124,11 @@ impl HttpClient {
             VERSION_STRING
         );
 
+        debug!(
+            "[spotify-capability-debug] http-client identity spotify-platform={spotify_platform} spotify-version={} os-version={os_version} user-agent={user_agent_str}",
+            spotify_version(),
+        );
+
         let user_agent = HeaderValue::from_str(user_agent_str).unwrap_or_else(|err| {
             error!("Invalid user agent <{user_agent_str}>: {err}");
             HeaderValue::from_static(FALLBACK_USER_AGENT)
