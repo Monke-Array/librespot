@@ -35,6 +35,7 @@ use crate::{
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
+    transition::{NoTransitionPolicy, TransitionEngine, TransitionPolicy},
 };
 use futures_util::{StreamExt, future::FusedFuture, stream::futures_unordered::FuturesUnordered};
 use librespot_metadata::{audio::UniqueFields, track::Tracks};
@@ -46,7 +47,7 @@ use tokio::{
     time::Sleep,
 };
 
-use crate::SAMPLES_PER_SECOND;
+use crate::{NUM_CHANNELS, SAMPLE_RATE, SAMPLES_PER_SECOND};
 
 const PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS: u32 = 30000;
 pub const DB_VOLTAGE_RATIO: f64 = 20.0;
@@ -212,6 +213,8 @@ struct PlayerInternal {
     volume_getter: Box<dyn VolumeGetter + Send>,
     event_senders: Vec<mpsc::UnboundedSender<PlayerEvent>>,
     converter: Converter,
+    transition_policy: NoTransitionPolicy,
+    transition: TransitionEngine,
 
     normalisation_integrators: [f64; 2],
     normalisation_peaks: [f64; 2],
@@ -670,6 +673,8 @@ impl Player {
                 volume_getter,
                 event_senders: vec![],
                 converter,
+                transition_policy: NoTransitionPolicy,
+                transition: TransitionEngine::new(SAMPLE_RATE, NUM_CHANNELS as usize),
 
                 normalisation_peaks: [0.0; 2],
                 normalisation_integrators: [0.0; 2],
@@ -1722,6 +1727,7 @@ impl PlayerInternal {
             failed_attempts,
             buffer_starved,
         } = request;
+        self.transition.cancel("current-track recovery started");
         self.cancel_recovery("a newer recovery superseded it");
         let generation = self.next_recovery_generation();
 
@@ -2035,6 +2041,7 @@ impl Future for PlayerInternal {
                             track_id,
                             loaded_track: Box::new(loaded_track),
                         };
+                        self.arm_transition_if_selected();
                     }
                     Poll::Ready(Err(e)) => {
                         debug!("Unable to preload {track_id:?}: {e}");
@@ -2306,6 +2313,41 @@ impl Future for PlayerInternal {
 }
 
 impl PlayerInternal {
+    fn arm_transition_if_selected(&mut self) {
+        let (current_position, current_duration) = match self.state {
+            PlayerState::Playing {
+                stream_position_ms,
+                duration_ms,
+                ..
+            }
+            | PlayerState::Paused {
+                stream_position_ms,
+                duration_ms,
+                ..
+            } => (
+                Duration::from_millis(u64::from(stream_position_ms)),
+                Duration::from_millis(u64::from(duration_ms)),
+            ),
+            _ => return,
+        };
+
+        let Some(spec) = self
+            .transition_policy
+            .plan(current_position, current_duration)
+        else {
+            return;
+        };
+
+        if self.config.passthrough {
+            debug!("Transition policy selected PCM mixing while encoded passthrough is active");
+            return;
+        }
+
+        if let Err(e) = self.transition.arm(spec) {
+            warn!("Unable to arm transition: {e}");
+        }
+    }
+
     fn ensure_sink_running(&mut self) {
         if self.sink_status != SinkStatus::Running {
             trace!("== Starting sink ==");
@@ -2356,6 +2398,7 @@ impl PlayerInternal {
     }
 
     fn handle_player_stop(&mut self) {
+        self.transition.cancel("player stopped");
         if let Some(recovery) = self.recovery.take() {
             debug!(
                 "Stop cancelled recovery generation {} for <{}> at {} ms",
@@ -2589,6 +2632,16 @@ impl PlayerInternal {
                         }
                     }
 
+                    let packet = match self.transition.render(packet, None) {
+                        Ok(packet) => packet,
+                        Err(e) => {
+                            error!("Transition engine rejected current-source packet: {e}");
+                            self.transition.cancel("rendering failed");
+                            self.handle_pause();
+                            return;
+                        }
+                    };
+
                     if let Err(e) = self.sink.write(packet, &mut self.converter) {
                         error!("{e}");
                         self.handle_pause();
@@ -2698,6 +2751,7 @@ impl PlayerInternal {
         play: bool,
         position_ms: u32,
     ) -> PlayerResult {
+        self.transition.cancel("new track load");
         self.cancel_recovery("a newer Load command arrived");
         self.next_recovery_generation();
         let play_request_id =
@@ -2930,6 +2984,7 @@ impl PlayerInternal {
                 preload_track = false;
             } else {
                 // we're preloading something else - cancel it.
+                self.transition.cancel("next-track preload was replaced");
                 self.preload = PlayerPreload::None;
             }
         }
@@ -2964,6 +3019,7 @@ impl PlayerInternal {
     }
 
     fn handle_command_seek(&mut self, position_ms: u32) -> PlayerResult {
+        self.transition.cancel("player seeked");
         if let Some(mut recovery) = self.recovery.take() {
             let old_generation = recovery.generation;
             let generation = self.next_recovery_generation();
@@ -3797,6 +3853,8 @@ mod tests {
             volume_getter: Box::new(NoOpVolume),
             event_senders: vec![],
             converter: Converter::new(None),
+            transition_policy: NoTransitionPolicy,
+            transition: TransitionEngine::new(SAMPLE_RATE, NUM_CHANNELS as usize),
             normalisation_peaks: [0.0; 2],
             normalisation_integrators: [0.0; 2],
             normalisation_channel: 0,
