@@ -1,0 +1,341 @@
+use std::{
+    io, mem,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, SyncSender, TryRecvError, sync_channel},
+    },
+    thread::{self, JoinHandle},
+};
+
+use librespot_audio::StreamLoaderController;
+
+use crate::{
+    NUM_CHANNELS, SAMPLE_RATE,
+    decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, DecoderError, DecoderResult},
+};
+
+/// Fixed-size chunks make the channel's PCM memory bound independent of decoder packet sizes.
+/// 1024 frames is the small playback quantum already used by real-time backends in this crate.
+pub(crate) const SECONDARY_PCM_CHUNK_FRAMES: usize = 1024;
+/// Eight chunks hold 8192 frames: about 186 ms, or 128 KiB of stereo `f64` PCM at 44.1 kHz.
+pub(crate) const SECONDARY_PCM_CHANNEL_CAPACITY: usize = 8;
+
+const SECONDARY_PCM_CHUNK_SAMPLES: usize = SECONDARY_PCM_CHUNK_FRAMES * NUM_CHANNELS as usize;
+
+pub(crate) type Decoder = Box<dyn AudioDecoder + Send>;
+
+/// Decoder execution owned by a `PlaybackSource`.
+///
+/// The worker variant has exclusive ownership of the decoder while the source remains movable
+/// between preload and current roles.
+pub(crate) enum SourceDecoder {
+    Direct(Decoder),
+    Worker(SecondaryDecodeWorker),
+    Invalid,
+}
+
+impl SourceDecoder {
+    pub(crate) fn direct(decoder: Decoder) -> Self {
+        Self::Direct(decoder)
+    }
+
+    pub(crate) fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError> {
+        match self {
+            Self::Direct(decoder) => decoder.seek(position_ms),
+            Self::Worker(_) => Err(DecoderError::Io(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "seeking a worker-backed decoder is not implemented",
+            ))),
+            Self::Invalid => Err(Self::invalid_state_error()),
+        }
+    }
+
+    pub(crate) fn next_packet(
+        &mut self,
+    ) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>> {
+        match self {
+            Self::Direct(decoder) => decoder.next_packet(),
+            Self::Worker(worker) => worker.recv_packet(),
+            Self::Invalid => Err(Self::invalid_state_error()),
+        }
+    }
+
+    pub(crate) fn start_secondary(
+        &mut self,
+        stream_loader_controller: StreamLoaderController,
+        generation: u64,
+        track_label: String,
+    ) -> Result<bool, DecoderError> {
+        match self {
+            Self::Worker(_) => return Ok(false),
+            Self::Invalid => return Err(Self::invalid_state_error()),
+            Self::Direct(_) => {}
+        }
+
+        let Self::Direct(decoder) = mem::replace(self, Self::Invalid) else {
+            unreachable!("direct decoder changed while starting secondary worker");
+        };
+        *self = Self::Worker(SecondaryDecodeWorker::spawn(
+            decoder,
+            stream_loader_controller,
+            generation,
+            track_label,
+        )?);
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_secondary_with_cancellation(
+        &mut self,
+        stream_loader_controller: StreamLoaderController,
+        generation: u64,
+        track_label: String,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<(), DecoderError> {
+        let Self::Direct(decoder) = mem::replace(self, Self::Invalid) else {
+            return Err(Self::invalid_state_error());
+        };
+        *self = Self::Worker(SecondaryDecodeWorker::spawn_with_cancellation(
+            decoder,
+            stream_loader_controller,
+            generation,
+            track_label,
+            cancelled,
+        )?);
+        Ok(())
+    }
+
+    pub(crate) fn try_recv_secondary(&self) -> Result<SecondaryDecodeMessage, TryRecvError> {
+        match self {
+            Self::Worker(worker) => worker.try_recv(),
+            Self::Direct(_) | Self::Invalid => Err(TryRecvError::Empty),
+        }
+    }
+
+    pub(crate) fn is_worker(&self) -> bool {
+        matches!(self, Self::Worker(_))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_decoder_address(&self) -> Option<*const ()> {
+        match self {
+            Self::Direct(decoder) => Some((&**decoder) as *const dyn AudioDecoder as *const ()),
+            Self::Worker(_) | Self::Invalid => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn worker_finished(&self) -> Option<Arc<AtomicBool>> {
+        match self {
+            Self::Worker(worker) => Some(worker.finished.clone()),
+            Self::Direct(_) | Self::Invalid => None,
+        }
+    }
+
+    fn invalid_state_error() -> DecoderError {
+        DecoderError::Io(io::Error::other("source decoder is in an invalid state"))
+    }
+}
+
+pub(crate) struct SecondaryDecodeMessage {
+    pub generation: u64,
+    pub event: SecondaryDecodeEvent,
+}
+
+pub(crate) enum SecondaryDecodeEvent {
+    Packet(AudioPacketPosition, AudioPacket),
+    Eof,
+    Failed(DecoderError),
+}
+
+pub(crate) struct SecondaryDecodeWorker {
+    receiver: Option<Receiver<SecondaryDecodeMessage>>,
+    cancelled: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+    stream_loader_controller: StreamLoaderController,
+    thread: Option<JoinHandle<()>>,
+    track_label: String,
+}
+
+impl SecondaryDecodeWorker {
+    fn spawn(
+        decoder: Decoder,
+        stream_loader_controller: StreamLoaderController,
+        generation: u64,
+        track_label: String,
+    ) -> Result<Self, DecoderError> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        Self::spawn_with_cancellation(
+            decoder,
+            stream_loader_controller,
+            generation,
+            track_label,
+            cancelled,
+        )
+    }
+
+    fn spawn_with_cancellation(
+        decoder: Decoder,
+        stream_loader_controller: StreamLoaderController,
+        generation: u64,
+        track_label: String,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Self, DecoderError> {
+        let (sender, receiver) = sync_channel(SECONDARY_PCM_CHANNEL_CAPACITY);
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let worker_finished = finished.clone();
+        let worker_track_label = track_label.clone();
+
+        let thread = thread::Builder::new()
+            .name("librespot-secondary-decode".into())
+            .spawn(move || {
+                run_decode_worker(
+                    decoder,
+                    sender,
+                    worker_cancelled,
+                    worker_finished,
+                    generation,
+                    &worker_track_label,
+                );
+            })
+            .map_err(DecoderError::Io)?;
+
+        Ok(Self {
+            receiver: Some(receiver),
+            cancelled,
+            finished,
+            stream_loader_controller,
+            thread: Some(thread),
+            track_label,
+        })
+    }
+
+    fn try_recv(&self) -> Result<SecondaryDecodeMessage, TryRecvError> {
+        self.receiver
+            .as_ref()
+            .ok_or(TryRecvError::Disconnected)?
+            .try_recv()
+    }
+
+    fn recv_packet(&self) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>> {
+        let message = self
+            .receiver
+            .as_ref()
+            .ok_or_else(|| {
+                DecoderError::Io(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "decoder worker cancelled",
+                ))
+            })?
+            .recv()
+            .map_err(|error| DecoderError::Io(io::Error::new(io::ErrorKind::BrokenPipe, error)))?;
+
+        match message.event {
+            SecondaryDecodeEvent::Packet(position, packet) => Ok(Some((position, packet))),
+            SecondaryDecodeEvent::Eof => Ok(None),
+            SecondaryDecodeEvent::Failed(error) => Err(error),
+        }
+    }
+
+    fn cancel(&mut self) {
+        if !self.cancelled.swap(true, Ordering::AcqRel) && !self.finished.load(Ordering::Acquire) {
+            debug!("Secondary decode cancelled for <{}>", self.track_label);
+        }
+
+        // Closing the compressed stream wakes AudioFileStreaming reads waiting on its condition
+        // variable. Dropping the receiver separately wakes a worker blocked by PCM backpressure.
+        self.stream_loader_controller.close();
+        self.receiver.take();
+
+        // Never join on the sink/playback thread. The two wakeups above make the worker converge
+        // promptly; dropping JoinHandle only detaches it while it exits.
+        self.thread.take();
+    }
+}
+
+impl Drop for SecondaryDecodeWorker {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+fn run_decode_worker(
+    mut decoder: Decoder,
+    sender: SyncSender<SecondaryDecodeMessage>,
+    cancelled: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+    generation: u64,
+    track_label: &str,
+) {
+    debug!("Secondary decode started for <{track_label}>");
+    let mut reported_ready = false;
+
+    while !cancelled.load(Ordering::Acquire) {
+        match decoder.next_packet() {
+            Ok(Some((position, AudioPacket::Samples(samples)))) => {
+                for (chunk_index, chunk) in samples.chunks(SECONDARY_PCM_CHUNK_SAMPLES).enumerate()
+                {
+                    if cancelled.load(Ordering::Acquire) {
+                        finished.store(true, Ordering::Release);
+                        return;
+                    }
+
+                    let frame_offset = chunk_index * SECONDARY_PCM_CHUNK_FRAMES;
+                    let position_offset_ms =
+                        (frame_offset as u64 * 1000 / u64::from(SAMPLE_RATE)) as u32;
+                    let chunk_position = AudioPacketPosition {
+                        position_ms: position.position_ms.saturating_add(position_offset_ms),
+                        skipped: position.skipped && chunk_index == 0,
+                    };
+                    let message = SecondaryDecodeMessage {
+                        generation,
+                        event: SecondaryDecodeEvent::Packet(
+                            chunk_position,
+                            AudioPacket::Samples(chunk.to_vec()),
+                        ),
+                    };
+
+                    if sender.send(message).is_err() {
+                        finished.store(true, Ordering::Release);
+                        return;
+                    }
+                    if !reported_ready {
+                        debug!("Secondary ready for transition for <{track_label}>");
+                        reported_ready = true;
+                    }
+                }
+            }
+            Ok(Some((_, AudioPacket::Raw(_)))) => {
+                let error = DecoderError::PassthroughDecoder(
+                    "secondary PCM decode received an encoded packet".into(),
+                );
+                debug!("Secondary decode failed for <{track_label}>: {error}");
+                let _ = sender.send(SecondaryDecodeMessage {
+                    generation,
+                    event: SecondaryDecodeEvent::Failed(error),
+                });
+                break;
+            }
+            Ok(None) => {
+                debug!("Secondary EOF for <{track_label}>");
+                let _ = sender.send(SecondaryDecodeMessage {
+                    generation,
+                    event: SecondaryDecodeEvent::Eof,
+                });
+                break;
+            }
+            Err(error) => {
+                debug!("Secondary decode failed for <{track_label}>: {error}");
+                let _ = sender.send(SecondaryDecodeMessage {
+                    generation,
+                    event: SecondaryDecodeEvent::Failed(error),
+                });
+                break;
+            }
+        }
+    }
+
+    finished.store(true, Ordering::Release);
+}

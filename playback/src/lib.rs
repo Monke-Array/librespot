@@ -13,6 +13,7 @@ pub mod dither;
 mod local_file;
 pub mod mixer;
 pub mod player;
+mod secondary;
 mod symphonia_util;
 mod transition;
 

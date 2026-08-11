@@ -35,6 +35,7 @@ use crate::{
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
+    secondary::{Decoder, SecondaryDecodeEvent, SourceDecoder},
     transition::{NoTransitionPolicy, TransitionEngine, TransitionPolicy},
 };
 use futures_util::{StreamExt, future::FusedFuture, stream::futures_unordered::FuturesUnordered};
@@ -201,6 +202,7 @@ struct PlayerInternal {
 
     state: PlayerState,
     preload: PlayerPreload,
+    secondary_generation: u64,
     recovery: Option<PlayerRecovery>,
     recovery_generation: u64,
     network_health: RecoveryHealth,
@@ -664,6 +666,7 @@ impl Player {
 
                 state: PlayerState::Stopped,
                 preload: PlayerPreload::None,
+                secondary_generation: 0,
                 recovery: None,
                 recovery_generation: 0,
                 network_health: RecoveryHealth::Healthy,
@@ -852,7 +855,7 @@ impl Drop for Player {
 /// A ready preload and the externally current track therefore have the same ownership shape and
 /// can be promoted by moving this value without rebuilding its decoder.
 struct PlaybackSource {
-    decoder: Decoder,
+    decoder: SourceDecoder,
     normalisation_data: NormalisationData,
     normalisation_factor: f64,
     stream_loader_controller: StreamLoaderController,
@@ -1006,8 +1009,6 @@ impl PlayerRecovery {
         };
     }
 }
-
-type Decoder = Box<dyn AudioDecoder + Send>;
 
 enum PlayerState {
     Stopped,
@@ -1493,7 +1494,7 @@ impl PlayerTrackLoader {
             info!("<{}> ({} ms) loaded", audio_item.name, duration_ms);
 
             return Ok(PlaybackSource {
-                decoder,
+                decoder: SourceDecoder::direct(decoder),
                 normalisation_data,
                 normalisation_factor: 1.0,
                 stream_loader_controller,
@@ -1584,7 +1585,7 @@ impl PlayerTrackLoader {
         info!("Loaded <{name}> from path <{}>", path.display());
 
         Ok(PlaybackSource {
-            decoder,
+            decoder: SourceDecoder::direct(decoder),
             normalisation_data,
             normalisation_factor: 1.0,
             stream_loader_controller,
@@ -2244,15 +2245,106 @@ impl Future for PlayerInternal {
 }
 
 impl PlayerInternal {
+    fn next_secondary_generation(&mut self) -> u64 {
+        self.secondary_generation = self.secondary_generation.wrapping_add(1);
+        self.secondary_generation
+    }
+
     fn cancel_secondary_source(&mut self, reason: &str) {
         self.transition.cancel(reason);
-        match mem::replace(&mut self.preload, PlayerPreload::None) {
+        let preload = mem::replace(&mut self.preload, PlayerPreload::None);
+        if !matches!(preload, PlayerPreload::None) {
+            self.next_secondary_generation();
+        }
+        match preload {
             PlayerPreload::None => {}
             PlayerPreload::Loading { track_id, .. } => {
                 debug!("Secondary source load for <{track_id}> cancelled: {reason}");
             }
             PlayerPreload::Ready { track_id, .. } => {
                 debug!("Secondary playback source for <{track_id}> cancelled: {reason}");
+            }
+        }
+    }
+
+    fn start_secondary_decode(&mut self) -> Result<bool, DecoderError> {
+        if self.config.passthrough {
+            return Ok(false);
+        }
+
+        let should_start = matches!(
+            &self.preload,
+            PlayerPreload::Ready { source, .. } if !source.decoder.is_worker()
+        );
+        if !should_start {
+            return Ok(false);
+        }
+
+        let generation = self.next_secondary_generation();
+        let PlayerPreload::Ready { track_id, source } = &mut self.preload else {
+            unreachable!("ready secondary changed while starting decoder worker");
+        };
+
+        source.decoder.start_secondary(
+            source.stream_loader_controller.clone(),
+            generation,
+            track_id.to_string(),
+        )
+    }
+
+    /// Non-blocking handoff used by the future transition scheduler. Terminal secondary events
+    /// are isolated here and never enter the current-track decoder/error path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn try_take_secondary_packet(&mut self) -> Option<(AudioPacketPosition, AudioPacket)> {
+        let (track_id, message) = {
+            let PlayerPreload::Ready { track_id, source } = &self.preload else {
+                return None;
+            };
+            let message = match source.decoder.try_recv_secondary() {
+                Ok(message) => message,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    debug!("Secondary decode failed for <{track_id}>: worker disconnected");
+                    self.cancel_secondary_source("secondary decode worker disconnected");
+                    return None;
+                }
+            };
+            (track_id.clone(), message)
+        };
+
+        if message.generation != self.secondary_generation {
+            debug!(
+                "Discarding stale secondary PCM generation {} for <{track_id}>; current generation is {}",
+                message.generation, self.secondary_generation
+            );
+            self.cancel_secondary_source("stale secondary decode generation");
+            return None;
+        }
+
+        match message.event {
+            SecondaryDecodeEvent::Packet(position, packet) => Some((position, packet)),
+            SecondaryDecodeEvent::Eof => {
+                self.cancel_secondary_source("secondary reached EOF");
+                None
+            }
+            SecondaryDecodeEvent::Failed(error) => {
+                let error = PlayerLoadError::from_decoder_error(&self.session, error);
+                if let PlayerState::Playing {
+                    play_request_id, ..
+                }
+                | PlayerState::Paused {
+                    play_request_id, ..
+                } = self.state
+                {
+                    self.send_event(load_error_event(
+                        track_id,
+                        play_request_id,
+                        error.kind,
+                        true,
+                    ));
+                }
+                self.cancel_secondary_source("secondary decode failed");
+                None
             }
         }
     }
@@ -2292,7 +2384,7 @@ impl PlayerInternal {
             source.stream_position_ms = source.decoder.seek(position_ms)?;
         }
 
-        debug!("Promoting secondary playback source for <{track_id}> to current");
+        debug!("Secondary promoted for <{track_id}>");
         self.start_playback(track_id, play_request_id, *source, play);
         Ok(true)
     }
@@ -2318,8 +2410,14 @@ impl PlayerInternal {
             return;
         }
 
-        if let Err(e) = self.transition.arm(spec) {
-            warn!("Unable to arm transition: {e}");
+        match self.transition.arm(spec) {
+            Ok(()) => {
+                if let Err(e) = self.start_secondary_decode() {
+                    warn!("Unable to start secondary decoder: {e}");
+                    self.cancel_secondary_source("secondary decoder could not start");
+                }
+            }
+            Err(e) => warn!("Unable to arm transition: {e}"),
         }
     }
 
@@ -3568,8 +3666,10 @@ mod tests {
         core::config::SessionConfig,
         local_file::LocalFileLookup,
         mixer::NoOpVolume,
+        secondary::{SECONDARY_PCM_CHANNEL_CAPACITY, SECONDARY_PCM_CHUNK_FRAMES},
         transition::{TransitionCurve, TransitionSpec, TransitionState},
     };
+    use std::sync::mpsc as std_mpsc;
 
     fn track_uri() -> SpotifyUri {
         SpotifyUri::from_uri("spotify:track:2TpxZ7JUBn3uw46aR7qd6V")
@@ -3706,9 +3806,113 @@ mod tests {
         }
     }
 
+    struct CountingPcmDecoder {
+        calls: Arc<AtomicUsize>,
+        packets_remaining: Option<usize>,
+    }
+
+    impl AudioDecoder for CountingPcmDecoder {
+        fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError> {
+            Ok(position_ms)
+        }
+
+        fn next_packet(
+            &mut self,
+        ) -> Result<Option<(AudioPacketPosition, AudioPacket)>, DecoderError> {
+            let call = self.calls.fetch_add(1, Ordering::AcqRel);
+            if matches!(self.packets_remaining, Some(0)) {
+                return Ok(None);
+            }
+            if let Some(remaining) = self.packets_remaining.as_mut() {
+                *remaining -= 1;
+            }
+
+            Ok(Some((
+                AudioPacketPosition {
+                    position_ms: (call as u32).saturating_mul(23),
+                    skipped: false,
+                },
+                AudioPacket::Samples(vec![
+                    0.25;
+                    SECONDARY_PCM_CHUNK_FRAMES * NUM_CHANNELS as usize
+                ]),
+            )))
+        }
+    }
+
+    struct BackpressureDecoder {
+        calls: std_mpsc::Sender<usize>,
+        call: usize,
+    }
+
+    impl AudioDecoder for BackpressureDecoder {
+        fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError> {
+            Ok(position_ms)
+        }
+
+        fn next_packet(
+            &mut self,
+        ) -> Result<Option<(AudioPacketPosition, AudioPacket)>, DecoderError> {
+            self.call += 1;
+            let _ = self.calls.send(self.call);
+            Ok(Some((
+                AudioPacketPosition {
+                    position_ms: (self.call as u32).saturating_mul(23),
+                    skipped: false,
+                },
+                AudioPacket::Samples(vec![
+                    0.5;
+                    SECONDARY_PCM_CHUNK_FRAMES * NUM_CHANNELS as usize
+                ]),
+            )))
+        }
+    }
+
+    struct CancellationBlockedDecoder {
+        cancelled: Arc<AtomicBool>,
+        entered: Option<std_mpsc::Sender<()>>,
+    }
+
+    impl AudioDecoder for CancellationBlockedDecoder {
+        fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError> {
+            Ok(position_ms)
+        }
+
+        fn next_packet(
+            &mut self,
+        ) -> Result<Option<(AudioPacketPosition, AudioPacket)>, DecoderError> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            while !self.cancelled.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(DecoderError::Io(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "scripted blocked decode cancelled",
+            )))
+        }
+    }
+
+    struct ErrorDecoder {
+        error: Option<DecoderError>,
+    }
+
+    impl AudioDecoder for ErrorDecoder {
+        fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError> {
+            Ok(position_ms)
+        }
+
+        fn next_packet(
+            &mut self,
+        ) -> Result<Option<(AudioPacketPosition, AudioPacket)>, DecoderError> {
+            Err(self.error.take().expect("scripted error should run once"))
+        }
+    }
+
     fn scripted_source(track_id: SpotifyUri, position_ms: u32, decoder: Decoder) -> PlaybackSource {
         PlaybackSource {
-            decoder,
+            decoder: SourceDecoder::direct(decoder),
             normalisation_data: NormalisationData::default(),
             normalisation_factor: 1.0,
             stream_loader_controller: StreamLoaderController::from_local_file(512 * 1024),
@@ -3780,6 +3984,56 @@ mod tests {
             .expect("test transition should arm");
     }
 
+    fn start_secondary_with_cancellation(player: &mut PlayerInternal, cancelled: Arc<AtomicBool>) {
+        let generation = player.next_secondary_generation();
+        let PlayerPreload::Ready { track_id, source } = &mut player.preload else {
+            panic!("test requires a ready secondary source");
+        };
+        source
+            .decoder
+            .start_secondary_with_cancellation(
+                source.stream_loader_controller.clone(),
+                generation,
+                track_id.to_string(),
+                cancelled,
+            )
+            .expect("secondary worker should start");
+    }
+
+    fn secondary_worker_finished(player: &PlayerInternal) -> Arc<AtomicBool> {
+        let PlayerPreload::Ready { source, .. } = &player.preload else {
+            panic!("test requires a ready secondary source");
+        };
+        source
+            .decoder
+            .worker_finished()
+            .expect("test requires a worker-backed secondary")
+    }
+
+    fn wait_until(message: &str, condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !condition() {
+            assert!(Instant::now() < deadline, "{message}");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn wait_for_secondary_packet(
+        player: &mut PlayerInternal,
+    ) -> (AudioPacketPosition, AudioPacket) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(packet) = player.try_take_secondary_packet() {
+                return packet;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "secondary packet was not produced"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     fn poll_recovery_once(player: &mut PlayerInternal) -> bool {
         let mut context = Context::from_waker(std::task::Waker::noop());
         player.poll_recovery(&mut context)
@@ -3806,6 +4060,7 @@ mod tests {
             load_handles: Arc::new(Mutex::new(HashMap::new())),
             state: PlayerState::Stopped,
             preload: PlayerPreload::None,
+            secondary_generation: 0,
             recovery: None,
             recovery_generation: 0,
             network_health: RecoveryHealth::Healthy,
@@ -3870,7 +4125,10 @@ mod tests {
 
         let next_track_id = next_track_uri();
         let next_source = scripted_source(next_track_id.clone(), 0, Box::new(ScriptedDecoder));
-        let decoder_address = (&*next_source.decoder) as *const dyn AudioDecoder as *const ();
+        let decoder_address = next_source
+            .decoder
+            .direct_decoder_address()
+            .expect("new source should own its direct decoder");
         set_ready_secondary(&mut player, next_track_id.clone(), next_source);
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         player.event_senders.push(event_tx);
@@ -3887,8 +4145,11 @@ mod tests {
         };
         assert_eq!(track_id, &next_track_id);
         assert_eq!(
-            (&*source.decoder) as *const dyn AudioDecoder as *const (),
-            decoder_address
+            source
+                .decoder
+                .direct_decoder_address()
+                .expect("unstarted promoted source should remain direct"),
+            decoder_address,
         );
         assert!(matches!(player.preload, PlayerPreload::None));
         assert!(matches!(
@@ -3904,6 +4165,465 @@ mod tests {
             Ok(PlayerEvent::Playing { ref track_id, .. }) if track_id == &next_track_id
         ));
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn default_policy_does_not_start_secondary_pcm_decode() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(0));
+        set_ready_secondary(
+            &mut player,
+            next_track_uri(),
+            scripted_source(
+                next_track_uri(),
+                0,
+                Box::new(CountingPcmDecoder {
+                    calls: decode_calls.clone(),
+                    packets_remaining: None,
+                }),
+            ),
+        );
+
+        player.arm_transition_if_selected();
+
+        let PlayerPreload::Ready { source, .. } = &player.preload else {
+            panic!("secondary source should remain ready");
+        };
+        assert!(!source.decoder.is_worker());
+        assert_eq!(decode_calls.load(Ordering::Acquire), 0);
+        assert_eq!(player.transition.state(), TransitionState::Idle);
+    }
+
+    #[test]
+    fn secondary_decoder_advances_independently() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(0));
+        set_ready_secondary(
+            &mut player,
+            next_track_uri(),
+            scripted_source(
+                next_track_uri(),
+                0,
+                Box::new(CountingPcmDecoder {
+                    calls: decode_calls.clone(),
+                    packets_remaining: Some(1),
+                }),
+            ),
+        );
+
+        assert!(
+            player
+                .start_secondary_decode()
+                .expect("secondary worker should start")
+        );
+        let (_, packet) = wait_for_secondary_packet(&mut player);
+
+        assert_eq!(
+            packet.samples().expect("worker should produce PCM").len(),
+            SECONDARY_PCM_CHUNK_FRAMES * NUM_CHANNELS as usize
+        );
+        assert!(decode_calls.load(Ordering::Acquire) >= 1);
+        assert!(matches!(player.state, PlayerState::Playing { .. }));
+        assert_eq!(player.sink_status, SinkStatus::Running);
+    }
+
+    #[test]
+    fn blocked_secondary_decoder_does_not_block_current_audio_loop() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        let (command_tx, commands) = mpsc::unbounded_channel();
+        player.commands = commands;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = std_mpsc::channel();
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(0));
+        set_ready_secondary(
+            &mut player,
+            next_track_uri(),
+            scripted_source(
+                next_track_uri(),
+                0,
+                Box::new(CancellationBlockedDecoder {
+                    cancelled: cancelled.clone(),
+                    entered: Some(entered_tx),
+                }),
+            ),
+        );
+        start_secondary_with_cancellation(&mut player, cancelled);
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("secondary decoder should enter its blocking read");
+
+        let started = Instant::now();
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        assert!(Pin::new(&mut player).poll(&mut context).is_pending());
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(matches!(player.state, PlayerState::EndOfTrack { .. }));
+
+        let finished = secondary_worker_finished(&player);
+        player.cancel_secondary_source("test cleanup");
+        wait_until("blocked secondary worker did not exit", || {
+            finished.load(Ordering::Acquire)
+        });
+        drop(command_tx);
+    }
+
+    #[test]
+    fn bounded_secondary_queue_applies_backpressure() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        let (call_tx, call_rx) = std_mpsc::channel();
+        set_ready_secondary(
+            &mut player,
+            next_track_uri(),
+            scripted_source(
+                next_track_uri(),
+                0,
+                Box::new(BackpressureDecoder {
+                    calls: call_tx,
+                    call: 0,
+                }),
+            ),
+        );
+
+        assert!(
+            player
+                .start_secondary_decode()
+                .expect("secondary worker should start")
+        );
+        for expected_call in 1..=SECONDARY_PCM_CHANNEL_CAPACITY + 1 {
+            assert_eq!(
+                call_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("decoder should fill queue and decode one blocked chunk"),
+                expected_call
+            );
+        }
+        assert!(call_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        let finished = secondary_worker_finished(&player);
+        player.cancel_secondary_source("test cleanup");
+        wait_until("backpressured secondary worker did not exit", || {
+            finished.load(Ordering::Acquire)
+        });
+    }
+
+    #[test]
+    fn cancelling_active_secondary_resets_transition_and_stops_worker() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        set_ready_secondary(
+            &mut player,
+            next_track_uri(),
+            scripted_source(
+                next_track_uri(),
+                0,
+                Box::new(CountingPcmDecoder {
+                    calls: decode_calls.clone(),
+                    packets_remaining: None,
+                }),
+            ),
+        );
+        arm_test_transition(&mut player);
+        assert!(
+            player
+                .start_secondary_decode()
+                .expect("secondary worker should start")
+        );
+        wait_until("secondary decoder did not advance", || {
+            decode_calls.load(Ordering::Acquire) > 0
+        });
+        let finished = secondary_worker_finished(&player);
+
+        player.cancel_secondary_source("test cancellation");
+
+        assert!(matches!(player.preload, PlayerPreload::None));
+        assert_eq!(player.transition.state(), TransitionState::Idle);
+        wait_until("active secondary worker did not exit", || {
+            finished.load(Ordering::Acquire)
+        });
+    }
+
+    #[test]
+    fn cancelling_network_blocked_secondary_is_nonblocking_and_reliable() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = std_mpsc::channel();
+        set_ready_secondary(
+            &mut player,
+            next_track_uri(),
+            scripted_source(
+                next_track_uri(),
+                0,
+                Box::new(CancellationBlockedDecoder {
+                    cancelled: cancelled.clone(),
+                    entered: Some(entered_tx),
+                }),
+            ),
+        );
+        start_secondary_with_cancellation(&mut player, cancelled);
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("secondary decoder should enter its blocking read");
+        let finished = secondary_worker_finished(&player);
+
+        let started = Instant::now();
+        player.cancel_secondary_source("network blocked test cancellation");
+
+        assert!(started.elapsed() < Duration::from_millis(250));
+        wait_until("network-blocked secondary worker did not exit", || {
+            finished.load(Ordering::Acquire)
+        });
+    }
+
+    #[test]
+    fn secondary_eof_is_isolated_from_current_track() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        player.event_senders.push(event_tx);
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(0));
+        set_ready_secondary(
+            &mut player,
+            next_track_uri(),
+            scripted_source(next_track_uri(), 0, Box::new(ScriptedDecoder)),
+        );
+        player
+            .start_secondary_decode()
+            .expect("secondary worker should start");
+        let finished = secondary_worker_finished(&player);
+        wait_until("secondary EOF was not produced", || {
+            finished.load(Ordering::Acquire)
+        });
+
+        assert!(player.try_take_secondary_packet().is_none());
+        assert!(matches!(player.state, PlayerState::Playing { .. }));
+        assert!(matches!(player.preload, PlayerPreload::None));
+        assert_eq!(player.sink_status, SinkStatus::Running);
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn secondary_transient_error_is_isolated_from_current_track() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        player.event_senders.push(event_tx);
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(0));
+        set_ready_secondary(
+            &mut player,
+            next_track_uri(),
+            scripted_source(
+                next_track_uri(),
+                0,
+                Box::new(ErrorDecoder {
+                    error: Some(DecoderError::Io(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "scripted secondary timeout",
+                    ))),
+                }),
+            ),
+        );
+        player
+            .start_secondary_decode()
+            .expect("secondary worker should start");
+        let finished = secondary_worker_finished(&player);
+        wait_until("secondary error was not produced", || {
+            finished.load(Ordering::Acquire)
+        });
+
+        assert!(player.try_take_secondary_packet().is_none());
+        assert!(matches!(player.state, PlayerState::Playing { .. }));
+        assert!(matches!(player.preload, PlayerPreload::None));
+        assert_eq!(player.sink_status, SinkStatus::Running);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(PlayerEvent::LoadFailed {
+                ref track_id,
+                play_request_id: 7,
+                error: PlayerLoadErrorKind::TransientNetwork,
+                is_preload: true,
+            }) if track_id == &next_track_uri()
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn secondary_permanent_error_uses_preload_unavailable_semantics() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        player.event_senders.push(event_tx);
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(0));
+        set_ready_secondary(
+            &mut player,
+            next_track_uri(),
+            scripted_source(
+                next_track_uri(),
+                0,
+                Box::new(ErrorDecoder {
+                    error: Some(DecoderError::SymphoniaDecoder(
+                        "scripted corrupt secondary".into(),
+                    )),
+                }),
+            ),
+        );
+        player
+            .start_secondary_decode()
+            .expect("secondary worker should start");
+        let finished = secondary_worker_finished(&player);
+        wait_until("secondary permanent error was not produced", || {
+            finished.load(Ordering::Acquire)
+        });
+
+        assert!(player.try_take_secondary_packet().is_none());
+        assert!(matches!(player.state, PlayerState::Playing { .. }));
+        assert_eq!(player.sink_status, SinkStatus::Running);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(PlayerEvent::Unavailable {
+                ref track_id,
+                play_request_id: 7,
+            }) if track_id == &next_track_uri()
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn stale_secondary_generation_cannot_deliver_pcm() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(0));
+        set_ready_secondary(
+            &mut player,
+            next_track_uri(),
+            scripted_source(
+                next_track_uri(),
+                0,
+                Box::new(CountingPcmDecoder {
+                    calls: decode_calls.clone(),
+                    packets_remaining: Some(1),
+                }),
+            ),
+        );
+        player
+            .start_secondary_decode()
+            .expect("secondary worker should start");
+        wait_until("secondary decoder did not advance", || {
+            decode_calls.load(Ordering::Acquire) > 0
+        });
+
+        player.next_secondary_generation();
+
+        assert!(player.try_take_secondary_packet().is_none());
+        assert!(matches!(player.preload, PlayerPreload::None));
+        assert!(matches!(player.state, PlayerState::Playing { .. }));
+    }
+
+    #[test]
+    fn worker_backed_secondary_promotes_without_reload_or_buffer_loss() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        let next_track_id = next_track_uri();
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(0));
+        set_ready_secondary(
+            &mut player,
+            next_track_id.clone(),
+            scripted_source(
+                next_track_id.clone(),
+                0,
+                Box::new(CountingPcmDecoder {
+                    calls: decode_calls.clone(),
+                    packets_remaining: Some(2),
+                }),
+            ),
+        );
+        player
+            .start_secondary_decode()
+            .expect("secondary worker should start");
+        wait_until("secondary decoder did not predecode", || {
+            decode_calls.load(Ordering::Acquire) >= 2
+        });
+
+        player
+            .handle_command_load(next_track_id.clone(), None, true, 0)
+            .expect("worker-backed secondary should promote");
+
+        let PlayerState::Playing {
+            track_id, source, ..
+        } = &mut player.state
+        else {
+            panic!("promoted secondary should become current");
+        };
+        assert_eq!(track_id, &next_track_id);
+        assert!(source.decoder.is_worker());
+        let packet = source
+            .decoder
+            .next_packet()
+            .expect("worker-backed current decode should succeed")
+            .expect("predecoded PCM should remain queued");
+        assert_eq!(
+            packet
+                .1
+                .samples()
+                .expect("promoted worker should preserve PCM")
+                .len(),
+            SECONDARY_PCM_CHUNK_FRAMES * NUM_CHANNELS as usize
+        );
+        assert!(matches!(player.preload, PlayerPreload::None));
+    }
+
+    #[test]
+    fn passthrough_never_starts_secondary_pcm_decode() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        player.config.passthrough = true;
+        set_ready_secondary(
+            &mut player,
+            next_track_uri(),
+            scripted_source(next_track_uri(), 0, Box::new(PanicDecoder)),
+        );
+
+        assert!(
+            !player
+                .start_secondary_decode()
+                .expect("passthrough skips PCM")
+        );
+        let PlayerPreload::Ready { source, .. } = &player.preload else {
+            panic!("passthrough secondary should remain ready");
+        };
+        assert!(!source.decoder.is_worker());
     }
 
     #[test]
