@@ -22,6 +22,7 @@ pub(crate) const SECONDARY_PCM_CHUNK_FRAMES: usize = 1024;
 pub(crate) const SECONDARY_PCM_CHANNEL_CAPACITY: usize = 8;
 
 const SECONDARY_PCM_CHUNK_SAMPLES: usize = SECONDARY_PCM_CHUNK_FRAMES * NUM_CHANNELS as usize;
+const SECONDARY_PCM_ASSEMBLER_SAMPLES: usize = SECONDARY_PCM_CHUNK_SAMPLES * 2;
 
 pub(crate) type Decoder = Box<dyn AudioDecoder + Send>;
 
@@ -106,10 +107,10 @@ impl SourceDecoder {
         Ok(())
     }
 
-    pub(crate) fn try_recv_secondary(&self) -> Result<SecondaryDecodeMessage, TryRecvError> {
+    pub(crate) fn try_read_secondary(&mut self, samples: usize) -> SecondaryRead {
         match self {
-            Self::Worker(worker) => worker.try_recv(),
-            Self::Direct(_) | Self::Invalid => Err(TryRecvError::Empty),
+            Self::Worker(worker) => worker.try_read(samples),
+            Self::Direct(_) | Self::Invalid => SecondaryRead::Pending,
         }
     }
 
@@ -149,6 +150,25 @@ pub(crate) enum SecondaryDecodeEvent {
     Failed(DecoderError),
 }
 
+pub(crate) struct SecondaryPcmBlock {
+    pub generation: u64,
+    pub position: AudioPacketPosition,
+    pub packet: AudioPacket,
+}
+
+pub(crate) enum SecondaryRead {
+    Pcm(SecondaryPcmBlock),
+    Pending,
+    Eof {
+        generation: u64,
+    },
+    Failed {
+        generation: u64,
+        error: DecoderError,
+    },
+    Disconnected,
+}
+
 pub(crate) struct SecondaryDecodeWorker {
     receiver: Option<Receiver<SecondaryDecodeMessage>>,
     cancelled: Arc<AtomicBool>,
@@ -156,6 +176,11 @@ pub(crate) struct SecondaryDecodeWorker {
     stream_loader_controller: StreamLoaderController,
     thread: Option<JoinHandle<()>>,
     track_label: String,
+    pcm_buffer: Vec<f64>,
+    pcm_origin: Option<AudioPacketPosition>,
+    pcm_consumed_frames: u64,
+    pcm_generation: Option<u64>,
+    pending_terminal: Option<SecondaryDecodeMessage>,
 }
 
 impl SecondaryDecodeWorker {
@@ -209,17 +234,116 @@ impl SecondaryDecodeWorker {
             stream_loader_controller,
             thread: Some(thread),
             track_label,
+            pcm_buffer: Vec::with_capacity(SECONDARY_PCM_ASSEMBLER_SAMPLES),
+            pcm_origin: None,
+            pcm_consumed_frames: 0,
+            pcm_generation: None,
+            pending_terminal: None,
         })
     }
 
-    fn try_recv(&self) -> Result<SecondaryDecodeMessage, TryRecvError> {
-        self.receiver
-            .as_ref()
-            .ok_or(TryRecvError::Disconnected)?
-            .try_recv()
+    fn try_read(&mut self, samples: usize) -> SecondaryRead {
+        assert!(samples > 0, "secondary PCM read must request samples");
+        assert!(
+            samples <= SECONDARY_PCM_CHUNK_SAMPLES,
+            "secondary PCM read exceeds the bounded assembler quantum"
+        );
+        assert_eq!(
+            samples % NUM_CHANNELS as usize,
+            0,
+            "secondary PCM read must be frame-aligned"
+        );
+
+        while self.pcm_buffer.len() < samples && self.pending_terminal.is_none() {
+            let message = match self
+                .receiver
+                .as_ref()
+                .ok_or(TryRecvError::Disconnected)
+                .and_then(Receiver::try_recv)
+            {
+                Ok(message) => message,
+                Err(TryRecvError::Empty) => return SecondaryRead::Pending,
+                Err(TryRecvError::Disconnected) => return SecondaryRead::Disconnected,
+            };
+
+            match message.event {
+                SecondaryDecodeEvent::Packet(position, AudioPacket::Samples(packet)) => {
+                    self.push_pcm(message.generation, position, packet);
+                }
+                SecondaryDecodeEvent::Packet(_, AudioPacket::Raw(_)) => {
+                    self.pending_terminal = Some(SecondaryDecodeMessage {
+                        generation: message.generation,
+                        event: SecondaryDecodeEvent::Failed(DecoderError::PassthroughDecoder(
+                            "secondary PCM assembler received encoded audio".into(),
+                        )),
+                    });
+                }
+                event @ (SecondaryDecodeEvent::Eof | SecondaryDecodeEvent::Failed(_)) => {
+                    self.pending_terminal = Some(SecondaryDecodeMessage {
+                        generation: message.generation,
+                        event,
+                    });
+                }
+            }
+        }
+
+        if self.pcm_buffer.len() >= samples {
+            return SecondaryRead::Pcm(self.take_pcm(samples));
+        }
+
+        let message = self
+            .pending_terminal
+            .take()
+            .expect("incomplete PCM without a terminal event must have returned pending");
+        match message.event {
+            SecondaryDecodeEvent::Eof => SecondaryRead::Eof {
+                generation: message.generation,
+            },
+            SecondaryDecodeEvent::Failed(error) => SecondaryRead::Failed {
+                generation: message.generation,
+                error,
+            },
+            SecondaryDecodeEvent::Packet(_, _) => {
+                unreachable!("only terminal events are stored")
+            }
+        }
     }
 
-    fn recv_packet(&self) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>> {
+    fn take_pcm(&mut self, samples: usize) -> SecondaryPcmBlock {
+        let channels = NUM_CHANNELS as usize;
+        let frames = samples / channels;
+        let origin = self
+            .pcm_origin
+            .as_ref()
+            .expect("buffered PCM must retain its origin");
+        let position_offset_ms = self.pcm_consumed_frames * 1000 / u64::from(SAMPLE_RATE);
+        let position = AudioPacketPosition {
+            position_ms: origin.position_ms.saturating_add(position_offset_ms as u32),
+            skipped: origin.skipped && self.pcm_consumed_frames == 0,
+        };
+        self.pcm_consumed_frames += frames as u64;
+        let packet = AudioPacket::Samples(self.pcm_buffer.drain(..samples).collect());
+        let generation = self
+            .pcm_generation
+            .expect("buffered PCM must retain its generation");
+
+        SecondaryPcmBlock {
+            generation,
+            position,
+            packet,
+        }
+    }
+
+    fn recv_packet(&mut self) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>> {
+        if !self.pcm_buffer.is_empty() {
+            let block = self.take_pcm(self.pcm_buffer.len());
+            return Ok(Some((block.position, block.packet)));
+        }
+
+        if let Some(message) = self.pending_terminal.take() {
+            return Self::message_into_packet(message);
+        }
+
         let message = self
             .receiver
             .as_ref()
@@ -232,6 +356,36 @@ impl SecondaryDecodeWorker {
             .recv()
             .map_err(|error| DecoderError::Io(io::Error::new(io::ErrorKind::BrokenPipe, error)))?;
 
+        match message.event {
+            SecondaryDecodeEvent::Packet(position, AudioPacket::Samples(packet)) => {
+                self.push_pcm(message.generation, position, packet);
+                let block = self.take_pcm(self.pcm_buffer.len());
+                Ok(Some((block.position, block.packet)))
+            }
+            SecondaryDecodeEvent::Packet(position, packet @ AudioPacket::Raw(_)) => {
+                Ok(Some((position, packet)))
+            }
+            SecondaryDecodeEvent::Eof => Ok(None),
+            SecondaryDecodeEvent::Failed(error) => Err(error),
+        }
+    }
+
+    fn push_pcm(&mut self, generation: u64, position: AudioPacketPosition, mut packet: Vec<f64>) {
+        assert!(packet.len() <= SECONDARY_PCM_CHUNK_SAMPLES);
+        assert!(self.pcm_buffer.len() + packet.len() <= SECONDARY_PCM_ASSEMBLER_SAMPLES);
+        if self.pcm_origin.is_none() {
+            self.pcm_origin = Some(position);
+            self.pcm_consumed_frames = 0;
+            self.pcm_generation = Some(generation);
+        } else {
+            debug_assert_eq!(self.pcm_generation, Some(generation));
+        }
+        self.pcm_buffer.append(&mut packet);
+    }
+
+    fn message_into_packet(
+        message: SecondaryDecodeMessage,
+    ) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>> {
         match message.event {
             SecondaryDecodeEvent::Packet(position, packet) => Ok(Some((position, packet))),
             SecondaryDecodeEvent::Eof => Ok(None),
@@ -302,7 +456,7 @@ fn run_decode_worker(
                         return;
                     }
                     if !reported_ready {
-                        debug!("Secondary ready for transition for <{track_label}>");
+                        debug!("Secondary PCM ready for transition for <{track_label}>");
                         reported_ready = true;
                     }
                 }

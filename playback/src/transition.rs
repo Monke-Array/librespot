@@ -14,10 +14,14 @@ pub(crate) trait TransitionPolicy {
         current_position: Duration,
         current_duration: Duration,
     ) -> Option<TransitionSpec>;
+
+    /// Whether an armed transition should begin consuming both sources now.
+    fn should_start(&self, current_position: Duration, current_duration: Duration) -> bool;
 }
 
 /// The default policy preserves librespot's existing one-track playback behavior.
 #[derive(Debug, Default)]
+#[allow(dead_code)] // Kept as the one-line opt-out/legacy policy and exercised in tests.
 pub(crate) struct NoTransitionPolicy;
 
 impl TransitionPolicy for NoTransitionPolicy {
@@ -27,6 +31,64 @@ impl TransitionPolicy for NoTransitionPolicy {
         _current_duration: Duration,
     ) -> Option<TransitionSpec> {
         None
+    }
+
+    fn should_start(&self, _current_position: Duration, _current_duration: Duration) -> bool {
+        false
+    }
+}
+
+/// A deliberately simple transition policy with a fixed overlap near natural EOF.
+#[derive(Debug)]
+pub(crate) struct FixedDurationTransitionPolicy {
+    duration: Duration,
+    preparation: Duration,
+}
+
+impl FixedDurationTransitionPolicy {
+    pub(crate) const FIVE_SECONDS: Duration = Duration::from_secs(5);
+
+    /// `preparation` gives the bounded secondary worker time to produce its first PCM chunk.
+    pub(crate) fn new(duration: Duration, preparation: Duration) -> Self {
+        Self {
+            duration,
+            preparation,
+        }
+    }
+
+    fn remaining(current_position: Duration, current_duration: Duration) -> Option<Duration> {
+        current_duration.checked_sub(current_position)
+    }
+}
+
+impl Default for FixedDurationTransitionPolicy {
+    fn default() -> Self {
+        Self::new(Self::FIVE_SECONDS, Duration::from_millis(200))
+    }
+}
+
+impl TransitionPolicy for FixedDurationTransitionPolicy {
+    fn plan(
+        &self,
+        current_position: Duration,
+        current_duration: Duration,
+    ) -> Option<TransitionSpec> {
+        let remaining = Self::remaining(current_position, current_duration)?;
+        if remaining > self.duration.saturating_add(self.preparation) {
+            return None;
+        }
+
+        Some(TransitionSpec {
+            duration: self.duration,
+            curve: TransitionCurve::Linear,
+            current_gain: 1.0,
+            next_gain: 1.0,
+        })
+    }
+
+    fn should_start(&self, current_position: Duration, current_duration: Duration) -> bool {
+        Self::remaining(current_position, current_duration)
+            .is_some_and(|remaining| remaining <= self.duration)
     }
 }
 
@@ -38,8 +100,8 @@ pub(crate) enum TransitionState {
     Finishing,
 }
 
-#[allow(dead_code)] // Both curves are part of the next, dual-decoder integration step.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Equal-power remains available for the next policy iteration.
 pub(crate) enum TransitionCurve {
     Linear,
     EqualPower,
@@ -110,6 +172,20 @@ impl TransitionEngine {
         self.state
     }
 
+    #[cfg(test)]
+    pub(crate) fn elapsed_frames(&self) -> usize {
+        self.elapsed_frames
+    }
+
+    #[cfg(test)]
+    pub(crate) fn total_frames(&self) -> usize {
+        self.total_frames
+    }
+
+    pub(crate) fn remaining_frames(&self) -> usize {
+        self.total_frames.saturating_sub(self.elapsed_frames)
+    }
+
     pub(crate) fn arm(&mut self, spec: TransitionSpec) -> Result<(), TransitionError> {
         if self.state != TransitionState::Idle {
             return Err(self.invalid_state("arm"));
@@ -176,7 +252,6 @@ impl TransitionEngine {
     }
 
     /// A dual-stream owner calls this after promoting the next decoder to current.
-    #[allow(dead_code)] // Promotion is intentionally deferred until the dual-decoder player pass.
     pub(crate) fn complete(&mut self) -> Result<(), TransitionError> {
         if self.state != TransitionState::Finishing {
             return Err(self.invalid_state("complete"));
@@ -295,6 +370,57 @@ mod tests {
             NoTransitionPolicy.plan(Duration::from_secs(150), Duration::from_secs(180)),
             None
         );
+    }
+
+    #[test]
+    fn fixed_policy_prepares_then_starts_at_five_seconds_remaining() {
+        let policy = FixedDurationTransitionPolicy::default();
+        let duration = Duration::from_secs(100);
+
+        assert_eq!(policy.plan(Duration::from_millis(94_799), duration), None);
+        let spec = policy
+            .plan(Duration::from_millis(94_800), duration)
+            .expect("bounded preparation should begin 200 ms before the overlap");
+        assert_eq!(spec.duration, Duration::from_secs(5));
+        assert_eq!(spec.curve, TransitionCurve::Linear);
+        assert!(!policy.should_start(Duration::from_millis(94_999), duration));
+        assert!(policy.should_start(Duration::from_millis(95_000), duration));
+    }
+
+    #[test]
+    fn five_second_transition_has_exact_frame_count() {
+        let mut engine = TransitionEngine::new(44_100, 2);
+        let spec = FixedDurationTransitionPolicy::default()
+            .plan(Duration::from_secs(95), Duration::from_secs(100))
+            .expect("policy should select the five-second transition");
+        engine.arm(spec).expect("fixed transition should arm");
+
+        assert_eq!(engine.total_frames(), 220_500);
+        let samples = 220_500 * 2;
+        let _ = engine
+            .render(
+                AudioPacket::Samples(vec![1.0; samples]),
+                Some(AudioPacket::Samples(vec![0.0; samples])),
+            )
+            .expect("exact five-second PCM should render");
+        assert_eq!(engine.elapsed_frames(), 220_500);
+        assert_eq!(engine.state(), TransitionState::Finishing);
+    }
+
+    #[test]
+    fn linear_fade_has_exact_endpoints_and_midpoint() {
+        let mut engine = TransitionEngine::new(3, 1);
+        engine
+            .arm(spec(1, TransitionCurve::Linear))
+            .expect("linear transition should arm");
+
+        let output = engine
+            .render(
+                AudioPacket::Samples(vec![1.0; 3]),
+                Some(AudioPacket::Samples(vec![0.0; 3])),
+            )
+            .expect("linear transition should render");
+        assert_eq!(into_samples(output), [1.0, 0.5, 0.0]);
     }
 
     #[test]
