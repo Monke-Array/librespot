@@ -128,6 +128,7 @@ message Capabilities {
     bool supports_rooms = 28;
     bool supports_dj = 29;
     common.media.AudioQuality supported_audio_quality = 30;
+    bool supports_playlist_mixing = 36;
 }
 
 message CapabilitySupportDetails {

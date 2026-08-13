@@ -167,6 +167,7 @@ impl ConnectState {
                     "audio/local".into(),
                 ],
                 supports_playlist_v2: true,
+                supports_playlist_mixing: true,
                 supports_transfer_command: true,
                 supports_command_request: true,
                 supports_set_options_command: true,
