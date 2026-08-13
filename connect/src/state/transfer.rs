@@ -13,7 +13,7 @@ use protobuf::MessageField;
 
 impl ConnectState {
     pub fn current_track_from_transfer(
-        &self,
+        &mut self,
         transfer: &TransferState,
     ) -> Result<ProvidedTrack, Error> {
         let track = if transfer.queue.is_playing_queue.unwrap_or_default() {
@@ -162,6 +162,7 @@ impl ConnectState {
             self.shuffling_context()
         );
 
+        let context_uri = self.context_uri().clone();
         for (i, track) in transfer.queue.tracks.iter().enumerate() {
             if transfer.queue.is_playing_queue.unwrap_or_default() && i == 0 {
                 // if we are currently playing from the queue,
@@ -171,7 +172,7 @@ impl ConnectState {
 
             if let Ok(queued_track) = self.context_to_provided_track(
                 track,
-                Some(self.context_uri()),
+                Some(&context_uri),
                 None,
                 None,
                 Some(Provider::Queue),

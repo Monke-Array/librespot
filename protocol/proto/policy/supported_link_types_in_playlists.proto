@@ -13,5 +13,7 @@ enum LinkType {
   LOCAL_TRACK = 9;
   SHOW = 62;
   EPISODE = 63;
+  PODCAST_CHAPTER = 96;
+  KALLAX = 100;
 }
 

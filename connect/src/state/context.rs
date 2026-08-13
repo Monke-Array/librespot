@@ -22,6 +22,23 @@ use uuid::Uuid;
 const LOCAL_FILES_IDENTIFIER: &str = "spotify:local-files";
 const SEARCH_IDENTIFIER: &str = "spotify:search";
 
+fn provided_uid(
+    uid: Option<&str>,
+    synthesized_uids: &mut std::collections::HashSet<String>,
+) -> String {
+    match uid {
+        Some(uid) if !uid.is_empty() => {
+            synthesized_uids.remove(uid);
+            uid.to_owned()
+        }
+        _ => {
+            let uid = Uuid::new_v4().as_simple().to_string();
+            synthesized_uids.insert(uid.clone());
+            uid
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct StateContext {
     pub tracks: ShuffleVec<ProvidedTrack>,
@@ -117,6 +134,7 @@ impl ConnectState {
             ResetContext::Completely => {
                 self.context = None;
                 self.autoplay_context = None;
+                self.synthesized_uids.clear();
 
                 let player = self.player_mut();
                 player.context_uri.clear();
@@ -353,7 +371,9 @@ impl ConnectState {
         context_length: Option<usize>,
         provider: Option<Provider>,
     ) -> StateContext {
-        let new_context_uri = new_context_uri.unwrap_or(self.context_uri());
+        let new_context_uri = new_context_uri
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.context_uri().clone());
 
         let tracks = page
             .tracks
@@ -362,7 +382,7 @@ impl ConnectState {
             .flat_map(|(i, track)| {
                 match self.context_to_provided_track(
                     track,
-                    Some(new_context_uri),
+                    Some(&new_context_uri),
                     context_length.map(|l| l + i),
                     Some(&page.metadata),
                     provider.clone(),
@@ -439,7 +459,7 @@ impl ConnectState {
     }
 
     pub fn context_to_provided_track(
-        &self,
+        &mut self,
         ctx_track: &ContextTrack,
         context_uri: Option<&str>,
         context_index: Option<usize>,
@@ -470,11 +490,7 @@ impl ConnectState {
         // assumption: the uid is used as unique-id of any item
         //  - queue resorting is done by each client and orients itself by the given uid
         //  - if no uid is present, resorting doesn't work or behaves not as intended
-        let uid = match ctx_track.uid.as_ref() {
-            Some(uid) if !uid.is_empty() => uid.to_string(),
-            // so providing a unique id should allow to resort the queue
-            _ => Uuid::new_v4().as_simple().to_string(),
-        };
+        let uid = provided_uid(ctx_track.uid.as_deref(), &mut self.synthesized_uids);
 
         let mut metadata = page_metadata.cloned().unwrap_or_default();
         for (k, v) in &ctx_track.metadata {
@@ -505,6 +521,12 @@ impl ConnectState {
         Ok(track)
     }
 
+    /// Return a row UID only when it originated in Spotify context data.
+    pub fn authentic_row_uid<'a>(&self, track: &'a ProvidedTrack) -> Option<&'a str> {
+        (!track.uid.is_empty() && !self.synthesized_uids.contains(&track.uid))
+            .then_some(track.uid.as_str())
+    }
+
     pub fn fill_context_from_page(&mut self, page: ContextPage) -> Result<(), Error> {
         let ctx_len = self.context.as_ref().map(|c| c.tracks.len());
         let context = self.state_context_from_page(page, HashMap::new(), None, None, ctx_len, None);
@@ -519,5 +541,26 @@ impl ConnectState {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn spotify_uid_remains_authentic() {
+        let mut synthesized = HashSet::new();
+        let uid = provided_uid(Some("00112233445566778899aabbccddeeff"), &mut synthesized);
+        assert_eq!(uid, "00112233445566778899aabbccddeeff");
+        assert!(!synthesized.contains(&uid));
+    }
+
+    #[test]
+    fn missing_uid_is_marked_as_synthesized() {
+        let mut synthesized = HashSet::new();
+        let uid = provided_uid(None, &mut synthesized);
+        assert!(synthesized.contains(&uid));
     }
 }

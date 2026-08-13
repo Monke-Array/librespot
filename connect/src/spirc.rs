@@ -17,6 +17,7 @@ use crate::{
         mixer::Mixer,
         player::{Player, PlayerEvent, PlayerEventChannel},
     },
+    playlist_data::PlaylistDataServiceClient,
     protocol::{
         connect::{Cluster, ClusterUpdate, LogoutCommand, SetVolumeCommand},
         context::Context,
@@ -25,6 +26,10 @@ use crate::{
         social_connect_v2::SessionUpdate,
         transfer_state::TransferState,
         user_attributes::UserAttributesMutation,
+    },
+    spotify_mix_hydration::{
+        CacheLookup, HydrationResult, TransitionHydrationCache, TransitionRowKey,
+        hydrate_transition_row,
     },
     state::{
         context::{ContextType, ResetContext},
@@ -44,6 +49,7 @@ use std::{
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot},
+    task::JoinSet,
     time::sleep,
 };
 
@@ -97,6 +103,8 @@ struct SpircTask {
     player_events: Option<PlayerEventChannel>,
 
     context_resolver: ContextResolver,
+    transition_hydration_cache: TransitionHydrationCache,
+    transition_hydrations: JoinSet<HydrationResult>,
 
     shutdown: bool,
     session: Session,
@@ -312,6 +320,8 @@ impl Spirc {
             player_events: Some(player_events),
 
             context_resolver: ContextResolver::new(session.clone()),
+            transition_hydration_cache: TransitionHydrationCache::default(),
+            transition_hydrations: JoinSet::new(),
 
             shutdown: false,
             session,
@@ -574,6 +584,7 @@ impl SpircTask {
 
         self.player.set_session(session.clone());
         self.context_resolver.set_session(session.clone());
+        self.cancel_transition_hydrations();
         self.connection_id_update = bindings.connection_id_update;
         self.connect_state_update = bindings.connect_state_update;
         self.connect_state_volume_update = bindings.connect_state_volume_update;
@@ -736,6 +747,15 @@ impl SpircTask {
                             if let Err(why) = self.notify().await {
                                 error!("update after context resolving failed: {why}")
                             }
+                        }
+                    },
+                    hydration = self.transition_hydrations.join_next(), if !self.transition_hydrations.is_empty() => {
+                        match hydration {
+                            Some(Ok(hydration)) => self.handle_transition_hydration(hydration),
+                            Some(Err(error)) if !error.is_cancelled() => {
+                                debug!("[spotify-mix] hydration task failed: {error}")
+                            }
+                            _ => {}
                         }
                     },
                     else => break
@@ -1366,6 +1386,10 @@ impl SpircTask {
             Some(ref uri) => Some(uri.clone()),
         };
 
+        if ctx_uri.as_deref() != Some(self.connect_state.context_uri().as_str()) {
+            self.cancel_transition_hydrations();
+        }
+
         self.connect_state.reset_context(
             ctx_uri
                 .as_deref()
@@ -1497,6 +1521,7 @@ impl SpircTask {
     }
 
     fn handle_stop(&mut self) {
+        self.cancel_transition_hydrations();
         self.player.stop();
         self.connect_state.update_position(0, self.now_ms());
         self.connect_state.clear_next_tracks();
@@ -1541,6 +1566,14 @@ impl SpircTask {
         page: Option<ContextPage>,
         fallback_index: Option<usize>,
     ) -> Result<(), Error> {
+        let context_changed = match &cmd.context {
+            PlayContext::Uri(uri) => uri != self.connect_state.context_uri(),
+            PlayContext::Tracks(_) => true,
+        };
+        if context_changed {
+            self.cancel_transition_hydrations();
+        }
+
         self.connect_state
             .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
                 ResetContext::WhenDifferent(uri)
@@ -1840,8 +1873,144 @@ impl SpircTask {
                 crate::spotify_mix::transition_plan_for_pair(outgoing, &incoming)
             });
             self.player
-                .preload_with_transition(track_id, transition_plan);
+                .preload_with_transition(track_id.clone(), transition_plan.clone());
+
+            // ContextTrack metadata occasionally already contains a saved recipe. When it does,
+            // it remains the fastest path and no row hydration is needed.
+            if transition_plan.is_some() {
+                return;
+            }
+
+            let Some(outgoing) = outgoing else {
+                debug!("[spotify-mix] hydration unavailable; using fallback");
+                return;
+            };
+            let playlist_uri = self.connect_state.context_uri().clone();
+            if !matches!(
+                SpotifyUri::from_uri(&playlist_uri),
+                Ok(SpotifyUri::Playlist { .. })
+            ) {
+                debug!("[spotify-mix] hydration unavailable; using fallback");
+                return;
+            }
+            let Some(row_uid) = self
+                .connect_state
+                .authentic_row_uid(&outgoing)
+                .map(str::to_owned)
+            else {
+                debug!("[spotify-mix] hydration unavailable; using fallback");
+                return;
+            };
+
+            let key = TransitionRowKey {
+                playlist_uri,
+                row_uid,
+            };
+            match self.transition_hydration_cache.lookup_or_begin(key.clone()) {
+                CacheLookup::Start => {
+                    debug!("[spotify-mix] hydrating transition row uid={}", key.row_uid);
+                    self.transition_hydrations.spawn(hydrate_transition_row(
+                        PlaylistDataServiceClient::new(self.session.clone()),
+                        key,
+                        outgoing.uri,
+                    ));
+                    debug!("[spotify-mix] hydration unavailable; using fallback");
+                }
+                CacheLookup::Pending | CacheLookup::Unavailable => {
+                    debug!("[spotify-mix] hydration unavailable; using fallback");
+                }
+                CacheLookup::Ready(row) => {
+                    debug!(
+                        "[spotify-mix] transition row hydrated recipe={}",
+                        row.recipe.is_some()
+                    );
+                    if let Some(recipe) = row.recipe {
+                        let plan = crate::spotify_mix::transition_plan_for_decoded_pair(
+                            &outgoing, &incoming, &recipe,
+                        );
+                        self.player.preload_with_transition(track_id, plan);
+                    }
+                }
+            }
         }
+    }
+
+    fn handle_transition_hydration(&mut self, hydration: HydrationResult) {
+        let HydrationResult {
+            key,
+            outgoing_uri,
+            result,
+        } = hydration;
+
+        match &result {
+            Ok(row) => debug!(
+                "[spotify-mix] transition row hydrated recipe={}",
+                row.recipe.is_some()
+            ),
+            Err(reason) => debug!("[spotify-mix] hydration failed: {reason}"),
+        }
+        self.transition_hydration_cache
+            .complete(key.clone(), result.clone());
+
+        let Ok(row) = result else {
+            debug!("[spotify-mix] hydration unavailable; using fallback");
+            return;
+        };
+        let Some(recipe) = row.recipe else {
+            debug!("[spotify-mix] hydration unavailable; using fallback");
+            return;
+        };
+
+        // A completed request can outlive a skip or context replacement. Never let it replace
+        // the next-track preload unless it still belongs to the active A -> B pair.
+        if self.connect_state.context_uri() != &key.playlist_uri {
+            return;
+        }
+        let Some(outgoing) = self
+            .connect_state
+            .current_track(|track| track.as_ref().cloned())
+        else {
+            return;
+        };
+        if outgoing.uri != outgoing_uri
+            || self.connect_state.authentic_row_uid(&outgoing) != Some(key.row_uid.as_str())
+        {
+            return;
+        }
+        let Some(incoming) = self.connect_state.preview_next_provided_track().cloned() else {
+            return;
+        };
+        let Some(track_id) = self.connect_state.preview_next_track() else {
+            return;
+        };
+        let Some(plan) =
+            crate::spotify_mix::transition_plan_for_decoded_pair(&outgoing, &incoming, &recipe)
+        else {
+            return;
+        };
+
+        let current_position_ms = match self.play_status {
+            SpircPlayStatus::Playing {
+                nominal_start_time, ..
+            } => self.now_ms().saturating_sub(nominal_start_time) as u64,
+            SpircPlayStatus::Paused { position_ms, .. }
+            | SpircPlayStatus::LoadingPause { position_ms }
+            | SpircPlayStatus::LoadingPlay { position_ms } => u64::from(position_ms),
+            SpircPlayStatus::Stopped => return,
+        };
+        let transition_start_ms =
+            u64::try_from(plan.current_start().as_millis()).unwrap_or(u64::MAX);
+        if current_position_ms >= transition_start_ms.saturating_sub(200) {
+            debug!("[spotify-mix] hydration unavailable; using fallback");
+            return;
+        }
+
+        self.player.preload_with_transition(track_id, Some(plan));
+    }
+
+    fn cancel_transition_hydrations(&mut self) {
+        self.transition_hydrations.abort_all();
+        self.transition_hydration_cache.clear();
     }
 
     // Mark unavailable tracks so we can skip them later
@@ -1969,6 +2138,7 @@ impl SpircTask {
         }
 
         debug!("playlist modification for current context: {uri}");
+        self.cancel_transition_hydrations();
         self.context_resolver.add(ResolveContext::from_uri(
             uri,
             self.connect_state.current_track(|t| &t.uri),

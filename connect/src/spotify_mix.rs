@@ -11,13 +11,13 @@ use librespot_protocol::{
 use protobuf::Message;
 use thiserror::Error;
 
-const RECIPE_ATTRIBUTE: &str = "automix.auto_transition_recipe";
-const BACKEND_RECIPE_ATTRIBUTE: &str = "automix.backend_auto_transition";
+pub(crate) const RECIPE_ATTRIBUTE: &str = "automix.auto_transition_recipe";
+pub(crate) const BACKEND_RECIPE_ATTRIBUTE: &str = "automix.backend_auto_transition";
 const ITEM_SPEED_ATTRIBUTE: &str = "item.speed";
 const ITEM_SPEED_TOLERANCE: f64 = 0.001;
 
 #[derive(Debug, Error)]
-enum SpotifyTransitionError {
+pub(crate) enum SpotifyTransitionError {
     #[error("recipe is not valid base64")]
     InvalidBase64,
     #[error("recipe is not a valid Automix Transition protobuf")]
@@ -49,12 +49,13 @@ enum SpotifyTransitionError {
 }
 
 /// Typed current Spotify Automix recipe decoded from a playlist item attribute.
-struct SpotifyTransitionRecipe {
+#[derive(Clone, Debug)]
+pub(crate) struct SpotifyTransitionRecipe {
     transition: Transition,
 }
 
 impl SpotifyTransitionRecipe {
-    fn from_base64(encoded: &str) -> Result<Self, SpotifyTransitionError> {
+    pub(crate) fn from_base64(encoded: &str) -> Result<Self, SpotifyTransitionError> {
         let bytes = BASE64
             .decode(encoded.as_bytes())
             .map_err(|_| SpotifyTransitionError::InvalidBase64)?;
@@ -256,7 +257,29 @@ pub(crate) fn transition_plan_for_pair(
         return None;
     };
 
-    let result = SpotifyTransitionRecipe::from_base64(encoded).and_then(|recipe| {
+    transition_plan_for_recipe_pair(outgoing, incoming, encoded)
+}
+
+pub(crate) fn transition_plan_for_recipe_pair(
+    outgoing: &ProvidedTrack,
+    incoming: &ProvidedTrack,
+    encoded: &str,
+) -> Option<TransitionPlan> {
+    match SpotifyTransitionRecipe::from_base64(encoded) {
+        Ok(recipe) => transition_plan_for_decoded_pair(outgoing, incoming, &recipe),
+        Err(error) => {
+            warn!("[spotify-mix] invalid saved transition: {error}; using fallback");
+            None
+        }
+    }
+}
+
+pub(crate) fn transition_plan_for_decoded_pair(
+    outgoing: &ProvidedTrack,
+    incoming: &ProvidedTrack,
+    recipe: &SpotifyTransitionRecipe,
+) -> Option<TransitionPlan> {
+    let result: Result<TransitionPlan, SpotifyTransitionError> = (|| {
         recipe.validate_pair(
             &outgoing.uri,
             &incoming.uri,
@@ -295,7 +318,7 @@ pub(crate) fn transition_plan_for_pair(
             debug!("[spotify-mix] unsupported EQ/filter/FX fields present");
         }
         Ok(plan)
-    });
+    })();
 
     match result {
         Ok(plan) => Some(plan),

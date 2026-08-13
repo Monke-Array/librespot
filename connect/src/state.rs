@@ -30,7 +30,7 @@ use crate::{
 use log::LevelFilter;
 use protobuf::{EnumOrUnknown, MessageField};
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -111,6 +111,8 @@ pub(super) struct ConnectState {
     request: PutStateRequest,
 
     unavailable_uri: Vec<String>,
+    /// UIDs generated locally for Connect bookkeeping are never valid Spotify row IDs.
+    synthesized_uids: HashSet<String>,
 
     active_since: Option<SystemTime>,
     queue_count: u64,
