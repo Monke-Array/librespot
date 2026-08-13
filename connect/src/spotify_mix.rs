@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 
 use data_encoding::BASE64;
 use librespot_playback::{
@@ -12,6 +12,7 @@ use protobuf::Message;
 use thiserror::Error;
 
 const RECIPE_ATTRIBUTE: &str = "automix.auto_transition_recipe";
+const BACKEND_RECIPE_ATTRIBUTE: &str = "automix.backend_auto_transition";
 const ITEM_SPEED_ATTRIBUTE: &str = "item.speed";
 const ITEM_SPEED_TOLERANCE: f64 = 0.001;
 
@@ -177,6 +178,38 @@ fn provided_item_speed(track: &ProvidedTrack) -> Option<f64> {
         .filter(|speed| speed.is_finite() && *speed > 0.0)
 }
 
+fn provided_metadata_keys(track: &ProvidedTrack) -> Vec<&str> {
+    track
+        .metadata
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn log_transition_track(label: &str, track: &ProvidedTrack) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+
+    debug!(
+        "[spotify-mix] {label} uri={:?} uid={:?}",
+        track.uri, track.uid
+    );
+    debug!(
+        "[spotify-mix] {label} metadata_keys={:?}",
+        provided_metadata_keys(track)
+    );
+    // ProvidedTrack has no format-list-attribute field in the current schema.
+    debug!("[spotify-mix] {label} format_attribute_keys=[]");
+    debug!(
+        "[spotify-mix] {label} recipe_present={} backend_recipe_present={}",
+        track.metadata.contains_key(RECIPE_ATTRIBUTE),
+        track.metadata.contains_key(BACKEND_RECIPE_ATTRIBUTE)
+    );
+}
+
 fn adapt_curve_set(curve_set: &CurveSet) -> Result<GainCurve, TransitionPlanError> {
     let segments = curve_set
         .curves
@@ -215,6 +248,9 @@ pub(crate) fn transition_plan_for_pair(
     outgoing: &ProvidedTrack,
     incoming: &ProvidedTrack,
 ) -> Option<TransitionPlan> {
+    log_transition_track("A", outgoing);
+    log_transition_track("B", incoming);
+
     let Some(encoded) = outgoing.metadata.get(RECIPE_ATTRIBUTE) else {
         debug!("[spotify-mix] no saved recipe; using fallback");
         return None;
@@ -436,5 +472,14 @@ mod tests {
         let outgoing = track(TRACK_A, Some(encoded(&transition())), Some("1.0"));
         let incoming = track(TRACK_B, None, Some("1.0005"));
         assert!(transition_plan_for_pair(&outgoing, &incoming).is_some());
+    }
+
+    #[test]
+    fn provided_metadata_keys_are_sorted_without_values() {
+        let mut track = ProvidedTrack::new();
+        track.metadata.insert("z-last".into(), "secret-z".into());
+        track.metadata.insert("a-first".into(), "secret-a".into());
+
+        assert_eq!(provided_metadata_keys(&track), ["a-first", "z-last"]);
     }
 }

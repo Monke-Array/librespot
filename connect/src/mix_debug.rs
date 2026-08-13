@@ -11,6 +11,8 @@ use std::collections::{BTreeSet, HashMap};
 
 const PREFIX: &str = "[spotify-mix-debug]";
 const TRACK_LIMIT: usize = 8;
+const RECIPE_ATTRIBUTE: &str = "automix.auto_transition_recipe";
+const BACKEND_RECIPE_ATTRIBUTE: &str = "automix.backend_auto_transition";
 
 pub(crate) fn log_cluster(source: &str, cluster: &Cluster) {
     if !enabled() {
@@ -204,20 +206,61 @@ fn log_context(source: &str, context: &Context) {
     }
 }
 
+pub(crate) fn log_context_track_before_conversion(track: &ContextTrack) {
+    if !enabled() {
+        return;
+    }
+
+    let mut fields = [
+        track.uri.is_some().then_some("uri"),
+        track.uid.is_some().then_some("uid"),
+        track.gid.is_some().then_some("gid"),
+        (!track.metadata.is_empty()).then_some("metadata"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    fields.sort_unstable();
+
+    debug!(
+        "[spotify-mix] raw ContextTrack uri={} uid={}",
+        safe(track.uri.as_deref()),
+        safe(track.uid.as_deref())
+    );
+    debug!(
+        "[spotify-mix] raw ContextTrack field_names={fields:?} metadata_keys={:?}",
+        keys(&track.metadata)
+    );
+    // ContextTrack has no format-list-attribute field in the current schema.
+    debug!("[spotify-mix] raw ContextTrack format_attribute_keys=[]");
+    debug!(
+        "[spotify-mix] raw ContextTrack recipe_present={} backend_recipe_present={}",
+        track.metadata.contains_key(RECIPE_ATTRIBUTE),
+        track.metadata.contains_key(BACKEND_RECIPE_ATTRIBUTE)
+    );
+    unknown("raw ContextTrack before conversion", track);
+}
+
 fn log_context_track(label: &str, index: usize, track: &ContextTrack) {
     debug!(
-        "{PREFIX} {label} index={index} id={} metadata keys={:?}",
-        spotify_id(track.uri.as_deref()),
-        keys(&track.metadata)
+        "{PREFIX} {label} index={index} uri={} uid={} metadata_keys={:?} format_attribute_keys=[] recipe_present={} backend_recipe_present={}",
+        safe(track.uri.as_deref()),
+        safe(track.uid.as_deref()),
+        keys(&track.metadata),
+        track.metadata.contains_key(RECIPE_ATTRIBUTE),
+        track.metadata.contains_key(BACKEND_RECIPE_ATTRIBUTE)
     );
     unknown("context track", track);
 }
 
 fn log_provided_track(label: &str, index: usize, track: &ProvidedTrack) {
     debug!(
-        "{PREFIX} {label} index={index} id={} metadata keys={:?}",
-        spotify_id(Some(&track.uri)),
-        keys(&track.metadata)
+        "{PREFIX} {label} index={index} uri={} uid={} metadata_keys={:?} format_attribute_keys=[] recipe_present={} backend_recipe_present={}",
+        safe(Some(&track.uri)),
+        safe(Some(&track.uid)),
+        keys(&track.metadata),
+        track.metadata.contains_key(RECIPE_ATTRIBUTE),
+        track.metadata.contains_key(BACKEND_RECIPE_ATTRIBUTE)
     );
     unknown("provided track", track);
 }
@@ -251,18 +294,6 @@ fn keys<V>(map: &HashMap<String, V>) -> Vec<String> {
     keys.sort();
     keys.truncate(128);
     keys
-}
-
-fn spotify_id(uri: Option<&str>) -> String {
-    let Some(uri) = uri.filter(|uri| uri.starts_with("spotify:")) else {
-        return "<redacted>".into();
-    };
-    let id = uri.rsplit(':').next().unwrap_or_default();
-    if id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric()) {
-        id.into()
-    } else {
-        "<redacted>".into()
-    }
 }
 
 fn safe(value: Option<&str>) -> String {

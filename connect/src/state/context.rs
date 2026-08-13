@@ -1,5 +1,6 @@
 use crate::{
     core::{Error, SpotifyId, SpotifyUri},
+    mix_debug,
     protocol::{
         context::Context,
         context_page::ContextPage,
@@ -445,6 +446,8 @@ impl ConnectState {
         page_metadata: Option<&HashMap<String, String>>,
         provider: Option<Provider>,
     ) -> Result<ProvidedTrack, Error> {
+        mix_debug::log_context_track_before_conversion(ctx_track);
+
         let id = match (ctx_track.uri.as_ref(), ctx_track.gid.as_ref()) {
             (Some(uri), _) if uri.contains(['?']) => {
                 Err(StateError::InvalidTrackUri(Some(uri.clone())))?
