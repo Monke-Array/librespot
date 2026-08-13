@@ -14,6 +14,7 @@ mod mix_debug;
 mod model;
 mod shuffle_vec;
 mod spirc;
+mod spotify_mix;
 mod state;
 
 pub use model::*;

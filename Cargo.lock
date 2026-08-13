@@ -1841,6 +1841,7 @@ dependencies = [
 name = "librespot-connect"
 version = "0.8.0"
 dependencies = [
+ "data-encoding",
  "futures-util",
  "librespot-core",
  "librespot-playback",

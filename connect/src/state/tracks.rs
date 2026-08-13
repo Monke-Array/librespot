@@ -352,14 +352,17 @@ impl<'ct> ConnectState {
         Ok(())
     }
 
-    pub fn preview_next_track(&mut self) -> Option<SpotifyUri> {
-        let next = if self.repeat_track() {
-            self.current_track(|t| &t.uri)
+    /// Return the complete next queue item without advancing queue state.
+    pub fn preview_next_provided_track(&self) -> Option<&ProvidedTrack> {
+        if self.repeat_track() {
+            self.player().track.as_ref()
         } else {
-            &self.next_tracks().first()?.uri
-        };
+            self.next_tracks().first()
+        }
+    }
 
-        SpotifyUri::from_uri(next).ok()
+    pub fn preview_next_track(&self) -> Option<SpotifyUri> {
+        SpotifyUri::from_uri(&self.preview_next_provided_track()?.uri).ok()
     }
 
     pub fn has_next_tracks(&self, min: Option<usize>) -> bool {

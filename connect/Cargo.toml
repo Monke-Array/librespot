@@ -22,6 +22,7 @@ librespot-core = { version = "0.8.0", path = "../core", default-features = false
 librespot-playback = { version = "0.8.0", path = "../playback", default-features = false }
 librespot-protocol = { version = "0.8.0", path = "../protocol", default-features = false }
 
+data-encoding = "2.5"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 log = "0.4"
 protobuf = "3.7"

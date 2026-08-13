@@ -1,0 +1,133 @@
+// Reconstructed from the current Spotify desktop client's generated protobuf codec
+// (xpui-modules.js module 27702, August 2026).
+
+syntax = "proto2";
+
+package spotify.automix.proto;
+
+option optimize_for = CODE_SIZE;
+
+enum PresetType {
+    PRESET_TYPE_UNSPECIFIED = 0;
+    PRESET_TYPE_FADE = 1;
+    PRESET_TYPE_CUT = 2;
+    PRESET_TYPE_BEATMATCHED_FADE = 3;
+    PRESET_TYPE_BEATMATCHED_CUT = 4;
+}
+
+enum BeatmatchPreference {
+    BEATMATCH_PREFERENCE_AUTO = 0;
+    BEATMATCH_PREFERENCE_OFF = 1;
+    BEATMATCH_PREFERENCE_ON = 2;
+}
+
+message CurvePoint {
+    optional double x = 1;
+    optional double y = 2;
+}
+
+// A normalized Bezier segment. start/end locate it within the complete envelope;
+// point x coordinates are local to that segment.
+message Curve {
+    repeated CurvePoint points = 1;
+    optional double start = 2;
+    optional double end = 3;
+}
+
+message CurveSet {
+    repeated Curve curves = 1;
+    reserved 2;
+    optional double minimum = 3;
+    optional double maximum = 4;
+}
+
+message VolumeStyle {
+    optional int32 id = 1;
+}
+
+message EqStyle {
+    optional int32 id = 1;
+}
+
+message FilterFxStyle {
+    optional int32 id = 1;
+}
+
+message FxStyle {
+    optional int32 id = 1;
+}
+
+message JogwheelStyle {
+    optional int32 id = 1;
+}
+
+message LoopingStyle {
+    optional int32 id = 1;
+}
+
+message EqCurveOverrides {
+    optional CurveSet low = 1;
+    optional CurveSet mid = 2;
+    optional CurveSet high = 3;
+}
+
+message FilterCurveOverrides {
+    optional CurveSet cutoff = 1;
+    optional CurveSet resonance = 2;
+    optional CurveSet noise_color = 3;
+}
+
+message FxCurveOverrides {
+    optional CurveSet echo_dry_wet = 1;
+    optional CurveSet reverb_dry_wet = 2;
+    optional CurveSet delay_dry_wet = 3;
+}
+
+message Preset {
+    optional int32 id = 1;
+    optional PresetType type = 2;
+    optional VolumeStyle volume_style_override = 3;
+    optional EqStyle eq_style_override = 4;
+    optional FilterFxStyle filter_fx_style_override = 5;
+    optional CurveSet volume_out_curve_override = 6;
+    optional CurveSet volume_in_curve_override = 7;
+    optional EqCurveOverrides eq_out_curve_overrides = 8;
+    optional EqCurveOverrides eq_in_curve_overrides = 9;
+    optional FilterCurveOverrides filter_out_curve_overrides = 10;
+    optional FilterCurveOverrides filter_in_curve_overrides = 11;
+    optional FxStyle fx_style_override = 12;
+    optional FxCurveOverrides fx_out_curve_overrides = 13;
+    optional FxCurveOverrides fx_in_curve_overrides = 14;
+    optional JogwheelStyle jogwheel_style_override = 15;
+    optional LoopingStyle looping_style_override = 16;
+}
+
+message Overlap {
+    optional string track_a_row_id = 1;
+    optional string track_b_row_id = 2;
+    optional int32 start_a_ms = 3;
+    optional int32 start_b_ms = 4;
+    optional int32 duration_ms = 5;
+    optional float speed_a = 6;
+    optional float speed_b = 7;
+    optional int32 duration_bars = 8;
+    optional bool is_beatmatched = 9;
+    optional string track_a_uri = 10;
+    optional string track_b_uri = 11;
+    optional string track_a_playable_uri = 12;
+    optional string track_b_playable_uri = 13;
+    optional string track_a_playable_beats_hash = 14;
+    optional string track_b_playable_beats_hash = 15;
+    optional float bpm_a = 16;
+    optional float bpm_b = 17;
+    optional double item_speed_a = 18;
+    optional double item_speed_b = 19;
+}
+
+message Transition {
+    optional Overlap overlap = 1;
+    optional Preset preset = 2;
+    optional bool is_overlap_override = 3;
+    optional bool is_preset_id_override = 4;
+    optional BeatmatchPreference beatmatch_preference = 5;
+}

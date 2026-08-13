@@ -1829,8 +1829,18 @@ impl SpircTask {
             _ => (),
         }
 
-        if let Some(track_id) = self.connect_state.preview_next_track() {
-            self.player.preload(track_id);
+        if let (Some(track_id), Some(incoming)) = (
+            self.connect_state.preview_next_track(),
+            self.connect_state.preview_next_provided_track().cloned(),
+        ) {
+            let outgoing = self
+                .connect_state
+                .current_track(|track| track.as_ref().cloned());
+            let transition_plan = outgoing.as_ref().and_then(|outgoing| {
+                crate::spotify_mix::transition_plan_for_pair(outgoing, &incoming)
+            });
+            self.player
+                .preload_with_transition(track_id, transition_plan);
         }
     }
 

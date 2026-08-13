@@ -41,6 +41,7 @@ fn compile() {
         proto_dir.join("storage-resolve.proto"),
         proto_dir.join("user_attributes.proto"),
         proto_dir.join("autoplay_context_request.proto"),
+        proto_dir.join("automix_transition.proto"),
         proto_dir.join("social_connect_v2.proto"),
         proto_dir.join("transfer_state.proto"),
         proto_dir.join("context_player_options.proto"),

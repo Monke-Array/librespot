@@ -17,6 +17,8 @@ mod secondary;
 mod symphonia_util;
 mod transition;
 
+pub use transition::{GainCurve, GainCurveSegment, GainPoint, TransitionPlan, TransitionPlanError};
+
 pub const SAMPLE_RATE: u32 = 44100;
 pub const NUM_CHANNELS: u8 = 2;
 pub const SAMPLES_PER_SECOND: u32 = SAMPLE_RATE * NUM_CHANNELS as u32;
