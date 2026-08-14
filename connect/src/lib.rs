@@ -12,7 +12,6 @@ mod capability_debug;
 mod context_resolver;
 mod mix_debug;
 mod model;
-mod playlist_data;
 mod shuffle_vec;
 mod spirc;
 mod spotify_mix;

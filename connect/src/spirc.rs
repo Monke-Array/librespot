@@ -17,7 +17,6 @@ use crate::{
         mixer::Mixer,
         player::{Player, PlayerEvent, PlayerEventChannel},
     },
-    playlist_data::PlaylistDataServiceClient,
     protocol::{
         connect::{Cluster, ClusterUpdate, LogoutCommand, SetVolumeCommand},
         context::Context,
@@ -28,8 +27,8 @@ use crate::{
         user_attributes::UserAttributesMutation,
     },
     spotify_mix_hydration::{
-        CacheLookup, HydrationResult, TransitionHydrationCache, TransitionRowKey,
-        hydrate_transition_row,
+        CacheLookup, HydrationResult, TransitionDataClient, TransitionHydrationCache,
+        TransitionHydrationKey, hydrate_transition_data, transition_uri,
     },
     state::{
         context::{ContextType, ResetContext},
@@ -1875,8 +1874,7 @@ impl SpircTask {
             self.player
                 .preload_with_transition(track_id.clone(), transition_plan.clone());
 
-            // ContextTrack metadata occasionally already contains a saved recipe. When it does,
-            // it remains the fastest path and no row hydration is needed.
+            // Retain support for contexts that already carry the recipe inline.
             if transition_plan.is_some() {
                 return;
             }
@@ -1885,6 +1883,11 @@ impl SpircTask {
                 debug!("[spotify-mix] hydration unavailable; using fallback");
                 return;
             };
+            let Some(transition_uri) = transition_uri(&outgoing).map(str::to_owned) else {
+                debug!("[spotify-mix] hydration unavailable; using fallback");
+                return;
+            };
+            debug!("[spotify-mix] transition uri found uri={transition_uri}");
             let playlist_uri = self.connect_state.context_uri().clone();
             if !matches!(
                 SpotifyUri::from_uri(&playlist_uri),
@@ -1902,33 +1905,33 @@ impl SpircTask {
                 return;
             };
 
-            let key = TransitionRowKey {
+            let key = TransitionHydrationKey {
                 playlist_uri,
                 row_uid,
+                transition_uri,
+                outgoing_uri: outgoing.uri.clone(),
+                incoming_uri: incoming.uri.clone(),
             };
             match self.transition_hydration_cache.lookup_or_begin(key.clone()) {
-                CacheLookup::Start => {
-                    debug!("[spotify-mix] hydrating transition row uid={}", key.row_uid);
-                    self.transition_hydrations.spawn(hydrate_transition_row(
-                        PlaylistDataServiceClient::new(self.session.clone()),
+                CacheLookup::Start(request_id) => {
+                    self.transition_hydrations.spawn(hydrate_transition_data(
+                        TransitionDataClient::new(self.session.clone()),
                         key,
-                        outgoing.uri,
+                        request_id,
                     ));
                     debug!("[spotify-mix] hydration unavailable; using fallback");
                 }
                 CacheLookup::Pending | CacheLookup::Unavailable => {
                     debug!("[spotify-mix] hydration unavailable; using fallback");
                 }
-                CacheLookup::Ready(row) => {
-                    debug!(
-                        "[spotify-mix] transition row hydrated recipe={}",
-                        row.recipe.is_some()
-                    );
-                    if let Some(recipe) = row.recipe {
-                        let plan = crate::spotify_mix::transition_plan_for_decoded_pair(
-                            &outgoing, &incoming, &recipe,
-                        );
-                        self.player.preload_with_transition(track_id, plan);
+                CacheLookup::Ready(transition) => {
+                    if let Some(plan) = crate::spotify_mix::transition_plan_for_decoded_pair(
+                        &outgoing,
+                        &incoming,
+                        &transition.recipe,
+                    ) {
+                        debug!("[spotify-mix] saved transition plan selected");
+                        self.player.preload_with_transition(track_id, Some(plan));
                     }
                 }
             }
@@ -1938,54 +1941,63 @@ impl SpircTask {
     fn handle_transition_hydration(&mut self, hydration: HydrationResult) {
         let HydrationResult {
             key,
-            outgoing_uri,
+            request_id,
             result,
         } = hydration;
 
-        match &result {
-            Ok(row) => debug!(
-                "[spotify-mix] transition row hydrated recipe={}",
-                row.recipe.is_some()
-            ),
-            Err(reason) => debug!("[spotify-mix] hydration failed: {reason}"),
-        }
-        self.transition_hydration_cache
-            .complete(key.clone(), result.clone());
-
-        let Ok(row) = result else {
-            debug!("[spotify-mix] hydration unavailable; using fallback");
-            return;
-        };
-        let Some(recipe) = row.recipe else {
-            debug!("[spotify-mix] hydration unavailable; using fallback");
-            return;
-        };
-
         // A completed request can outlive a skip or context replacement. Never let it replace
-        // the next-track preload unless it still belongs to the active A -> B pair.
-        if self.connect_state.context_uri() != &key.playlist_uri {
-            return;
-        }
+        // the next-track preload or repopulate a cleared cache unless it still belongs to A -> B.
         let Some(outgoing) = self
             .connect_state
             .current_track(|track| track.as_ref().cloned())
         else {
             return;
         };
-        if outgoing.uri != outgoing_uri
-            || self.connect_state.authentic_row_uid(&outgoing) != Some(key.row_uid.as_str())
-        {
+        let Some(incoming) = self.connect_state.preview_next_provided_track().cloned() else {
+            return;
+        };
+        let Some(row_uid) = self.connect_state.authentic_row_uid(&outgoing) else {
+            return;
+        };
+        let Some(active_transition_uri) = transition_uri(&outgoing) else {
+            return;
+        };
+        if !key.matches_pair(
+            self.connect_state.context_uri(),
+            row_uid,
+            active_transition_uri,
+            &outgoing.uri,
+            &incoming.uri,
+        ) {
+            debug!("[spotify-mix] discarded stale transition hydration result");
             return;
         }
-        let Some(incoming) = self.connect_state.preview_next_provided_track().cloned() else {
+
+        if !self
+            .transition_hydration_cache
+            .complete(key.clone(), request_id, result.clone())
+        {
+            debug!("[spotify-mix] discarded cancelled transition hydration result");
+            return;
+        }
+
+        match &result {
+            Ok(_) => debug!("[spotify-mix] transition data hydrated recipe=true"),
+            Err(reason) => debug!("[spotify-mix] hydration failed: {reason}"),
+        }
+
+        let Ok(transition) = result else {
+            debug!("[spotify-mix] hydration unavailable; using fallback");
             return;
         };
         let Some(track_id) = self.connect_state.preview_next_track() else {
             return;
         };
-        let Some(plan) =
-            crate::spotify_mix::transition_plan_for_decoded_pair(&outgoing, &incoming, &recipe)
-        else {
+        let Some(plan) = crate::spotify_mix::transition_plan_for_decoded_pair(
+            &outgoing,
+            &incoming,
+            &transition.recipe,
+        ) else {
             return;
         };
 
@@ -2005,6 +2017,7 @@ impl SpircTask {
             return;
         }
 
+        debug!("[spotify-mix] saved transition plan selected");
         self.player.preload_with_transition(track_id, Some(plan));
     }
 

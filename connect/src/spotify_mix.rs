@@ -44,6 +44,14 @@ pub(crate) enum SpotifyTransitionError {
     MissingOutgoingVolumeCurve,
     #[error("recipe has no incoming volume curve override")]
     MissingIncomingVolumeCurve,
+    #[error("preset/style resolution required (preset={0})")]
+    UnsupportedPresetStyle(i32),
+    #[error("tempo handling required ({0}={1})")]
+    UnsupportedTempo(&'static str, f32),
+    #[error("EQ/filter/FX rendering required")]
+    UnsupportedEffects,
+    #[error("inline volume automation is required")]
+    UnsupportedVolumeAutomation,
     #[error(transparent)]
     InvalidPlan(#[from] TransitionPlanError),
 }
@@ -152,6 +160,63 @@ impl SpotifyTransitionRecipe {
             adapt_curve_set(incoming)?,
         )
         .map_err(Into::into)
+    }
+
+    fn ensure_renderable(&self) -> Result<(), SpotifyTransitionError> {
+        let overlap = self.overlap()?;
+        let preset = self
+            .transition
+            .preset
+            .as_ref()
+            .ok_or(SpotifyTransitionError::MissingPreset)?;
+
+        // EqSwap is confirmed to require preset semantics that the current renderer does not
+        // implement. Other presets without inline volume automation need style resolution too.
+        if preset.id() == 2
+            || (preset.id() != 0
+                && (preset.volume_out_curve_override.is_none()
+                    || preset.volume_in_curve_override.is_none()))
+        {
+            return Err(SpotifyTransitionError::UnsupportedPresetStyle(preset.id()));
+        }
+        if preset.volume_out_curve_override.is_none() || preset.volume_in_curve_override.is_none() {
+            return Err(SpotifyTransitionError::UnsupportedVolumeAutomation);
+        }
+        if has_unsupported_effects(preset) {
+            return Err(SpotifyTransitionError::UnsupportedEffects);
+        }
+        if overlap
+            .speed_a
+            .is_some_and(|speed| (speed - 1.0).abs() > ITEM_SPEED_TOLERANCE as f32)
+        {
+            return Err(SpotifyTransitionError::UnsupportedTempo(
+                "speedA",
+                overlap.speed_a(),
+            ));
+        }
+        if overlap
+            .speed_b
+            .is_some_and(|speed| (speed - 1.0).abs() > ITEM_SPEED_TOLERANCE as f32)
+        {
+            return Err(SpotifyTransitionError::UnsupportedTempo(
+                "speedB",
+                overlap.speed_b(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn decoded_summary(&self) -> Result<String, SpotifyTransitionError> {
+        let overlap = self.overlap()?;
+        Ok(format!(
+            "startA={} startB={} duration={} preset={} speedA={:?} speedB={:?}",
+            overlap.start_a_ms(),
+            overlap.start_b_ms(),
+            overlap.duration_ms(),
+            self.preset().map(Preset::id).unwrap_or_default(),
+            overlap.speed_a,
+            overlap.speed_b
+        ))
     }
 
     fn preset(&self) -> Option<&Preset> {
@@ -286,9 +351,26 @@ pub(crate) fn transition_plan_for_decoded_pair(
             provided_item_speed(outgoing),
             provided_item_speed(incoming),
         )?;
-        let plan = recipe.to_plan()?;
         let overlap = recipe.overlap()?;
         let preset = recipe.preset();
+        debug!(
+            "[spotify-mix] saved recipe decoded {}",
+            recipe.decoded_summary()?
+        );
+        debug!(
+            "[spotify-mix] preset type={:?} beatmatchPreference={:?} beatmatched={} itemSpeedA={} itemSpeedB={}",
+            preset.map(Preset::type_),
+            recipe.transition.beatmatch_preference(),
+            overlap.is_beatmatched(),
+            overlap.item_speed_a(),
+            overlap.item_speed_b()
+        );
+        debug!(
+            "[spotify-mix] durationBars={:?} bpmA={:?} bpmB={:?}",
+            overlap.duration_bars, overlap.bpm_a, overlap.bpm_b
+        );
+        recipe.ensure_renderable()?;
+        let plan = recipe.to_plan()?;
         debug!(
             "[spotify-mix] saved transition {} -> {}",
             outgoing.uri, incoming.uri
@@ -299,29 +381,20 @@ pub(crate) fn transition_plan_for_decoded_pair(
             overlap.start_b_ms(),
             overlap.duration_ms()
         );
-        debug!(
-            "[spotify-mix] preset={} type={:?} beatmatchPreference={:?} beatmatched={} speedA={:?} speedB={:?} itemSpeedA={} itemSpeedB={}",
-            preset.map(Preset::id).unwrap_or_default(),
-            preset.map(Preset::type_),
-            recipe.transition.beatmatch_preference(),
-            overlap.is_beatmatched(),
-            overlap.speed_a,
-            overlap.speed_b,
-            overlap.item_speed_a(),
-            overlap.item_speed_b()
-        );
-        debug!(
-            "[spotify-mix] durationBars={:?} bpmA={:?} bpmB={:?}",
-            overlap.duration_bars, overlap.bpm_a, overlap.bpm_b
-        );
-        if preset.is_some_and(has_unsupported_effects) {
-            debug!("[spotify-mix] unsupported EQ/filter/FX fields present");
-        }
         Ok(plan)
     })();
 
     match result {
         Ok(plan) => Some(plan),
+        Err(
+            error @ (SpotifyTransitionError::UnsupportedPresetStyle(_)
+            | SpotifyTransitionError::UnsupportedTempo(_, _)
+            | SpotifyTransitionError::UnsupportedEffects
+            | SpotifyTransitionError::UnsupportedVolumeAutomation),
+        ) => {
+            warn!("[spotify-mix] saved recipe unsupported: {error}; using fallback");
+            None
+        }
         Err(error) => {
             warn!("[spotify-mix] invalid saved transition: {error}; using fallback");
             None
@@ -495,6 +568,24 @@ mod tests {
         let outgoing = track(TRACK_A, Some(encoded(&transition())), Some("1.0"));
         let incoming = track(TRACK_B, None, Some("1.0005"));
         assert!(transition_plan_for_pair(&outgoing, &incoming).is_some());
+    }
+
+    #[test]
+    fn eq_swap_without_inline_curves_is_reported_as_unsupported() {
+        let mut transition = transition();
+        let preset = transition.preset.as_mut().unwrap();
+        preset.id = Some(2);
+        preset.volume_out_curve_override.clear();
+        preset.volume_in_curve_override.clear();
+        let recipe = SpotifyTransitionRecipe::from_base64(&encoded(&transition)).unwrap();
+
+        assert!(matches!(
+            recipe.ensure_renderable(),
+            Err(SpotifyTransitionError::UnsupportedPresetStyle(2))
+        ));
+        let outgoing = track(TRACK_A, None, Some("1.0"));
+        let incoming = track(TRACK_B, None, Some("1.0"));
+        assert!(transition_plan_for_decoded_pair(&outgoing, &incoming, &recipe).is_none());
     }
 
     #[test]

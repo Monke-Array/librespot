@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+// The upstream package name is not known. Keep this local envelope unqualified.
+message TransitionData {
+    string transition_uri = 1;
+    string latest_transition_uri = 2;
+    string playlist_uri = 3;
+    bytes item_id = 4;
+    string creator_user_id = 5;
+    string transition = 6;
+    string track_a_uri = 7;
+    string track_b_uri = 8;
+}
