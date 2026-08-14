@@ -1,0 +1,885 @@
+{
+  "format": "spotify-automix-input-validation-v1",
+  "oraclePairs": 8,
+  "uniqueTracks": 9,
+  "totalTransitions": 107,
+  "beatmatchedTransitions": 105,
+  "nonBeatmatchedTransitions": 2,
+  "exactGeometry": 105,
+  "exactSpeedBits": 22,
+  "maximumSpeedDifference": 0.00000762939453125,
+  "speedFormulaCandidates": [
+    {
+      "name": "outputMillisecondsFloat32/rawDouble:divide",
+      "exact": 33,
+      "maximumDifference": 0.000007510185241699219
+    },
+    {
+      "name": "outputMillisecondsFloat32/rawFloat32:divide",
+      "exact": 33,
+      "maximumDifference": 0.000007510185241699219
+    },
+    {
+      "name": "outputMillisecondsDouble/rawDouble:divide",
+      "exact": 28,
+      "maximumDifference": 0.000007510185241699219
+    },
+    {
+      "name": "outputMillisecondsDouble/rawFloat32:divide",
+      "exact": 28,
+      "maximumDifference": 0.000007510185241699219
+    },
+    {
+      "name": "rawDouble/rawDouble:divide",
+      "exact": 28,
+      "maximumDifference": 0.00000762939453125
+    },
+    {
+      "name": "rawDouble/rawFloat32:divide",
+      "exact": 28,
+      "maximumDifference": 0.00000762939453125
+    },
+    {
+      "name": "rawFloat32/rawDouble:divide",
+      "exact": 27,
+      "maximumDifference": 0.00000762939453125
+    },
+    {
+      "name": "rawFloat32/rawFloat32:divide",
+      "exact": 27,
+      "maximumDifference": 0.00000762939453125
+    },
+    {
+      "name": "outputMillisecondsDouble/rawDouble:inverseDivide",
+      "exact": 24,
+      "maximumDifference": 0.000007510185241699219
+    },
+    {
+      "name": "outputMillisecondsFloat32/rawDouble:inverseDivide",
+      "exact": 24,
+      "maximumDifference": 0.000007510185241699219
+    },
+    {
+      "name": "outputMillisecondsDouble/rawFloat32:inverseDivide",
+      "exact": 24,
+      "maximumDifference": 0.000007510185241699219
+    },
+    {
+      "name": "outputMillisecondsFloat32/rawFloat32:inverseDivide",
+      "exact": 24,
+      "maximumDifference": 0.000007510185241699219
+    }
+  ],
+  "exactPreset": 107,
+  "beatsHashesMatched": 9,
+  "hashes": [
+    {
+      "canonicalTrackUri": "spotify:track:2BMRUAA1oTc7e9JPlr6xbZ",
+      "playableTrackUri": "spotify:track:2BMRUAA1oTc7e9JPlr6xbZ",
+      "captured": "2ed62e425d2482ad5cf32fb9ba7bc4cd",
+      "expected": "2ed62e425d2482ad5cf32fb9ba7bc4cd",
+      "matches": true
+    },
+    {
+      "canonicalTrackUri": "spotify:track:5g9lS8deSIxItFBmZRC4vN",
+      "playableTrackUri": "spotify:track:5g9lS8deSIxItFBmZRC4vN",
+      "captured": "92a1c0e36130287b588172fb00de2839",
+      "expected": "92a1c0e36130287b588172fb00de2839",
+      "matches": true
+    },
+    {
+      "canonicalTrackUri": "spotify:track:0VjIjW4GlUZAMYd2vXMi3b",
+      "playableTrackUri": "spotify:track:0VjIjW4GlUZAMYd2vXMi3b",
+      "captured": "ff129e65d0b0f79d072687dcc4d3a1e3",
+      "expected": "ff129e65d0b0f79d072687dcc4d3a1e3",
+      "matches": true
+    },
+    {
+      "canonicalTrackUri": "spotify:track:4PTG3Z6ehGkBFwjybzWkR8",
+      "playableTrackUri": "spotify:track:4PTG3Z6ehGkBFwjybzWkR8",
+      "captured": "8fd75eb7ae1ffd0322040eb53085ac61",
+      "expected": "8fd75eb7ae1ffd0322040eb53085ac61",
+      "matches": true
+    },
+    {
+      "canonicalTrackUri": "spotify:track:5ghIJDpPoe3CfHMGu71E6T",
+      "playableTrackUri": "spotify:track:4CeeEOM32jQcH3eN9Q2dGj",
+      "captured": "b0c32b602b259f62de5649357c427bb1",
+      "expected": "b0c32b602b259f62de5649357c427bb1",
+      "matches": true
+    },
+    {
+      "canonicalTrackUri": "spotify:track:5ChkMS8OtdzJeqyybCc9R5",
+      "playableTrackUri": "spotify:track:5ChkMS8OtdzJeqyybCc9R5",
+      "captured": "02f9af0a0f2bc50f0987fe69ca4b084c",
+      "expected": "02f9af0a0f2bc50f0987fe69ca4b084c",
+      "matches": true
+    },
+    {
+      "canonicalTrackUri": "spotify:track:7tFiyTwD0nx5a1eklYtX2J",
+      "playableTrackUri": "spotify:track:2JiDi0qAXsPwhPqA2qaKGt",
+      "captured": "208579284d5c36884a329d7968ca7e0c",
+      "expected": "208579284d5c36884a329d7968ca7e0c",
+      "matches": true
+    },
+    {
+      "canonicalTrackUri": "spotify:track:003vvx7Niy0yvhvHt4a68B",
+      "playableTrackUri": "spotify:track:003vvx7Niy0yvhvHt4a68B",
+      "captured": "fa371d0cae33684c888eb42c42db3391",
+      "expected": "fa371d0cae33684c888eb42c42db3391",
+      "matches": true
+    },
+    {
+      "canonicalTrackUri": "spotify:track:5T8EDUDqKcs6OSOwEsfqG7",
+      "playableTrackUri": "spotify:track:1NHWG8zxSEypSRF3UufrnO",
+      "captured": "e6f584ce03bd34ed034879c13953246e",
+      "expected": "e6f584ce03bd34ed034879c13953246e",
+      "matches": true
+    }
+  ],
+  "perPair": [
+    {
+      "pairIndex": 0,
+      "label": "tested-playlist",
+      "transitions": 15,
+      "beatmatched": 15,
+      "exactGeometry": 15,
+      "exactSpeedBits": 11,
+      "exactPreset": 15
+    },
+    {
+      "pairIndex": 1,
+      "label": "tested-reverse",
+      "transitions": 15,
+      "beatmatched": 15,
+      "exactGeometry": 15,
+      "exactSpeedBits": 4,
+      "exactPreset": 15
+    },
+    {
+      "pairIndex": 2,
+      "label": "blinding-to-never",
+      "transitions": 1,
+      "beatmatched": 0,
+      "exactGeometry": 0,
+      "exactSpeedBits": 0,
+      "exactPreset": 1
+    },
+    {
+      "pairIndex": 3,
+      "label": "never-to-blinding",
+      "transitions": 1,
+      "beatmatched": 0,
+      "exactGeometry": 0,
+      "exactSpeedBits": 0,
+      "exactPreset": 1
+    },
+    {
+      "pairIndex": 4,
+      "label": "nirvana-to-billie-jean",
+      "transitions": 20,
+      "beatmatched": 20,
+      "exactGeometry": 20,
+      "exactSpeedBits": 3,
+      "exactPreset": 20
+    },
+    {
+      "pairIndex": 5,
+      "label": "billie-jean-to-nirvana",
+      "transitions": 20,
+      "beatmatched": 20,
+      "exactGeometry": 20,
+      "exactSpeedBits": 1,
+      "exactPreset": 20
+    },
+    {
+      "pairIndex": 6,
+      "label": "bohemian-to-brightside",
+      "transitions": 15,
+      "beatmatched": 15,
+      "exactGeometry": 15,
+      "exactSpeedBits": 1,
+      "exactPreset": 15
+    },
+    {
+      "pairIndex": 7,
+      "label": "brightside-to-dont-stop",
+      "transitions": 20,
+      "beatmatched": 20,
+      "exactGeometry": 20,
+      "exactSpeedBits": 2,
+      "exactPreset": 20
+    }
+  ],
+  "discrepancies": [
+    {
+      "pair": "tested-playlist",
+      "rank": 1,
+      "field": "speedB",
+      "expected": 0.9031204581260681,
+      "actual": 0.9031203985214233,
+      "absoluteDifference": 5.960464477539063e-8
+    },
+    {
+      "pair": "tested-playlist",
+      "rank": 3,
+      "field": "speedB",
+      "expected": 0.9031204581260681,
+      "actual": 0.9031203985214233,
+      "absoluteDifference": 5.960464477539063e-8
+    },
+    {
+      "pair": "tested-playlist",
+      "rank": 5,
+      "field": "speedB",
+      "expected": 0.9031204581260681,
+      "actual": 0.9031203985214233,
+      "absoluteDifference": 5.960464477539063e-8
+    },
+    {
+      "pair": "tested-playlist",
+      "rank": 7,
+      "field": "speedB",
+      "expected": 1.028037667274475,
+      "actual": 1.0280377864837646,
+      "absoluteDifference": 1.1920928955078125e-7
+    },
+    {
+      "pair": "tested-reverse",
+      "rank": 0,
+      "field": "speedB",
+      "expected": 0.9836363792419434,
+      "actual": 0.9836363196372986,
+      "absoluteDifference": 5.960464477539063e-8
+    },
+    {
+      "pair": "tested-reverse",
+      "rank": 3,
+      "field": "speedB",
+      "expected": 0.9837250709533691,
+      "actual": 0.9837250113487244,
+      "absoluteDifference": 5.960464477539063e-8
+    },
+    {
+      "pair": "tested-reverse",
+      "rank": 5,
+      "field": "speedB",
+      "expected": 0.9837250709533691,
+      "actual": 0.9837250113487244,
+      "absoluteDifference": 5.960464477539063e-8
+    },
+    {
+      "pair": "tested-reverse",
+      "rank": 6,
+      "field": "speedB",
+      "expected": 0.9856322407722473,
+      "actual": 0.9856323003768921,
+      "absoluteDifference": 5.960464477539063e-8
+    },
+    {
+      "pair": "tested-reverse",
+      "rank": 7,
+      "field": "speedB",
+      "expected": 0.9854545593261719,
+      "actual": 0.9854573011398315,
+      "absoluteDifference": 0.0000027418136596679688
+    },
+    {
+      "pair": "tested-reverse",
+      "rank": 9,
+      "field": "speedB",
+      "expected": 0.9854546785354614,
+      "actual": 0.9854573011398315,
+      "absoluteDifference": 0.0000026226043701171875
+    },
+    {
+      "pair": "tested-reverse",
+      "rank": 10,
+      "field": "speedB",
+      "expected": 0.9845898747444153,
+      "actual": 0.9845907092094421,
+      "absoluteDifference": 8.344650268554688e-7
+    },
+    {
+      "pair": "tested-reverse",
+      "rank": 11,
+      "field": "speedB",
+      "expected": 0.9845898747444153,
+      "actual": 0.9845907092094421,
+      "absoluteDifference": 8.344650268554688e-7
+    },
+    {
+      "pair": "tested-reverse",
+      "rank": 12,
+      "field": "speedB",
+      "expected": 0.9845898747444153,
+      "actual": 0.9845907092094421,
+      "absoluteDifference": 8.344650268554688e-7
+    },
+    {
+      "pair": "tested-reverse",
+      "rank": 13,
+      "field": "speedB",
+      "expected": 0.9845454692840576,
+      "actual": 0.9845463037490845,
+      "absoluteDifference": 8.344650268554688e-7
+    },
+    {
+      "pair": "tested-reverse",
+      "rank": 14,
+      "field": "speedB",
+      "expected": 0.9854544997215271,
+      "actual": 0.985455334186554,
+      "absoluteDifference": 8.344650268554688e-7
+    },
+    {
+      "pair": "nirvana-to-billie-jean",
+      "rank": 1,
+      "field": "speedB",
+      "expected": 1.002454161643982,
+      "actual": 1.0024467706680298,
+      "absoluteDifference": 0.0000073909759521484375
+    },
+    {
+      "pair": "nirvana-to-billie-jean",
+      "rank": 2,
+      "field": "speedB",
+      "expected": 1.024935245513916,
+      "actual": 1.0249390602111816,
+      "absoluteDifference": 0.000003814697265625
+    },
+    {
+      "pair": "nirvana-to-billie-jean",
+      "rank": 3,
+      "field": "speedB",
+      "expected": 1.0073562860488892,
+      "actual": 1.0073524713516235,
+      "absoluteDifference": 0.000003814697265625
+    },
+    {
+      "pair": "nirvana-to-billie-jean",
+      "rank": 4,
+      "field": "speedB",
+      "expected": 1.0036627054214478,
+      "actual": 1.0036625862121582,
+      "absoluteDifference": 1.1920928955078125e-7
+    },
+    {
+      "pair": "nirvana-to-billie-jean",
+      "rank": 6,
+      "field": "speedB",
+      "expected": 1.002454161643982,
+      "actual": 1.0024542808532715,
+      "absoluteDifference": 1.1920928955078125e-7
+    },
+    {
+      "pair": "nirvana-to-billie-jean",
+      "rank": 7,
+      "field": "speedB",
+      "expected": 1.0073561668395996,
+      "actual": 1.007348895072937,
+      "absoluteDifference": 0.000007271766662597656
+    },
+    {
+      "pair": "nirvana-to-billie-jean",
+      "rank": 8,
+      "field": "speedB",
+      "expected": 0.9903134703636169,
+      "actual": 0.9903136491775513,
+      "absoluteDifference": 1.7881393432617188e-7
+    },
+    {
+      "pair": "nirvana-to-billie-jean",
+      "rank": 9,
+      "field": "speedB",
+      "expected": 1.024935245513916,
+      "actual": 1.024938941001892,
+      "absoluteDifference": 0.0000036954879760742188
+    },
+    {
+      "pair": "nirvana-to-billie-jean",
+      "rank": 10,
+      "field": "speedB",
+      "expected": 1.003665566444397,
+      "actual": 1.0036636590957642,
+      "absoluteDifference": 0.0000019073486328125
+    },
+    {
+      "pair": "nirvana-to-billie-jean",
+      "rank": 12,
+      "field": "speedB",
+      "expected": 1.006124496459961,
+      "actual": 1.0061227083206177,
+      "absoluteDifference": 0.0000017881393432617188
+    },
+    {
+      "pair": "nirvana-to-billie-jean",
+      "rank": 13,
+      "field": "speedB",
+      "expected": 1.004894495010376,
+      "actual": 1.0048925876617432,
+      "absoluteDifference": 0.0000019073486328125
+    },
+    {
+      "pair": "nirvana-to-billie-jean",
+      "rank": 14,
+      "field": "speedB",
+      "expected": 1.0018329620361328,
+      "actual": 1.0018310546875,
+      "absoluteDifference": 0.0000019073486328125
+    },
+    {
+      "pair": "nirvana-to-billie-jean",
+      "rank": 15,
+      "field": "speedB",
+      "expected": 1.0061269998550415,
+      "actual": 1.006127953529358,
+      "absoluteDifference": 9.5367431640625e-7
+    },
+    {
+      "pair": "nirvana-to-billie-jean",
+      "rank": 16,
+      "field": "speedB",
+      "expected": 1.005820631980896,
+      "actual": 1.0058215856552124,
+      "absoluteDifference": 9.5367431640625e-7
+    },
+    {
+      "pair": "nirvana-to-billie-jean",
+      "rank": 17,
+      "field": "speedB",
+      "expected": 1.0061269998550415,
+      "actual": 1.006127953529358,
+      "absoluteDifference": 9.5367431640625e-7
+    },
+    {
+      "pair": "nirvana-to-billie-jean",
+      "rank": 18,
+      "field": "speedB",
+      "expected": 1.006127119064331,
+      "actual": 1.006127953529358,
+      "absoluteDifference": 8.344650268554688e-7
+    },
+    {
+      "pair": "nirvana-to-billie-jean",
+      "rank": 19,
+      "field": "speedB",
+      "expected": 1.0055142641067505,
+      "actual": 1.005515217781067,
+      "absoluteDifference": 9.5367431640625e-7
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 0,
+      "field": "speedB",
+      "expected": 0.9902424216270447,
+      "actual": 0.9902462363243103,
+      "absoluteDifference": 0.000003814697265625
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 1,
+      "field": "speedB",
+      "expected": 0.9951205253601074,
+      "actual": 0.9951241612434387,
+      "absoluteDifference": 0.000003635883331298828
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 2,
+      "field": "speedB",
+      "expected": 0.995120644569397,
+      "actual": 0.9951204657554626,
+      "absoluteDifference": 1.7881393432617188e-7
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 3,
+      "field": "speedB",
+      "expected": 1.004876732826233,
+      "actual": 1.0048762559890747,
+      "absoluteDifference": 4.76837158203125e-7
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 4,
+      "field": "speedB",
+      "expected": 0.9890387654304504,
+      "actual": 0.989037036895752,
+      "absoluteDifference": 0.0000017285346984863281
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 5,
+      "field": "speedB",
+      "expected": 0.9939110279083252,
+      "actual": 0.9939090609550476,
+      "absoluteDifference": 0.0000019669532775878906
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 6,
+      "field": "speedB",
+      "expected": 0.991452693939209,
+      "actual": 0.9914528131484985,
+      "absoluteDifference": 1.1920928955078125e-7
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 7,
+      "field": "speedB",
+      "expected": 0.995120644569397,
+      "actual": 0.9951241612434387,
+      "absoluteDifference": 0.000003516674041748047
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 8,
+      "field": "speedB",
+      "expected": 1.004876732826233,
+      "actual": 1.0048800706863403,
+      "absoluteDifference": 0.000003337860107421875
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 9,
+      "field": "speedB",
+      "expected": 0.9951280951499939,
+      "actual": 0.9951204657554626,
+      "absoluteDifference": 0.00000762939453125
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 10,
+      "field": "speedB",
+      "expected": 1.0097612142562866,
+      "actual": 1.0097630023956299,
+      "absoluteDifference": 0.0000017881393432617188
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 11,
+      "field": "speedB",
+      "expected": 1.0115915536880493,
+      "actual": 1.0115934610366821,
+      "absoluteDifference": 0.0000019073486328125
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 12,
+      "field": "speedB",
+      "expected": 1.0103801488876343,
+      "actual": 1.010378122329712,
+      "absoluteDifference": 0.0000020265579223632812
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 13,
+      "field": "speedB",
+      "expected": 1.0103782415390015,
+      "actual": 1.010378122329712,
+      "absoluteDifference": 1.1920928955078125e-7
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 15,
+      "field": "speedB",
+      "expected": 1.0103752613067627,
+      "actual": 1.010375738143921,
+      "absoluteDifference": 4.76837158203125e-7
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 16,
+      "field": "speedB",
+      "expected": 1.010992407798767,
+      "actual": 1.0109919309616089,
+      "absoluteDifference": 4.76837158203125e-7
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 17,
+      "field": "speedB",
+      "expected": 1.010375738143921,
+      "actual": 1.0103752613067627,
+      "absoluteDifference": 4.76837158203125e-7
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 18,
+      "field": "speedB",
+      "expected": 1.0106804370880127,
+      "actual": 1.010680913925171,
+      "absoluteDifference": 4.76837158203125e-7
+    },
+    {
+      "pair": "billie-jean-to-nirvana",
+      "rank": 19,
+      "field": "speedB",
+      "expected": 1.0106843709945679,
+      "actual": 1.010683536529541,
+      "absoluteDifference": 8.344650268554688e-7
+    },
+    {
+      "pair": "bohemian-to-brightside",
+      "rank": 0,
+      "field": "speedB",
+      "expected": 0.9189804792404175,
+      "actual": 0.918980598449707,
+      "absoluteDifference": 1.1920928955078125e-7
+    },
+    {
+      "pair": "bohemian-to-brightside",
+      "rank": 1,
+      "field": "speedB",
+      "expected": 0.9189803600311279,
+      "actual": 0.918980598449707,
+      "absoluteDifference": 2.384185791015625e-7
+    },
+    {
+      "pair": "bohemian-to-brightside",
+      "rank": 2,
+      "field": "speedB",
+      "expected": 0.9189803600311279,
+      "actual": 0.9189808964729309,
+      "absoluteDifference": 5.364418029785156e-7
+    },
+    {
+      "pair": "bohemian-to-brightside",
+      "rank": 3,
+      "field": "speedB",
+      "expected": 0.9295154213905334,
+      "actual": 0.9295156002044678,
+      "absoluteDifference": 1.7881393432617188e-7
+    },
+    {
+      "pair": "bohemian-to-brightside",
+      "rank": 4,
+      "field": "speedB",
+      "expected": 0.9189808964729309,
+      "actual": 0.9189803600311279,
+      "absoluteDifference": 5.364418029785156e-7
+    },
+    {
+      "pair": "bohemian-to-brightside",
+      "rank": 5,
+      "field": "speedB",
+      "expected": 0.9281803369522095,
+      "actual": 0.928184449672699,
+      "absoluteDifference": 0.000004112720489501953
+    },
+    {
+      "pair": "bohemian-to-brightside",
+      "rank": 6,
+      "field": "speedB",
+      "expected": 0.928180456161499,
+      "actual": 0.9281843900680542,
+      "absoluteDifference": 0.000003933906555175781
+    },
+    {
+      "pair": "bohemian-to-brightside",
+      "rank": 7,
+      "field": "speedB",
+      "expected": 0.9281803965568542,
+      "actual": 0.9281843900680542,
+      "absoluteDifference": 0.000003993511199951172
+    },
+    {
+      "pair": "bohemian-to-brightside",
+      "rank": 8,
+      "field": "speedB",
+      "expected": 0.9281801581382751,
+      "actual": 0.9281845688819885,
+      "absoluteDifference": 0.000004410743713378906
+    },
+    {
+      "pair": "bohemian-to-brightside",
+      "rank": 9,
+      "field": "speedB",
+      "expected": 0.9295154213905334,
+      "actual": 0.9295114874839783,
+      "absoluteDifference": 0.000003933906555175781
+    },
+    {
+      "pair": "bohemian-to-brightside",
+      "rank": 10,
+      "field": "speedB",
+      "expected": 0.9308463335037231,
+      "actual": 0.9308463931083679,
+      "absoluteDifference": 5.960464477539063e-8
+    },
+    {
+      "pair": "bohemian-to-brightside",
+      "rank": 11,
+      "field": "speedB",
+      "expected": 0.9321850538253784,
+      "actual": 0.9321830868721008,
+      "absoluteDifference": 0.0000019669532775878906
+    },
+    {
+      "pair": "bohemian-to-brightside",
+      "rank": 12,
+      "field": "speedB",
+      "expected": 0.9308463931083679,
+      "actual": 0.9308463335037231,
+      "absoluteDifference": 5.960464477539063e-8
+    },
+    {
+      "pair": "bohemian-to-brightside",
+      "rank": 13,
+      "field": "speedB",
+      "expected": 0.9309180974960327,
+      "actual": 0.9309181571006775,
+      "absoluteDifference": 5.960464477539063e-8
+    },
+    {
+      "pair": "brightside-to-dont-stop",
+      "rank": 0,
+      "field": "speedB",
+      "expected": 0.9525313377380371,
+      "actual": 0.9525268077850342,
+      "absoluteDifference": 0.0000045299530029296875
+    },
+    {
+      "pair": "brightside-to-dont-stop",
+      "rank": 1,
+      "field": "speedB",
+      "expected": 0.9522356390953064,
+      "actual": 0.952231228351593,
+      "absoluteDifference": 0.000004410743713378906
+    },
+    {
+      "pair": "brightside-to-dont-stop",
+      "rank": 2,
+      "field": "speedB",
+      "expected": 0.9525268077850342,
+      "actual": 0.9525312781333923,
+      "absoluteDifference": 0.000004470348358154297
+    },
+    {
+      "pair": "brightside-to-dont-stop",
+      "rank": 3,
+      "field": "speedB",
+      "expected": 0.9617788195610046,
+      "actual": 0.9617742896080017,
+      "absoluteDifference": 0.0000045299530029296875
+    },
+    {
+      "pair": "brightside-to-dont-stop",
+      "rank": 4,
+      "field": "speedB",
+      "expected": 0.952231228351593,
+      "actual": 0.9522356986999512,
+      "absoluteDifference": 0.000004470348358154297
+    },
+    {
+      "pair": "brightside-to-dont-stop",
+      "rank": 5,
+      "field": "speedB",
+      "expected": 0.9570048451423645,
+      "actual": 0.9570042490959167,
+      "absoluteDifference": 5.960464477539062e-7
+    },
+    {
+      "pair": "brightside-to-dont-stop",
+      "rank": 6,
+      "field": "speedB",
+      "expected": 0.9570048451423645,
+      "actual": 0.9570042490959167,
+      "absoluteDifference": 5.960464477539062e-7
+    },
+    {
+      "pair": "brightside-to-dont-stop",
+      "rank": 8,
+      "field": "speedB",
+      "expected": 0.9571533799171448,
+      "actual": 0.9571505784988403,
+      "absoluteDifference": 0.0000028014183044433594
+    },
+    {
+      "pair": "brightside-to-dont-stop",
+      "rank": 10,
+      "field": "speedB",
+      "expected": 0.9586185812950134,
+      "actual": 0.9586189389228821,
+      "absoluteDifference": 3.5762786865234375e-7
+    },
+    {
+      "pair": "brightside-to-dont-stop",
+      "rank": 11,
+      "field": "speedB",
+      "expected": 0.953224778175354,
+      "actual": 0.9532244801521301,
+      "absoluteDifference": 2.980232238769531e-7
+    },
+    {
+      "pair": "brightside-to-dont-stop",
+      "rank": 12,
+      "field": "speedB",
+      "expected": 0.953224778175354,
+      "actual": 0.9532244801521301,
+      "absoluteDifference": 2.980232238769531e-7
+    },
+    {
+      "pair": "brightside-to-dont-stop",
+      "rank": 13,
+      "field": "speedB",
+      "expected": 0.9586197137832642,
+      "actual": 0.9586189389228821,
+      "absoluteDifference": 7.748603820800781e-7
+    },
+    {
+      "pair": "brightside-to-dont-stop",
+      "rank": 14,
+      "field": "speedB",
+      "expected": 0.9547656774520874,
+      "actual": 0.9547657370567322,
+      "absoluteDifference": 5.960464477539063e-8
+    },
+    {
+      "pair": "brightside-to-dont-stop",
+      "rank": 15,
+      "field": "speedB",
+      "expected": 0.9548028111457825,
+      "actual": 0.954802930355072,
+      "absoluteDifference": 1.1920928955078125e-7
+    },
+    {
+      "pair": "brightside-to-dont-stop",
+      "rank": 16,
+      "field": "speedB",
+      "expected": 0.9528762698173523,
+      "actual": 0.9528762102127075,
+      "absoluteDifference": 5.960464477539063e-8
+    },
+    {
+      "pair": "brightside-to-dont-stop",
+      "rank": 17,
+      "field": "speedB",
+      "expected": 0.9548028111457825,
+      "actual": 0.954802930355072,
+      "absoluteDifference": 1.1920928955078125e-7
+    },
+    {
+      "pair": "brightside-to-dont-stop",
+      "rank": 18,
+      "field": "speedB",
+      "expected": 0.9548028111457825,
+      "actual": 0.954802930355072,
+      "absoluteDifference": 1.1920928955078125e-7
+    },
+    {
+      "pair": "brightside-to-dont-stop",
+      "rank": 19,
+      "field": "speedB",
+      "expected": 0.9548033475875854,
+      "actual": 0.954802930355072,
+      "absoluteDifference": 4.172325134277344e-7
+    }
+  ],
+  "scoreValidation": {
+    "status": "not-yet-exact",
+    "reason": "The snapshots now contain all observed score inputs, but unresolved native base/cuepoint operation details remain outside this fixture-capture task."
+  }
+}
+

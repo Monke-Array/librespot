@@ -1,0 +1,63 @@
+{
+  "format": "spotify-automix-effective-config-v1",
+  "capturedAt": "2026-08-14T19:20:23.0635781+02:00",
+  "namespace": "core-automix",
+  "spotifyDesktopVersion": "1.2.96.518",
+  "spotifyDllSha256": "e3fb0cf4b033c7fd689e5a1486c3fec298c263f73868b6085ab4671b35ad538d",
+  "confirmedActive": {
+    "maximumTransitionDurationMs": {
+      "value": 35000,
+      "evidence": "Automix/GetMaxTransitionLength live RPC"
+    },
+    "beatmatchOptOutTransitionDurationMs": {
+      "value": 5000,
+      "evidence": "Automix/GetBeatmatchOptOutTransitionDuration live RPC"
+    }
+  },
+  "compiledDefaultsActiveOverrideUnknown": {
+    "scoringWeights": {
+      "cuepoint": 1,
+      "vocal": 1,
+      "key": 1,
+      "genre": 1
+    },
+    "candidateDurationBars": [2, 4, 8, 16, 32],
+    "maximumDurationBars": 16,
+    "maximumTrackFraction": 0.2,
+    "maximumSpeedDifferenceFraction": 0.1,
+    "baseScoreRejectionThreshold": 0.4,
+    "downbeatConfidenceThreshold": 0.4,
+    "beatIntervalVarianceRejection": 0.0005,
+    "diminishingKnee": 0.15,
+    "diminishingTimeMs": 90000,
+    "cuepointStartScore": 0.8,
+    "cuepointEndScore": 0.8,
+    "cuepointMiddleScore": 1,
+    "cuepointMarginMs": 500,
+    "cuepointNonbestMultiplier": 0.95,
+    "vocalThreshold": 0.2,
+    "vocalExponent": 1,
+    "keyIdealScore": 1,
+    "keyCompatibleScore": 0.9,
+    "keyAcceptableScore": 0.8,
+    "keyPoorScore": 0.6,
+    "genreIdealScore": 1,
+    "genreAcceptableScore": 0.8,
+    "genrePoorScore": 0.6,
+    "beatmatchabilityThreshold": 0.5,
+    "candidateStepMs": 1000,
+    "candidateOffsetMs": 500,
+    "allowTwoFourTimeSignature": true,
+    "useCorrectedBounds": true,
+    "cuepointConfidenceScoring": false,
+    "octaveBpmCorrection": false,
+    "beatsHashValidation": false,
+    "curveOverrides": false,
+    "backendTransition": false
+  },
+  "unknownActiveOverrides": {
+    "status": "not exposed through the Automix Esperanto interface",
+    "attempt": "No resolved HeuristicsConfig object was observable at the process-local JS boundary; only the two duration getters are RPC-visible.",
+    "warning": "Values under compiledDefaultsActiveOverrideUnknown must not be labeled session-effective until a native config-provider boundary is intercepted."
+  }
+}

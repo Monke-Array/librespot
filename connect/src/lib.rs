@@ -14,6 +14,8 @@ mod mix_debug;
 mod model;
 mod shuffle_vec;
 mod spirc;
+#[doc(hidden)]
+pub mod spotify_auto_mix;
 mod spotify_mix;
 mod spotify_mix_hydration;
 mod state;

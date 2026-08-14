@@ -1,0 +1,29 @@
+{
+  "format": "spotify-automix-preset-rank-validation-v1",
+  "sourceFixture": "tools/spotify-automix-oracle/get_computed_transitions_2026-08-14.json",
+  "spotifyDesktopVersion": "1.2.96.518",
+  "spotifyDllSha256": "e3fb0cf4b033c7fd689e5a1486c3fec298c263f73868b6085ab4671b35ad538d",
+  "beatmatchedCandidates": 105,
+  "topPresetPredictionsMatched": 105,
+  "hashInput": [
+    "trackAPlayableUri UTF-8 bytes",
+    "trackBPlayableUri UTF-8 bytes",
+    "durationBars int32 little-endian",
+    "trunc(startASeconds * 1000) int32 little-endian",
+    "trunc(startBSeconds * 1000) int32 little-endian"
+  ],
+  "hash": "SHA-1",
+  "selector": "little-endian uint64 from digest bytes 0..7 modulo pool length",
+  "shortPoolForBarsBelow4": [1, 10, 19],
+  "longPoolForBarsAtLeast4": [1, 2, 3, 4, 5, 17, 18, 8, 9, 10, 19],
+  "selectedScore": 1.0,
+  "alternativeScore": 0.5,
+  "alternativeOrder": "preset IDs 0 through 22 ascending, excluding selected ID",
+  "nonBeatmatchedSelectedPreset": 1,
+  "repeatabilityCheck": {
+    "pair": "spotify:track:2BMRUAA1oTc7e9JPlr6xbZ -> spotify:track:5g9lS8deSIxItFBmZRC4vN",
+    "copiesInOneRpc": 4,
+    "additionalRpcCopies": 1,
+    "identicalNativeOutputs": true
+  }
+}

@@ -1,0 +1,86 @@
+{
+  "format": "spotify-automix-style-oracle-v1",
+  "capturedAt": "2026-08-14",
+  "source": {
+    "clientVersion": "1.2.96.518",
+    "service": "spotify.automix.esperanto.proto.Automix",
+    "calls": [
+      "GetStylesForPresetId",
+      "GetVolumeStylesForVolumeStyleId",
+      "GetEqStylesForEqStyleId"
+    ]
+  },
+  "preset": {
+    "presetId": 2,
+    "volumeStyleId": 7,
+    "eqStyleId": 1,
+    "filterFxStyleId": 0,
+    "fxStyleId": 0,
+    "jogwheelStyleId": 0,
+    "loopingStyleId": 0
+  },
+  "volumeStyle": {
+    "id": 7,
+    "fadeOutCurves": [
+      {
+        "start": 0,
+        "end": 0.998046875,
+        "points": [{"x": 0, "y": 1}, {"x": 1, "y": 1}]
+      },
+      {
+        "start": 0.998046875,
+        "end": 1,
+        "points": [
+          {"x": 0, "y": 1},
+          {"x": 0.5, "y": 1},
+          {"x": 0.5, "y": 0},
+          {"x": 1, "y": 0}
+        ]
+      }
+    ],
+    "fadeInCurves": [
+      {
+        "start": 0,
+        "end": 0.001953125,
+        "points": [
+          {"x": 0, "y": 0},
+          {"x": 0.5, "y": 0},
+          {"x": 0.5, "y": 1},
+          {"x": 1, "y": 1}
+        ]
+      },
+      {
+        "start": 0.001953125,
+        "end": 1,
+        "points": [{"x": 0, "y": 1}, {"x": 1, "y": 1}]
+      }
+    ]
+  },
+  "eqStyle": {
+    "id": 1,
+    "lowEqOutCurves": [
+      {"start": 0, "end": 0.46875, "points": [{"x": 0, "y": 0.5}, {"x": 1, "y": 0.5}]},
+      {"start": 0.46875, "end": 0.5, "points": [{"x": 0, "y": 0.5}, {"x": 0.5, "y": 0.5}, {"x": 0.5, "y": 0}, {"x": 1, "y": 0}]},
+      {"start": 0.5, "end": 1, "points": [{"x": 0, "y": 0}, {"x": 1, "y": 0}]}
+    ],
+    "midEqOutCurves": [
+      {"start": 0, "end": 1, "points": [{"x": 0, "y": 0.5}, {"x": 0.5, "y": 0.5}, {"x": 0.5, "y": 0.19999999999999996}, {"x": 1, "y": 0.19999999999999996}]}
+    ],
+    "highEqOutCurves": [
+      {"start": 0, "end": 0.5, "points": [{"x": 0, "y": 0.5}, {"x": 0.5, "y": 0.5}, {"x": 0.5, "y": 0.19999999999999996}, {"x": 1, "y": 0.19999999999999996}]},
+      {"start": 0.5, "end": 1, "points": [{"x": 0, "y": 0.19999999999999996}, {"x": 1, "y": 0.19999999999999996}]}
+    ],
+    "lowEqInCurves": [
+      {"start": 0, "end": 0.46875, "points": [{"x": 0, "y": 0}, {"x": 1, "y": 0}]},
+      {"start": 0.46875, "end": 0.5, "points": [{"x": 0, "y": 0}, {"x": 0.5, "y": 0}, {"x": 0.5, "y": 0.5}, {"x": 1, "y": 0.5}]},
+      {"start": 0.5, "end": 1, "points": [{"x": 0, "y": 0.5}, {"x": 1, "y": 0.5}]}
+    ],
+    "midEqInCurves": [
+      {"start": 0, "end": 1, "points": [{"x": 0, "y": 0.19999999999999996}, {"x": 0.5, "y": 0.19999999999999996}, {"x": 0.5, "y": 0.5}, {"x": 1, "y": 0.5}]}
+    ],
+    "highEqInCurves": [
+      {"start": 0, "end": 0.5, "points": [{"x": 0, "y": 0.19999999999999996}, {"x": 0.5, "y": 0.19999999999999996}, {"x": 0.5, "y": 0.5}, {"x": 1, "y": 0.5}]},
+      {"start": 0.5, "end": 1, "points": [{"x": 0, "y": 0.5}, {"x": 1, "y": 0.5}]}
+    ]
+  }
+}

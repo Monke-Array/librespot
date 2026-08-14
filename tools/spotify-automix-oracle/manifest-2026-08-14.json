@@ -1,0 +1,128 @@
+{
+  "format": "spotify-automix-input-manifest-v1",
+  "capturedOn": "2026-08-14",
+  "spotifyDesktopVersion": "1.2.96.518",
+  "spotifyDllSha256": "e3fb0cf4b033c7fd689e5a1486c3fec298c263f73868b6085ab4671b35ad538d",
+  "outputOracle": "get_computed_transitions_2026-08-14.json",
+  "configFixture": "config/automix-config-2026-08-14.json",
+  "itemSpeedFixture": "item-speed-experiment-2026-08-14.json",
+  "inputValidationFixture": "input-validation-2026-08-14.json",
+  "pairs": [
+    {
+      "label": "tested-playlist",
+      "trackAUri": "spotify:track:2BMRUAA1oTc7e9JPlr6xbZ",
+      "trackBUri": "spotify:track:5g9lS8deSIxItFBmZRC4vN",
+      "itemSpeedA": 1,
+      "itemSpeedB": 1
+    },
+    {
+      "label": "tested-reverse",
+      "trackAUri": "spotify:track:5g9lS8deSIxItFBmZRC4vN",
+      "trackBUri": "spotify:track:2BMRUAA1oTc7e9JPlr6xbZ",
+      "itemSpeedA": 1,
+      "itemSpeedB": 1
+    },
+    {
+      "label": "blinding-to-never",
+      "trackAUri": "spotify:track:0VjIjW4GlUZAMYd2vXMi3b",
+      "trackBUri": "spotify:track:4PTG3Z6ehGkBFwjybzWkR8",
+      "itemSpeedA": 1,
+      "itemSpeedB": 1
+    },
+    {
+      "label": "never-to-blinding",
+      "trackAUri": "spotify:track:4PTG3Z6ehGkBFwjybzWkR8",
+      "trackBUri": "spotify:track:0VjIjW4GlUZAMYd2vXMi3b",
+      "itemSpeedA": 1,
+      "itemSpeedB": 1
+    },
+    {
+      "label": "nirvana-to-billie-jean",
+      "trackAUri": "spotify:track:5ghIJDpPoe3CfHMGu71E6T",
+      "trackBUri": "spotify:track:5ChkMS8OtdzJeqyybCc9R5",
+      "itemSpeedA": 1,
+      "itemSpeedB": 1
+    },
+    {
+      "label": "billie-jean-to-nirvana",
+      "trackAUri": "spotify:track:5ChkMS8OtdzJeqyybCc9R5",
+      "trackBUri": "spotify:track:5ghIJDpPoe3CfHMGu71E6T",
+      "itemSpeedA": 1,
+      "itemSpeedB": 1
+    },
+    {
+      "label": "bohemian-to-brightside",
+      "trackAUri": "spotify:track:7tFiyTwD0nx5a1eklYtX2J",
+      "trackBUri": "spotify:track:003vvx7Niy0yvhvHt4a68B",
+      "itemSpeedA": 1,
+      "itemSpeedB": 1
+    },
+    {
+      "label": "brightside-to-dont-stop",
+      "trackAUri": "spotify:track:003vvx7Niy0yvhvHt4a68B",
+      "trackBUri": "spotify:track:5T8EDUDqKcs6OSOwEsfqG7",
+      "itemSpeedA": 1,
+      "itemSpeedB": 1
+    }
+  ],
+  "tracks": [
+    {
+      "canonicalTrackUri": "spotify:track:2BMRUAA1oTc7e9JPlr6xbZ",
+      "playableTrackUri": "spotify:track:2BMRUAA1oTc7e9JPlr6xbZ",
+      "file": "tracks/2BMRUAA1oTc7e9JPlr6xbZ.json"
+    },
+    {
+      "canonicalTrackUri": "spotify:track:5g9lS8deSIxItFBmZRC4vN",
+      "playableTrackUri": "spotify:track:5g9lS8deSIxItFBmZRC4vN",
+      "file": "tracks/5g9lS8deSIxItFBmZRC4vN.json"
+    },
+    {
+      "canonicalTrackUri": "spotify:track:0VjIjW4GlUZAMYd2vXMi3b",
+      "playableTrackUri": "spotify:track:0VjIjW4GlUZAMYd2vXMi3b",
+      "file": "tracks/0VjIjW4GlUZAMYd2vXMi3b.json"
+    },
+    {
+      "canonicalTrackUri": "spotify:track:4PTG3Z6ehGkBFwjybzWkR8",
+      "playableTrackUri": "spotify:track:4PTG3Z6ehGkBFwjybzWkR8",
+      "file": "tracks/4PTG3Z6ehGkBFwjybzWkR8.json"
+    },
+    {
+      "canonicalTrackUri": "spotify:track:5ghIJDpPoe3CfHMGu71E6T",
+      "playableTrackUri": "spotify:track:4CeeEOM32jQcH3eN9Q2dGj",
+      "file": "tracks/5ghIJDpPoe3CfHMGu71E6T.json"
+    },
+    {
+      "canonicalTrackUri": "spotify:track:5ChkMS8OtdzJeqyybCc9R5",
+      "playableTrackUri": "spotify:track:5ChkMS8OtdzJeqyybCc9R5",
+      "file": "tracks/5ChkMS8OtdzJeqyybCc9R5.json"
+    },
+    {
+      "canonicalTrackUri": "spotify:track:7tFiyTwD0nx5a1eklYtX2J",
+      "playableTrackUri": "spotify:track:2JiDi0qAXsPwhPqA2qaKGt",
+      "file": "tracks/7tFiyTwD0nx5a1eklYtX2J.json"
+    },
+    {
+      "canonicalTrackUri": "spotify:track:003vvx7Niy0yvhvHt4a68B",
+      "playableTrackUri": "spotify:track:003vvx7Niy0yvhvHt4a68B",
+      "file": "tracks/003vvx7Niy0yvhvHt4a68B.json"
+    },
+    {
+      "canonicalTrackUri": "spotify:track:5T8EDUDqKcs6OSOwEsfqG7",
+      "playableTrackUri": "spotify:track:1NHWG8zxSEypSRF3UufrnO",
+      "file": "tracks/5T8EDUDqKcs6OSOwEsfqG7.json"
+    }
+  ],
+  "sourceRouting": {
+    "canonicalTrackUri": [
+      "TRACK_DESCRIPTOR",
+      "CUEPOINTS",
+      "MIXABILITY"
+    ],
+    "playableTrackUri": [
+      "BEATS",
+      "VOCAL_ACTIVITY",
+      "AUDIO_ATTRIBUTES_V2",
+      "audio-analysis"
+    ]
+  }
+}
