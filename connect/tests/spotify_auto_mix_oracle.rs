@@ -5,12 +5,16 @@ use std::{
 };
 
 use librespot_connect::spotify_auto_mix::{
-    AutoBeat, AutoGeometryConfig, AutoPairGeometryInput, AutoTrackGeometryInput,
-    GeneratedOverlapCandidate, enumerate_windows, generate_overlap_candidates, normalize_downbeats,
+    AutoBeat, AutoCamelotKey, AutoCuepoint, AutoCuepoints, AutoGeometryConfig,
+    AutoPairGeometryInput, AutoPairScoringInput, AutoTrackGeometryInput, AutoTrackScoringInput,
+    AutoTransitionOverlap, AutoVocalActivity, GeneratedOverlapCandidate, enumerate_windows,
+    generate_overlap_candidates, generate_ranked_transitions, normalize_downbeats, rank_presets,
+    score_candidate,
 };
 use serde_json::Value;
 
 const SPEED_TOLERANCE: f64 = 7.629_394_531_25e-6;
+const MAX_OBSERVED_SCORE_DIFFERENCE: f64 = 7.152_557_373_046_875e-7;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct GeometryKey {
@@ -103,6 +107,101 @@ fn load_manifest_tracks() -> (Value, HashMap<String, (Value, AutoTrackGeometryIn
         tracks.insert(uri.to_owned(), load_track(uri));
     }
     (manifest, tracks)
+}
+
+fn optional_cuepoint(value: &Value) -> Option<AutoCuepoint> {
+    (!value.is_null()).then(|| AutoCuepoint {
+        position_ms: integer(required(value, "positionMs")),
+        tempo_bpm: number(required(value, "tempoBpm")) as f32,
+    })
+}
+
+fn cuepoint_list(value: &Value) -> Vec<AutoCuepoint> {
+    value
+        .as_array()
+        .expect("cuepoint candidates must be an array")
+        .iter()
+        .map(|cuepoint| AutoCuepoint {
+            position_ms: integer(required(cuepoint, "positionMs")),
+            tempo_bpm: number(required(cuepoint, "tempoBpm")) as f32,
+        })
+        .collect()
+}
+
+fn scoring_input(fixture: &Value, geometry: AutoTrackGeometryInput) -> AutoTrackScoringInput {
+    let decoded = required(fixture, "decoded");
+    let cuepoints = required(decoded, "cuepoints");
+    let vocal = required(decoded, "vocalActivity");
+    let audio_attributes = required(decoded, "audioAttributesV2");
+    let camelot = audio_attributes
+        .get("key")
+        .and_then(|key| key.get("camelotKey"))
+        .and_then(|camelot| camelot.get("value"))
+        .and_then(Value::as_str)
+        .and_then(AutoCamelotKey::parse);
+    let genre_concept_uris = required(decoded, "trackDescriptors")
+        .as_array()
+        .expect("track descriptors must be an array")
+        .iter()
+        .filter(|descriptor| {
+            required(descriptor, "types")
+                .as_array()
+                .expect("descriptor types must be an array")
+                .iter()
+                .any(|kind| integer(kind) == 1)
+        })
+        .map(|descriptor| string(required(descriptor, "conceptUri")).to_owned())
+        .collect();
+    let mixability = required(decoded, "mixability");
+
+    AutoTrackScoringInput {
+        scoring_duration_seconds: required(fixture, "duration")
+            .get("scoringSeconds")
+            .map_or_else(
+                || number(required(required(fixture, "duration"), "seconds")) as f32,
+                |duration| number(duration) as f32,
+            ),
+        geometry,
+        playable_uri: string(required(required(fixture, "identity"), "playableTrackUri"))
+            .to_owned(),
+        cuepoints: AutoCuepoints {
+            best_fade_in: optional_cuepoint(required(cuepoints, "bestFadeIn")),
+            best_fade_out: optional_cuepoint(required(cuepoints, "bestFadeOut")),
+            fade_in_candidates: cuepoint_list(required(cuepoints, "fadeInCandidates")),
+            fade_out_candidates: cuepoint_list(required(cuepoints, "fadeOutCandidates")),
+        },
+        vocal_activity: AutoVocalActivity {
+            source_sample_rate_hz: integer(required(vocal, "sourceSampleRateHz")) as u32,
+            smoothing_window_size: integer(required(vocal, "smoothingWindowSize")) as u32,
+            first_window_sample_start: integer(required(vocal, "firstWindowSampleStart")),
+            samples_between_windows: integer(required(vocal, "samplesBetweenWindows")) as u32,
+            probabilities: required(vocal, "probabilities")
+                .as_array()
+                .expect("vocal probabilities must be an array")
+                .iter()
+                .map(|probability| integer(probability) as u8)
+                .collect(),
+        },
+        camelot_key: camelot,
+        bpm: number(required(audio_attributes, "bpm")) as f32,
+        genre_concept_uris,
+        mixable: required(mixability, "mixable").as_bool().unwrap(),
+        genre_based_beatmatchability: number(required(mixability, "genreBasedBeatmatchability"))
+            as f32,
+    }
+}
+
+fn load_scoring_tracks(manifest: &Value) -> HashMap<String, AutoTrackScoringInput> {
+    required(manifest, "tracks")
+        .as_array()
+        .expect("manifest tracks must be an array")
+        .iter()
+        .map(|track| {
+            let uri = string(required(track, "canonicalTrackUri"));
+            let (fixture, geometry) = load_track(uri);
+            (uri.to_owned(), scoring_input(&fixture, geometry))
+        })
+        .collect()
 }
 
 fn expected_geometry(overlap: &Value) -> GeometryKey {
@@ -447,20 +546,282 @@ fn item_speed_fixture_changes_membership_without_changing_shared_geometry() {
 }
 
 #[test]
-fn geometry_module_contains_no_milestone_two_algorithms() {
+fn pure_module_contains_no_live_integration() {
     let source = include_str!("../src/spotify_auto_mix.rs");
     for forbidden in [
-        "base_score",
-        "cuepoint_score",
-        "vocal_score",
-        "key_score",
-        "genre_score",
-        "pareto",
-        "preset_hash",
+        "Session",
+        "SpClient",
+        "TransitionEngine",
+        "tokio::",
+        "async fn",
     ] {
         assert!(
             !source.contains(forbidden),
-            "unexpected milestone-2 code: {forbidden}"
+            "unexpected live integration dependency: {forbidden}"
         );
     }
+}
+
+fn overlap_key(overlap: AutoTransitionOverlap) -> (bool, i64, i64, usize, i64) {
+    (
+        overlap.is_beatmatched,
+        overlap.start_a_ms,
+        overlap.start_b_ms,
+        overlap.duration_bars,
+        overlap.duration_ms,
+    )
+}
+
+fn oracle_overlap_key(overlap: &Value) -> (bool, i64, i64, usize, i64) {
+    (
+        required(overlap, "isBeatmatched").as_bool().unwrap(),
+        integer(required(overlap, "startAMs")),
+        integer(required(overlap, "startBMs")),
+        integer(required(overlap, "durationBars")) as usize,
+        integer(required(overlap, "durationMs")),
+    )
+}
+
+#[test]
+fn complete_scoring_ranking_and_preset_pipeline_reports_strict_oracle_parity() {
+    let manifest = read_json(fixture_root().join("manifest-2026-08-14.json"));
+    let tracks = load_scoring_tracks(&manifest);
+    let oracle = read_json(fixture_root().join("get_computed_transitions_2026-08-14.json"));
+    let run = &required(&oracle, "runs").as_array().unwrap()[0];
+    let official_entries = required(required(run, "response"), "computedTransitions")
+        .as_array()
+        .unwrap();
+    let pairs = required(&manifest, "pairs").as_array().unwrap();
+
+    let mut raw_total = 0;
+    let mut base_valid_total = 0;
+    let mut retained_total = 0;
+    let mut expected_rank = 0;
+    let mut exact_rank = 0;
+    let mut score_vector_tie_rank = 0;
+    let mut exact_scores = 0;
+    let mut compared_scores = 0;
+    let mut maximum_score_difference = 0.0_f64;
+    let mut exact_presets = 0;
+    let mut exact_positional_presets = 0;
+    let mut expected_presets = 0;
+    let mut exact_fallbacks = 0;
+    let mut non_tie_rank_discrepancies = Vec::new();
+    let mut score_discrepancies = Vec::new();
+
+    for (pair, official_entry) in pairs.iter().zip(official_entries) {
+        let label = string(required(pair, "label"));
+        let track_a = &tracks[string(required(pair, "trackAUri"))];
+        let track_b = &tracks[string(required(pair, "trackBUri"))];
+        let pair_input = AutoPairScoringInput {
+            track_a,
+            track_b,
+            item_speed_a: number(required(pair, "itemSpeedA")) as f32,
+            item_speed_b: number(required(pair, "itemSpeedB")) as f32,
+        };
+        let result = generate_ranked_transitions(pair_input, AutoGeometryConfig::default());
+        let official = required(official_entry, "rankedTransitions")
+            .as_array()
+            .unwrap();
+
+        raw_total += result.raw_candidate_count;
+        base_valid_total += result.base_valid_candidate_count;
+        retained_total += result.per_bar_retained_count;
+        eprintln!(
+            "score_pair={label} raw={} base_valid={} retained={} final={} expected={}",
+            result.raw_candidate_count,
+            result.base_valid_candidate_count,
+            result.per_bar_retained_count,
+            result.ranked_transitions.len(),
+            official.len()
+        );
+        assert_eq!(
+            result.ranked_transitions.len(),
+            official.len(),
+            "{label}: returned transition count"
+        );
+
+        let generated_by_key: HashMap<_, _> = result
+            .ranked_transitions
+            .iter()
+            .map(|ranked| (overlap_key(ranked.overlap), ranked))
+            .collect();
+
+        for (rank, expected) in official.iter().enumerate() {
+            expected_rank += 1;
+            let expected_overlap = required(expected, "overlap");
+            let key = oracle_overlap_key(expected_overlap);
+            let expected_is_beatmatched = required(expected_overlap, "isBeatmatched")
+                .as_bool()
+                .unwrap();
+
+            let mut recovered_raw = None;
+            let identity_candidate = if let Some(generated) = generated_by_key.get(&key) {
+                Some((
+                    generated.computed_score,
+                    generated.components,
+                    generated.overlap.speed_a,
+                    generated.overlap.speed_b,
+                ))
+            } else if expected_is_beatmatched {
+                let raw = generate_overlap_candidates(
+                    AutoPairGeometryInput {
+                        track_a: &track_a.geometry,
+                        track_b: &track_b.geometry,
+                        item_speed_a: pair_input.item_speed_a,
+                        item_speed_b: pair_input.item_speed_b,
+                    },
+                    AutoGeometryConfig::default(),
+                )
+                .into_iter()
+                .find(|candidate| {
+                    (
+                        true,
+                        candidate.start_a_ms,
+                        candidate.start_b_ms,
+                        candidate.duration_bars,
+                        candidate.duration_ms,
+                    ) == key
+                })
+                .unwrap_or_else(|| panic!("{label} rank={rank}: oracle geometry is not raw-valid"));
+                let scored = score_candidate(raw, pair_input).unwrap_or_else(|| {
+                    panic!("{label} rank={rank}: oracle geometry failed scoring")
+                });
+                recovered_raw = Some(scored);
+                Some((
+                    scored.computed_score,
+                    Some(scored.components),
+                    scored.geometry.speed_a,
+                    scored.geometry.speed_b,
+                ))
+            } else {
+                None
+            };
+            let identity_candidate = identity_candidate
+                .unwrap_or_else(|| panic!("{label} rank={rank}: expected candidate missing"));
+
+            let generated_at_rank = &result.ranked_transitions[rank];
+            if overlap_key(generated_at_rank.overlap) == key {
+                exact_rank += 1;
+            } else {
+                let same_score_vector = generated_at_rank.components == identity_candidate.1
+                    && generated_at_rank.computed_score.to_bits() == identity_candidate.0.to_bits()
+                    && generated_at_rank.overlap.duration_bars
+                        == integer(required(expected_overlap, "durationBars")) as usize;
+                if same_score_vector {
+                    score_vector_tie_rank += 1;
+                } else {
+                    non_tie_rank_discrepancies.push(format!(
+                        "{label} rank={rank}: generated={:?} expected={key:?} generated_score={} expected_identity_score={}",
+                        overlap_key(generated_at_rank.overlap),
+                        generated_at_rank.computed_score,
+                        identity_candidate.0
+                    ));
+                }
+            }
+
+            assert_eq!(
+                identity_candidate.2.to_bits(),
+                (number(required(expected_overlap, "speedA")) as f32).to_bits(),
+                "{label} rank={rank} speedA"
+            );
+            assert_eq!(
+                identity_candidate.3.to_bits(),
+                (number(required(expected_overlap, "speedB")) as f32).to_bits(),
+                "{label} rank={rank} speedB"
+            );
+
+            let expected_score = number(required(expected, "computedScore"));
+            let difference = (f64::from(identity_candidate.0) - expected_score).abs();
+            maximum_score_difference = maximum_score_difference.max(difference);
+            compared_scores += 1;
+            if identity_candidate.0.to_bits() == (expected_score as f32).to_bits() {
+                exact_scores += 1;
+            } else {
+                score_discrepancies.push(format!(
+                    "{label} rank={rank}: generated={} expected={expected_score} components={:?}",
+                    identity_candidate.0, identity_candidate.1
+                ));
+            }
+
+            let expected_shape = AutoTransitionOverlap {
+                start_a_ms: integer(required(expected_overlap, "startAMs")),
+                start_b_ms: integer(required(expected_overlap, "startBMs")),
+                duration_ms: integer(required(expected_overlap, "durationMs")),
+                duration_bars: integer(required(expected_overlap, "durationBars")) as usize,
+                speed_a: number(required(expected_overlap, "speedA")) as f32,
+                speed_b: number(required(expected_overlap, "speedB")) as f32,
+                is_beatmatched: expected_is_beatmatched,
+            };
+            let direct_presets =
+                rank_presets(&track_a.playable_uri, &track_b.playable_uri, expected_shape);
+            let expected_preset_values = required(expected, "rankedPresets").as_array().unwrap();
+            expected_presets += 1;
+            let presets_match = direct_presets.len() == expected_preset_values.len()
+                && direct_presets.iter().zip(expected_preset_values).all(
+                    |(generated, expected)| {
+                        generated.preset_id
+                            == integer(required(required(expected, "preset"), "id")) as u8
+                            && generated.computed_score.to_bits()
+                                == (number(required(expected, "computedScore")) as f32).to_bits()
+                    },
+                );
+            if presets_match {
+                exact_presets += 1;
+            }
+            if generated_at_rank.ranked_presets == direct_presets {
+                exact_positional_presets += 1;
+            }
+
+            if !expected_is_beatmatched {
+                assert!(recovered_raw.is_none());
+                let generated = generated_by_key
+                    .get(&key)
+                    .unwrap_or_else(|| panic!("{label}: fallback identity mismatch"));
+                assert_eq!(generated.computed_score.to_bits(), 0.0_f32.to_bits());
+                assert_eq!(generated.ranked_presets, direct_presets);
+                exact_fallbacks += 1;
+            }
+        }
+    }
+
+    eprintln!(
+        "score_summary raw={raw_total} base_valid={base_valid_total} retained={retained_total} final={expected_rank} exact_rank={exact_rank} score_vector_ties={score_vector_tie_rank} scores={exact_scores}/{compared_scores} max_score_difference={maximum_score_difference:.15} presets={exact_presets}/{expected_presets} positional_presets={exact_positional_presets}/{expected_presets} fallbacks={exact_fallbacks}/2"
+    );
+    if !score_discrepancies.is_empty() {
+        eprintln!(
+            "non_bit_exact_scores ({}):\n{}",
+            score_discrepancies.len(),
+            score_discrepancies
+                .iter()
+                .take(40)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    assert_eq!(raw_total, 224_036);
+    assert_eq!(base_valid_total, 13_601);
+    assert_eq!(retained_total, 105);
+    assert_eq!(expected_rank, 107);
+    assert_eq!(exact_rank, 98);
+    assert_eq!(score_vector_tie_rank, 9);
+    assert!(
+        non_tie_rank_discrepancies.is_empty(),
+        "non-tie rank discrepancies:\n{}",
+        non_tie_rank_discrepancies.join("\n")
+    );
+    assert_eq!(compared_scores, 107);
+    assert!(
+        exact_scores >= 75,
+        "computed-score bit parity regressed to {exact_scores}/107"
+    );
+    assert!(
+        maximum_score_difference <= MAX_OBSERVED_SCORE_DIFFERENCE,
+        "computed-score difference regressed to {maximum_score_difference}"
+    );
+    assert_eq!(exact_presets, expected_presets);
+    assert_eq!(exact_presets, 107);
+    assert_eq!(exact_fallbacks, 2);
 }

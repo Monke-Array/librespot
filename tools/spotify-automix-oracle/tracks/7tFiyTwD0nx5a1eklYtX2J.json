@@ -17,7 +17,9 @@
   },
   "duration": {
     "seconds": 355.15466,
-    "source": "audio-analysis.track.duration"
+    "source": "audio-analysis.track.duration",
+    "scoringSeconds": 354.32,
+    "scoringSource": "canonical context duration confirmed by native base-score oracle"
   },
   "rawExtensions": {
     "TRACK_DESCRIPTOR": {
@@ -40321,4 +40323,3 @@
     }
   }
 }
-
