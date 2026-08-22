@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package spotify.automix.live;
+
+option optimize_for = CODE_SIZE;
+
+message ExtensionDescriptorData {
+    repeated ExtensionDescriptor descriptor = 1;
+}
+
+message ExtensionDescriptor {
+    string text = 1;
+    float weight = 2;
+    repeated uint32 types = 3;
+    string concept_uri = 4;
+    string localized_term = 5;
+}
+
+message Cuepoint {
+    int64 position_ms = 1;
+    float tempo_bpm = 2;
+    uint32 origin = 3;
+    double confidence = 4;
+}
+
+message Cuepoints {
+    Cuepoint best_fade_in_cuepoint = 1;
+    Cuepoint best_fade_out_cuepoint = 2;
+    repeated Cuepoint fade_in_cuepoints = 3;
+    repeated Cuepoint fade_out_cuepoints = 4;
+}
+
+message Beat {
+    float time = 1;
+    float duration = 2;
+    uint32 value = 3;
+    float beat_confidence = 4;
+    float downbeat_confidence = 5;
+}
+
+message Beats {
+    uint32 beats_per_bar = 1;
+    repeated Beat beats = 2;
+    string beats_hash = 3;
+}
+
+message VocalActivity {
+    float source_sample_rate_hz = 1;
+    int32 smoothing_window_size = 2;
+    int32 first_window_sample_start = 3;
+    int32 samples_between_windows = 4;
+    repeated int32 vocal_activity_probabilities = 5;
+}
+
+message Mixability {
+    bool mixable = 1;
+    double genre_based_beatmatchability = 2;
+}
+
+message AudioAttributesV2 {
+    double bpm = 1;
+    AudioKey key = 2;
+}
+
+message AudioKey {
+    string value = 1;
+    uint32 mode = 2;
+    CamelotKey camelot_key = 3;
+}
+
+message CamelotKey {
+    string value = 1;
+    string color = 2;
+}

@@ -16,6 +16,8 @@ mod shuffle_vec;
 mod spirc;
 #[doc(hidden)]
 pub mod spotify_auto_mix;
+#[allow(dead_code)]
+pub(crate) mod spotify_auto_mix_metadata;
 mod spotify_mix;
 mod spotify_mix_hydration;
 mod state;

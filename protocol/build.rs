@@ -42,6 +42,7 @@ fn compile() {
         proto_dir.join("user_attributes.proto"),
         proto_dir.join("autoplay_context_request.proto"),
         proto_dir.join("automix_transition.proto"),
+        proto_dir.join("spotify_auto_mix_metadata.proto"),
         proto_dir.join("transition_data.proto"),
         proto_dir.join("social_connect_v2.proto"),
         proto_dir.join("transfer_state.proto"),
