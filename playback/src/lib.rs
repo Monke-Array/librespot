@@ -15,8 +15,10 @@ pub mod mixer;
 pub mod player;
 mod secondary;
 mod symphonia_util;
+mod time_stretch;
 mod transition;
 
+pub use time_stretch::{SpeedAutomation, SpeedAutomationError, SpeedPoint};
 pub use transition::{GainCurve, GainCurveSegment, GainPoint, TransitionPlan, TransitionPlanError};
 
 pub const SAMPLE_RATE: u32 = 44100;

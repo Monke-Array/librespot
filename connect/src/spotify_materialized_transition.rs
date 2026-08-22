@@ -6,7 +6,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use librespot_playback::{
-    GainCurve, GainCurveSegment, GainPoint, TransitionPlan, TransitionPlanError,
+    GainCurve, GainCurveSegment, GainPoint, SpeedAutomation, SpeedPoint, TransitionPlan,
+    TransitionPlanError,
 };
 use librespot_protocol::player::ProvidedTrack;
 use serde_json::Value;
@@ -135,8 +136,8 @@ pub enum MaterializedTransitionRenderError {
     /// Both source volume envelopes are required for dual-source rendering.
     #[error("materialized transition is missing {0} volume automation")]
     MissingVolumeAutomation(&'static str),
-    /// Playback-speed automation requires time stretching, which is not implemented yet.
-    #[error("materialized transition requires speed automation")]
+    /// The supplied speed automation is invalid or outside the pitch-preserving renderer's range.
+    #[error("materialized transition has unsupported speed automation")]
     UnsupportedSpeedAutomation,
     /// Unequal source and wall-clock durations require timeline conversion or time stretching.
     #[error("materialized transition source durations do not match its wall-clock overlap")]
@@ -158,13 +159,40 @@ impl MaterializedTransitionRenderPlan {
     /// Parsed-but-unsupported DSP keeps the complete transition non-renderable until the
     /// corresponding renderer exists.
     pub fn to_transition_plan(&self) -> Result<TransitionPlan, MaterializedTransitionRenderError> {
-        if !self.incoming_speed.is_empty() {
-            return Err(MaterializedTransitionRenderError::UnsupportedSpeedAutomation);
-        }
-        if self.outgoing.duration_ms != self.overlap_ms
-            || self.incoming.duration_ms != self.overlap_ms
-        {
+        let incoming_speed = (!self.incoming_speed.is_empty())
+            .then(|| {
+                SpeedAutomation::new(
+                    self.incoming_speed
+                        .iter()
+                        .map(|point| SpeedPoint {
+                            from_position: Duration::from_millis(point.position),
+                            speed: point.speed,
+                        })
+                        .collect(),
+                )
+            })
+            .transpose()
+            .map_err(|_| MaterializedTransitionRenderError::UnsupportedSpeedAutomation)?;
+
+        if self.outgoing.duration_ms != self.overlap_ms {
             return Err(MaterializedTransitionRenderError::UnsupportedTiming);
+        }
+        match &incoming_speed {
+            None if self.incoming.duration_ms != self.overlap_ms => {
+                return Err(MaterializedTransitionRenderError::UnsupportedTiming);
+            }
+            Some(speed) => {
+                let source_duration = speed.source_duration_for_wall_time(
+                    Duration::from_millis(self.incoming.start_ms),
+                    Duration::from_millis(self.overlap_ms),
+                );
+                if source_duration.abs_diff(Duration::from_millis(self.incoming.duration_ms))
+                    > Duration::from_millis(1)
+                {
+                    return Err(MaterializedTransitionRenderError::UnsupportedTiming);
+                }
+            }
+            None => {}
         }
         if self.outgoing_eq_low_gain.is_some() || self.incoming_eq_low_gain.is_some() {
             return Err(MaterializedTransitionRenderError::UnsupportedEqAutomation);
@@ -180,14 +208,17 @@ impl MaterializedTransitionRenderPlan {
             MaterializedTransitionRenderError::MissingVolumeAutomation("incoming"),
         )?;
 
-        TransitionPlan::new(
+        let plan = TransitionPlan::new(
             Duration::from_millis(self.outgoing.start_ms),
             Duration::from_millis(self.incoming.start_ms),
             Duration::from_millis(self.overlap_ms),
             adapt_gain_curve(outgoing)?,
             adapt_gain_curve(incoming)?,
-        )
-        .map_err(Into::into)
+        )?;
+        Ok(match incoming_speed {
+            Some(speed) => plan.with_next_speed_automation(speed),
+            None => plan,
+        })
     }
 }
 
@@ -572,6 +603,24 @@ mod tests {
     const CAPTURED_SPEED_AUTOMATION: &str = r#"[
         {"from_position":0,"speed":0.90312},
         {"from_position":8763,"speed":0.90812},
+        {"from_position":9763,"speed":0.91312},
+        {"from_position":10763,"speed":0.91812},
+        {"from_position":11763,"speed":0.92312},
+        {"from_position":12763,"speed":0.92812},
+        {"from_position":13763,"speed":0.93312},
+        {"from_position":14763,"speed":0.93812},
+        {"from_position":15763,"speed":0.94312},
+        {"from_position":16763,"speed":0.94812},
+        {"from_position":17763,"speed":0.95312},
+        {"from_position":18763,"speed":0.95812},
+        {"from_position":19763,"speed":0.96312},
+        {"from_position":20763,"speed":0.96812},
+        {"from_position":21763,"speed":0.97312},
+        {"from_position":22763,"speed":0.97812},
+        {"from_position":23763,"speed":0.98312},
+        {"from_position":24763,"speed":0.98812},
+        {"from_position":25763,"speed":0.99312},
+        {"from_position":26763,"speed":0.99812},
         {"from_position":27763,"speed":1.0}
     ]"#;
     const CAPTURED_INCOMING_VOLUME_CURVE: &str = r#"[
@@ -645,7 +694,7 @@ mod tests {
         assert_eq!(plan.incoming_audio_automix_mode.as_deref(), Some("auto"));
         assert_eq!(
             plan.to_transition_plan(),
-            Err(MaterializedTransitionRenderError::UnsupportedSpeedAutomation)
+            Err(MaterializedTransitionRenderError::UnsupportedEqAutomation)
         );
         assert_eq!(
             plan.transition_uri.as_deref(),
@@ -669,6 +718,54 @@ mod tests {
         assert_eq!(transition.current_start(), Duration::from_millis(208_960));
         assert_eq!(transition.next_start(), Duration::from_millis(2_763));
         assert_eq!(transition.duration(), Duration::from_millis(6_090));
+    }
+
+    #[test]
+    fn captured_speed_is_renderable_but_known_pair_remains_blocked_by_eq() {
+        let mut plan = materialized_transition_plan_for_pair(&outgoing(), &incoming())
+            .unwrap()
+            .unwrap();
+        plan.outgoing_eq_low_gain = None;
+
+        let transition = plan.to_transition_plan().unwrap();
+        let speed = transition.next_speed_automation().unwrap();
+
+        assert_eq!(speed.points().len(), 21);
+        assert_eq!(speed.points()[0].from_position, Duration::ZERO);
+        assert_eq!(speed.points()[0].speed, 0.90312);
+        assert_eq!(
+            speed.points()[1].from_position,
+            Duration::from_millis(8_763)
+        );
+        assert_eq!(speed.points()[1].speed, 0.90812);
+        assert_eq!(
+            speed.points()[20].from_position,
+            Duration::from_millis(27_763)
+        );
+        assert_eq!(speed.points()[20].speed, 1.0);
+        assert!(
+            speed
+                .points()
+                .windows(2)
+                .all(|pair| pair[0].from_position < pair[1].from_position)
+        );
+        assert!(speed.points().iter().all(|point| {
+            speed.speed_at(point.from_position).to_bits() == point.speed.to_bits()
+        }));
+    }
+
+    #[test]
+    fn speed_outside_the_pitch_preserving_renderer_range_remains_unsupported() {
+        let mut plan = materialized_transition_plan_for_pair(&outgoing(), &incoming())
+            .unwrap()
+            .unwrap();
+        plan.incoming_speed[0].speed = 5.0;
+        plan.outgoing_eq_low_gain = None;
+
+        assert_eq!(
+            plan.to_transition_plan(),
+            Err(MaterializedTransitionRenderError::UnsupportedSpeedAutomation)
+        );
     }
 
     #[test]

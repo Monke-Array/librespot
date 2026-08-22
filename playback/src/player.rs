@@ -2073,10 +2073,25 @@ impl Future for PlayerInternal {
                             .map(|plan| {
                                 let requested_ms = u64::try_from(plan.next_start().as_millis())
                                     .unwrap_or(u64::MAX);
-                                requested_ms
-                                    .saturating_sub(u64::from(source.stream_position_ms))
-                                    .saturating_mul(u64::from(SAMPLE_RATE))
-                                    .div_ceil(1000)
+                                let source_start =
+                                    Duration::from_millis(u64::from(source.stream_position_ms));
+                                let source_trim = Duration::from_millis(
+                                    requested_ms
+                                        .saturating_sub(u64::from(source.stream_position_ms)),
+                                );
+                                let wall_trim = plan
+                                    .next_speed_automation()
+                                    .map(|speed| {
+                                        speed.wall_duration_for_source_time(
+                                            source_start,
+                                            source_trim,
+                                        )
+                                    })
+                                    .unwrap_or(source_trim);
+                                wall_trim
+                                    .as_nanos()
+                                    .saturating_mul(u128::from(SAMPLE_RATE))
+                                    .div_ceil(1_000_000_000)
                             })
                             .and_then(|frames| usize::try_from(frames).ok())
                             .unwrap_or(0);
@@ -2381,6 +2396,12 @@ impl PlayerInternal {
             return Ok(false);
         }
 
+        let speed_automation = self
+            .preload
+            .transition_plan()
+            .and_then(TransitionPlan::next_speed_automation)
+            .cloned();
+
         let generation = self.next_secondary_generation();
         let PlayerPreload::Ready {
             track_id, source, ..
@@ -2393,6 +2414,8 @@ impl PlayerInternal {
             source.stream_loader_controller.clone(),
             generation,
             track_id.to_string(),
+            speed_automation,
+            source.stream_position_ms,
         )
     }
 
@@ -3055,6 +3078,7 @@ impl PlayerInternal {
                     return;
                 }
             };
+            let source_end_position_ms = block.source_end_position_ms;
             let AudioPacket::Samples(mut next_samples) = block.packet else {
                 unreachable!("secondary aligned reads only return PCM");
             };
@@ -3082,7 +3106,11 @@ impl PlayerInternal {
                 return;
             }
             if let PlayerPreload::Ready { source, .. } = &mut self.preload {
-                source.account_transition_frames(block.position.position_ms, frames);
+                if let Some(source_end_position_ms) = source_end_position_ms {
+                    source.stream_position_ms = source_end_position_ms;
+                } else {
+                    source.account_transition_frames(block.position.position_ms, frames);
+                }
             }
             offset = end;
 
@@ -4555,6 +4583,33 @@ mod tests {
         .expect("test plan should validate")
     }
 
+    fn speed_transition_plan(
+        duration: Duration,
+        next_start: Duration,
+        speed: f64,
+    ) -> TransitionPlan {
+        let gain = |value| {
+            GainCurve::new(vec![GainCurveSegment {
+                start: 0.0,
+                end: 1.0,
+                points: vec![
+                    GainPoint { x: 0.0, y: value },
+                    GainPoint { x: 1.0, y: value },
+                ],
+            }])
+            .expect("test curve should validate")
+        };
+        TransitionPlan::new(Duration::ZERO, next_start, duration, gain(1.0), gain(1.0))
+            .expect("test plan should validate")
+            .with_next_speed_automation(
+                crate::SpeedAutomation::new(vec![crate::SpeedPoint {
+                    from_position: Duration::ZERO,
+                    speed,
+                }])
+                .expect("test speed should validate"),
+            )
+    }
+
     fn arm_test_transition(player: &mut PlayerInternal) {
         player
             .transition
@@ -5465,6 +5520,61 @@ mod tests {
         player.apply_global_output_dsp(&mut mixed, volume);
 
         assert_eq!(mixed, [0.25, 0.1875, 0.125]);
+    }
+
+    #[test]
+    fn time_stretched_transition_completes_on_wall_clock_and_promotes_at_source_time() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(0));
+
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        player.preload = PlayerPreload::Ready {
+            track_id: next_track_uri(),
+            transition_plan: Some(speed_transition_plan(
+                Duration::from_millis(100),
+                Duration::from_millis(2_763),
+                0.90312,
+            )),
+            secondary_trim_frames: 0,
+            source: Box::new(scripted_source(
+                next_track_uri(),
+                2_763,
+                Box::new(CountingPcmDecoder {
+                    calls: decode_calls.clone(),
+                    packets_remaining: None,
+                }),
+            )),
+        };
+
+        player.arm_transition_if_selected();
+        assert_eq!(player.transition.state(), TransitionState::Armed);
+        wait_until("time-stretched secondary queue did not fill", || {
+            decode_calls.load(Ordering::Acquire) >= 9
+        });
+
+        player.handle_packet(
+            Some((
+                AudioPacketPosition {
+                    position_ms: 0,
+                    skipped: false,
+                },
+                AudioPacket::Samples(vec![1.0; 4_410 * NUM_CHANNELS as usize]),
+            )),
+            1.0,
+        );
+
+        let PlayerState::Playing {
+            track_id, source, ..
+        } = &player.state
+        else {
+            panic!("time-stretched secondary should be promoted");
+        };
+        assert_eq!(track_id, &next_track_uri());
+        assert_eq!(source.stream_position_ms, 2_853);
+        assert_eq!(player.transition.state(), TransitionState::Idle);
     }
 
     #[test]

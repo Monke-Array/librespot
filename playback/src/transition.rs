@@ -2,7 +2,7 @@ use std::{cmp::Ordering, f64::consts::FRAC_PI_2, time::Duration};
 
 use thiserror::Error;
 
-use crate::decoder::AudioPacket;
+use crate::{SpeedAutomation, decoder::AudioPacket};
 
 /// Selects whether the player should prepare a transition and, if so, its shape.
 ///
@@ -225,6 +225,7 @@ pub struct TransitionPlan {
     duration: Duration,
     current_gain: GainCurve,
     next_gain: GainCurve,
+    next_speed: Option<SpeedAutomation>,
 }
 
 impl TransitionPlan {
@@ -245,7 +246,14 @@ impl TransitionPlan {
             duration,
             current_gain,
             next_gain,
+            next_speed: None,
         })
+    }
+
+    /// Attach validated source-timeline speed automation for the incoming source.
+    pub fn with_next_speed_automation(mut self, automation: SpeedAutomation) -> Self {
+        self.next_speed = Some(automation);
+        self
     }
 
     /// Position at which the outgoing source begins the transition.
@@ -261,6 +269,11 @@ impl TransitionPlan {
     /// Exact overlap duration.
     pub fn duration(&self) -> Duration {
         self.duration
+    }
+
+    /// Incoming source-timeline speed automation, when pitch-preserving stretching is required.
+    pub fn next_speed_automation(&self) -> Option<&SpeedAutomation> {
+        self.next_speed.as_ref()
     }
 
     fn spec(&self) -> TransitionSpec {

@@ -11,8 +11,9 @@ use std::{
 use librespot_audio::StreamLoaderController;
 
 use crate::{
-    NUM_CHANNELS, SAMPLE_RATE,
+    NUM_CHANNELS, SAMPLE_RATE, SpeedAutomation,
     decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, DecoderError, DecoderResult},
+    time_stretch::PitchPreservingTimeStretch,
 };
 
 /// Fixed-size chunks make the channel's PCM memory bound independent of decoder packet sizes.
@@ -67,6 +68,8 @@ impl SourceDecoder {
         stream_loader_controller: StreamLoaderController,
         generation: u64,
         track_label: String,
+        speed_automation: Option<SpeedAutomation>,
+        source_position_ms: u32,
     ) -> Result<bool, DecoderError> {
         match self {
             Self::Worker(_) => return Ok(false),
@@ -82,6 +85,8 @@ impl SourceDecoder {
             stream_loader_controller,
             generation,
             track_label,
+            speed_automation,
+            source_position_ms,
         )?);
         Ok(true)
     }
@@ -103,6 +108,8 @@ impl SourceDecoder {
             generation,
             track_label,
             cancelled,
+            None,
+            0,
         )?);
         Ok(())
     }
@@ -154,6 +161,7 @@ pub(crate) struct SecondaryPcmBlock {
     pub generation: u64,
     pub position: AudioPacketPosition,
     pub packet: AudioPacket,
+    pub source_end_position_ms: Option<u32>,
 }
 
 pub(crate) enum SecondaryRead {
@@ -181,6 +189,8 @@ pub(crate) struct SecondaryDecodeWorker {
     pcm_consumed_frames: u64,
     pcm_generation: Option<u64>,
     pending_terminal: Option<SecondaryDecodeMessage>,
+    time_stretch: Option<PitchPreservingTimeStretch>,
+    time_stretch_flushed: bool,
 }
 
 impl SecondaryDecodeWorker {
@@ -189,6 +199,8 @@ impl SecondaryDecodeWorker {
         stream_loader_controller: StreamLoaderController,
         generation: u64,
         track_label: String,
+        speed_automation: Option<SpeedAutomation>,
+        source_position_ms: u32,
     ) -> Result<Self, DecoderError> {
         let cancelled = Arc::new(AtomicBool::new(false));
         Self::spawn_with_cancellation(
@@ -197,6 +209,8 @@ impl SecondaryDecodeWorker {
             generation,
             track_label,
             cancelled,
+            speed_automation,
+            source_position_ms,
         )
     }
 
@@ -206,6 +220,8 @@ impl SecondaryDecodeWorker {
         generation: u64,
         track_label: String,
         cancelled: Arc<AtomicBool>,
+        speed_automation: Option<SpeedAutomation>,
+        source_position_ms: u32,
     ) -> Result<Self, DecoderError> {
         let (sender, receiver) = sync_channel(SECONDARY_PCM_CHANNEL_CAPACITY);
         let finished = Arc::new(AtomicBool::new(false));
@@ -239,6 +255,13 @@ impl SecondaryDecodeWorker {
             pcm_consumed_frames: 0,
             pcm_generation: None,
             pending_terminal: None,
+            time_stretch: speed_automation.and_then(|automation| {
+                PitchPreservingTimeStretch::new(
+                    automation,
+                    std::time::Duration::from_millis(u64::from(source_position_ms)),
+                )
+            }),
+            time_stretch_flushed: false,
         })
     }
 
@@ -253,6 +276,10 @@ impl SecondaryDecodeWorker {
             0,
             "secondary PCM read must be frame-aligned"
         );
+
+        if self.time_stretch.is_some() {
+            return self.try_read_stretched(samples);
+        }
 
         while self.pcm_buffer.len() < samples && self.pending_terminal.is_none() {
             let message = match self
@@ -331,10 +358,127 @@ impl SecondaryDecodeWorker {
             generation,
             position,
             packet,
+            source_end_position_ms: None,
+        }
+    }
+
+    fn try_read_stretched(&mut self, samples: usize) -> SecondaryRead {
+        loop {
+            if let Some(block) = self.take_stretched_if_available(samples) {
+                return SecondaryRead::Pcm(block);
+            }
+            if self.pending_terminal.is_some() {
+                self.flush_time_stretch();
+                if let Some(block) = self.take_stretched_if_available(samples) {
+                    return SecondaryRead::Pcm(block);
+                }
+                return self.take_pending_terminal();
+            }
+
+            let message = match self
+                .receiver
+                .as_ref()
+                .ok_or(TryRecvError::Disconnected)
+                .and_then(Receiver::try_recv)
+            {
+                Ok(message) => message,
+                Err(TryRecvError::Empty) => return SecondaryRead::Pending,
+                Err(TryRecvError::Disconnected) => return SecondaryRead::Disconnected,
+            };
+            self.push_stretched_message(message);
+        }
+    }
+
+    fn take_stretched_if_available(&mut self, samples: usize) -> Option<SecondaryPcmBlock> {
+        let stretch = self.time_stretch.as_mut()?;
+        stretch.fill_output(samples);
+        if stretch.available_samples() < samples {
+            return None;
+        }
+
+        let position_ms = duration_ms_u32(stretch.source_position());
+        let packet = AudioPacket::Samples(stretch.take(samples));
+        let source_end_position_ms = Some(duration_ms_u32(stretch.source_position()));
+        let generation = self.pcm_generation?;
+        let skipped = self
+            .pcm_origin
+            .as_ref()
+            .is_some_and(|origin| origin.skipped && self.pcm_consumed_frames == 0);
+        self.pcm_consumed_frames += (samples / NUM_CHANNELS as usize) as u64;
+        Some(SecondaryPcmBlock {
+            generation,
+            position: AudioPacketPosition {
+                position_ms,
+                skipped,
+            },
+            packet,
+            source_end_position_ms,
+        })
+    }
+
+    fn push_stretched_message(&mut self, message: SecondaryDecodeMessage) {
+        match message.event {
+            SecondaryDecodeEvent::Packet(position, AudioPacket::Samples(samples)) => {
+                if self.pcm_origin.is_none() {
+                    self.pcm_origin = Some(position);
+                    self.pcm_generation = Some(message.generation);
+                    self.pcm_consumed_frames = 0;
+                }
+                if self.pcm_generation == Some(message.generation) {
+                    self.time_stretch
+                        .as_mut()
+                        .expect("stretched message requires a processor")
+                        .push(&samples);
+                }
+            }
+            SecondaryDecodeEvent::Packet(_, AudioPacket::Raw(_)) => {
+                self.pending_terminal = Some(SecondaryDecodeMessage {
+                    generation: message.generation,
+                    event: SecondaryDecodeEvent::Failed(DecoderError::PassthroughDecoder(
+                        "time stretching received an encoded packet".into(),
+                    )),
+                });
+            }
+            event @ (SecondaryDecodeEvent::Eof | SecondaryDecodeEvent::Failed(_)) => {
+                self.pending_terminal = Some(SecondaryDecodeMessage {
+                    generation: message.generation,
+                    event,
+                });
+            }
+        }
+    }
+
+    fn flush_time_stretch(&mut self) {
+        if !self.time_stretch_flushed {
+            self.time_stretch
+                .as_mut()
+                .expect("flush requires a time stretcher")
+                .flush();
+            self.time_stretch_flushed = true;
+        }
+    }
+
+    fn take_pending_terminal(&mut self) -> SecondaryRead {
+        let message = self
+            .pending_terminal
+            .take()
+            .expect("terminal read requires a pending event");
+        match message.event {
+            SecondaryDecodeEvent::Eof => SecondaryRead::Eof {
+                generation: message.generation,
+            },
+            SecondaryDecodeEvent::Failed(error) => SecondaryRead::Failed {
+                generation: message.generation,
+                error,
+            },
+            SecondaryDecodeEvent::Packet(_, _) => unreachable!("only terminal events are stored"),
         }
     }
 
     fn recv_packet(&mut self) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>> {
+        if self.time_stretch.is_some() {
+            return self.recv_stretched_packet();
+        }
         if !self.pcm_buffer.is_empty() {
             let block = self.take_pcm(self.pcm_buffer.len());
             return Ok(Some((block.position, block.packet)));
@@ -367,6 +511,51 @@ impl SecondaryDecodeWorker {
             }
             SecondaryDecodeEvent::Eof => Ok(None),
             SecondaryDecodeEvent::Failed(error) => Err(error),
+        }
+    }
+
+    fn recv_stretched_packet(
+        &mut self,
+    ) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>> {
+        loop {
+            if let Some(block) = self.take_stretched_if_available(SECONDARY_PCM_CHUNK_SAMPLES) {
+                return Ok(Some((block.position, block.packet)));
+            }
+            if self.pending_terminal.is_some() {
+                self.flush_time_stretch();
+                let available = self
+                    .time_stretch
+                    .as_ref()
+                    .expect("stretched receive requires a processor")
+                    .available_samples();
+                if available > 0 {
+                    let channels = NUM_CHANNELS as usize;
+                    let samples = available.min(SECONDARY_PCM_CHUNK_SAMPLES) / channels * channels;
+                    if let Some(block) = self.take_stretched_if_available(samples) {
+                        return Ok(Some((block.position, block.packet)));
+                    }
+                }
+                let message = self
+                    .pending_terminal
+                    .take()
+                    .expect("terminal event remains pending after stretch flush");
+                return Self::message_into_packet(message);
+            }
+
+            let message = self
+                .receiver
+                .as_ref()
+                .ok_or_else(|| {
+                    DecoderError::Io(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "decoder worker cancelled",
+                    ))
+                })?
+                .recv()
+                .map_err(|error| {
+                    DecoderError::Io(io::Error::new(io::ErrorKind::BrokenPipe, error))
+                })?;
+            self.push_stretched_message(message);
         }
     }
 
@@ -407,6 +596,10 @@ impl SecondaryDecodeWorker {
         // promptly; dropping JoinHandle only detaches it while it exits.
         self.thread.take();
     }
+}
+
+fn duration_ms_u32(duration: std::time::Duration) -> u32 {
+    u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
 }
 
 impl Drop for SecondaryDecodeWorker {
