@@ -8,7 +8,7 @@ use librespot_protocol::{
     automix_transition::{CurveSet, Overlap, Preset, Transition},
     player::ProvidedTrack,
 };
-use protobuf::Message;
+use protobuf::{Message, MessageField};
 use thiserror::Error;
 
 pub(crate) const RECIPE_ATTRIBUTE: &str = "automix.auto_transition_recipe";
@@ -69,6 +69,58 @@ impl SpotifyTransitionRecipe {
             .map_err(|_| SpotifyTransitionError::InvalidBase64)?;
         let transition = Transition::parse_from_bytes(&bytes)
             .map_err(|_| SpotifyTransitionError::InvalidProtobuf)?;
+        let recipe = Self { transition };
+        recipe.sanity_check()?;
+        Ok(recipe)
+    }
+
+    pub(crate) fn from_local_auto(
+        outgoing: &ProvidedTrack,
+        incoming: &ProvidedTrack,
+        playable_a_uri: &str,
+        playable_b_uri: &str,
+        bpm_a: f32,
+        bpm_b: f32,
+        item_speed_a: f32,
+        item_speed_b: f32,
+        overlap: crate::spotify_auto_mix::AutoTransitionOverlap,
+        preset_id: u8,
+    ) -> Result<Self, SpotifyTransitionError> {
+        let start_a_ms = i32::try_from(overlap.start_a_ms)
+            .map_err(|_| SpotifyTransitionError::InvalidDuration)?;
+        let start_b_ms = i32::try_from(overlap.start_b_ms)
+            .map_err(|_| SpotifyTransitionError::InvalidDuration)?;
+        let duration_ms = i32::try_from(overlap.duration_ms)
+            .map_err(|_| SpotifyTransitionError::InvalidDuration)?;
+        let duration_bars = i32::try_from(overlap.duration_bars)
+            .map_err(|_| SpotifyTransitionError::InvalidDuration)?;
+        let transition = Transition {
+            overlap: MessageField::some(Overlap {
+                track_a_row_id: (!outgoing.uid.is_empty()).then(|| outgoing.uid.clone()),
+                track_b_row_id: (!incoming.uid.is_empty()).then(|| incoming.uid.clone()),
+                start_a_ms: Some(start_a_ms),
+                start_b_ms: Some(start_b_ms),
+                duration_ms: Some(duration_ms),
+                speed_a: Some(overlap.speed_a),
+                speed_b: Some(overlap.speed_b),
+                duration_bars: Some(duration_bars),
+                is_beatmatched: Some(overlap.is_beatmatched),
+                track_a_uri: Some(outgoing.uri.clone()),
+                track_b_uri: Some(incoming.uri.clone()),
+                track_a_playable_uri: Some(playable_a_uri.to_owned()),
+                track_b_playable_uri: Some(playable_b_uri.to_owned()),
+                bpm_a: Some(bpm_a),
+                bpm_b: Some(bpm_b),
+                item_speed_a: Some(f64::from(item_speed_a)),
+                item_speed_b: Some(f64::from(item_speed_b)),
+                ..Default::default()
+            }),
+            preset: MessageField::some(Preset {
+                id: Some(i32::from(preset_id)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         let recipe = Self { transition };
         recipe.sanity_check()?;
         Ok(recipe)
@@ -244,6 +296,13 @@ fn provided_item_speed(track: &ProvidedTrack) -> Option<f64> {
         .filter(|speed| speed.is_finite() && *speed > 0.0)
 }
 
+pub(crate) fn provided_item_speed_or_default(track: &ProvidedTrack) -> f32 {
+    provided_item_speed(track)
+        .map(|speed| speed as f32)
+        .filter(|speed| speed.is_finite() && *speed > 0.0)
+        .unwrap_or(1.0)
+}
+
 fn provided_metadata_keys(track: &ProvidedTrack) -> Vec<&str> {
     track
         .metadata
@@ -344,6 +403,24 @@ pub(crate) fn transition_plan_for_decoded_pair(
     incoming: &ProvidedTrack,
     recipe: &SpotifyTransitionRecipe,
 ) -> Option<TransitionPlan> {
+    transition_plan_for_decoded_pair_with_origin(outgoing, incoming, recipe, "saved", true)
+}
+
+pub(crate) fn transition_plan_for_local_auto_pair(
+    outgoing: &ProvidedTrack,
+    incoming: &ProvidedTrack,
+    recipe: &SpotifyTransitionRecipe,
+) -> Option<TransitionPlan> {
+    transition_plan_for_decoded_pair_with_origin(outgoing, incoming, recipe, "local Auto", false)
+}
+
+fn transition_plan_for_decoded_pair_with_origin(
+    outgoing: &ProvidedTrack,
+    incoming: &ProvidedTrack,
+    recipe: &SpotifyTransitionRecipe,
+    origin: &str,
+    warn_on_failure: bool,
+) -> Option<TransitionPlan> {
     let result: Result<TransitionPlan, SpotifyTransitionError> = (|| {
         recipe.validate_pair(
             &outgoing.uri,
@@ -354,7 +431,7 @@ pub(crate) fn transition_plan_for_decoded_pair(
         let overlap = recipe.overlap()?;
         let preset = recipe.preset();
         debug!(
-            "[spotify-mix] saved recipe decoded {}",
+            "[spotify-mix] {origin} recipe decoded {}",
             recipe.decoded_summary()?
         );
         debug!(
@@ -372,7 +449,7 @@ pub(crate) fn transition_plan_for_decoded_pair(
         recipe.ensure_renderable()?;
         let plan = recipe.to_plan()?;
         debug!(
-            "[spotify-mix] saved transition {} -> {}",
+            "[spotify-mix] {origin} transition {} -> {}",
             outgoing.uri, incoming.uri
         );
         debug!(
@@ -392,11 +469,19 @@ pub(crate) fn transition_plan_for_decoded_pair(
             | SpotifyTransitionError::UnsupportedEffects
             | SpotifyTransitionError::UnsupportedVolumeAutomation),
         ) => {
-            warn!("[spotify-mix] saved recipe unsupported: {error}; using fallback");
+            if warn_on_failure {
+                warn!("[spotify-mix] {origin} recipe unsupported: {error}; using fallback");
+            } else {
+                debug!("[spotify-auto] {origin} recipe unsupported: {error}; using fallback");
+            }
             None
         }
         Err(error) => {
-            warn!("[spotify-mix] invalid saved transition: {error}; using fallback");
+            if warn_on_failure {
+                warn!("[spotify-mix] invalid {origin} transition: {error}; using fallback");
+            } else {
+                debug!("[spotify-auto] invalid {origin} transition: {error}; using fallback");
+            }
             None
         }
     }
@@ -506,6 +591,69 @@ mod tests {
         assert_eq!(plan.current_start(), Duration::from_millis(175_000));
         assert_eq!(plan.next_start(), Duration::from_millis(12_000));
         assert_eq!(plan.duration(), Duration::from_millis(8_000));
+    }
+
+    #[test]
+    fn local_auto_recipe_preserves_resolved_identities_and_oracle_geometry() {
+        let mut outgoing = track(TRACK_A, None, Some("1.25"));
+        outgoing.uid = "row-a".into();
+        let mut incoming = track(TRACK_B, None, None);
+        incoming.uid = "row-b".into();
+        let playable_a = "spotify:track:2BMRUAA1oTc7e9JPlr6xbZ";
+        let playable_b = "spotify:track:5g9lS8deSIxItFBmZRC4vN";
+        let recipe = SpotifyTransitionRecipe::from_local_auto(
+            &outgoing,
+            &incoming,
+            playable_a,
+            playable_b,
+            87.102_9,
+            87.274,
+            1.25,
+            1.0,
+            crate::spotify_auto_mix::AutoTransitionOverlap {
+                start_a_ms: 208_960,
+                start_b_ms: 2_763,
+                duration_ms: 6_090,
+                duration_bars: 2,
+                speed_a: 1.0,
+                speed_b: 0.903_120_4,
+                is_beatmatched: true,
+            },
+            1,
+        )
+        .unwrap();
+        let overlap = recipe.overlap().unwrap();
+
+        assert_eq!(overlap.track_a_uri(), TRACK_A);
+        assert_eq!(overlap.track_b_uri(), TRACK_B);
+        assert_eq!(overlap.track_a_playable_uri(), playable_a);
+        assert_eq!(overlap.track_b_playable_uri(), playable_b);
+        assert_eq!(overlap.track_a_row_id(), "row-a");
+        assert_eq!(overlap.track_b_row_id(), "row-b");
+        assert_eq!(overlap.start_a_ms(), 208_960);
+        assert_eq!(overlap.start_b_ms(), 2_763);
+        assert_eq!(overlap.duration_ms(), 6_090);
+        assert_eq!(overlap.duration_bars(), 2);
+        assert_eq!(overlap.speed_b().to_bits(), 0.903_120_4_f32.to_bits());
+        assert!(overlap.is_beatmatched());
+        assert_eq!(overlap.item_speed_a(), 1.25);
+        assert_eq!(recipe.preset().unwrap().id(), 1);
+    }
+
+    #[test]
+    fn item_speed_defaults_to_one_for_missing_or_invalid_metadata() {
+        assert_eq!(
+            provided_item_speed_or_default(&track(TRACK_A, None, None)),
+            1.0
+        );
+        assert_eq!(
+            provided_item_speed_or_default(&track(TRACK_A, None, Some("not-a-speed"))),
+            1.0
+        );
+        assert_eq!(
+            provided_item_speed_or_default(&track(TRACK_A, None, Some("1.125"))),
+            1.125
+        );
     }
 
     #[test]

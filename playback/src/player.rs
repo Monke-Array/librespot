@@ -314,6 +314,8 @@ pub enum PlayerEvent {
     // The player is preloading a track.
     Preloading {
         track_id: SpotifyUri,
+        playable_uri: String,
+        canonical_duration_ms: u32,
     },
     // The player is playing a track.
     // This event is issued at the start of playback of whenever the position must be communicated
@@ -380,7 +382,9 @@ pub enum PlayerEvent {
         position_ms: u32,
     },
     TrackChanged {
+        track_id: SpotifyUri,
         audio_item: Box<AudioItem>,
+        canonical_duration_ms: u32,
     },
     SessionConnected {
         connection_id: String,
@@ -890,6 +894,7 @@ struct PlaybackSource {
     normalisation_factor: f64,
     stream_loader_controller: StreamLoaderController,
     audio_item: AudioItem,
+    canonical_duration_ms: u32,
     bytes_per_second: usize,
     duration_ms: u32,
     stream_position_ms: u32,
@@ -1325,13 +1330,20 @@ impl PlayerTrackLoader {
             }
         };
 
-        let audio_item = match AudioItem::get_file(&self.session, track_uri).await {
-            Ok(audio) => self.find_available_alternative(audio).await?,
-            Err(e) => {
-                error!("Unable to load audio item: {e:?}");
-                return Err(PlayerLoadError::from_error(&self.session, e));
-            }
-        };
+        let (audio_item, canonical_duration_ms) =
+            match AudioItem::get_file(&self.session, track_uri).await {
+                Ok(audio) => {
+                    let canonical_duration_ms = audio.duration_ms;
+                    (
+                        self.find_available_alternative(audio).await?,
+                        canonical_duration_ms,
+                    )
+                }
+                Err(e) => {
+                    error!("Unable to load audio item: {e:?}");
+                    return Err(PlayerLoadError::from_error(&self.session, e));
+                }
+            };
 
         info!(
             "Loading <{}> with Spotify URI <{}>",
@@ -1560,6 +1572,7 @@ impl PlayerTrackLoader {
                 normalisation_factor: 1.0,
                 stream_loader_controller,
                 audio_item,
+                canonical_duration_ms,
                 bytes_per_second,
                 duration_ms,
                 stream_position_ms,
@@ -1686,6 +1699,7 @@ impl PlayerTrackLoader {
                     path: path.to_path_buf(),
                 },
             },
+            canonical_duration_ms: duration.as_millis() as u32,
         })
     }
 }
@@ -2068,6 +2082,8 @@ impl Future for PlayerInternal {
                             .unwrap_or(0);
                         self.send_event(PlayerEvent::Preloading {
                             track_id: track_id.clone(),
+                            playable_uri: source.audio_item.uri.clone(),
+                            canonical_duration_ms: source.canonical_duration_ms,
                         });
                         debug!("Secondary playback source ready for <{track_id}>");
                         self.preload = PlayerPreload::Ready {
@@ -3117,6 +3133,7 @@ impl PlayerInternal {
             Instant::now().checked_sub(Duration::from_millis(u64::from(position_ms)));
         source.suggested_to_preload_next_track = false;
         let audio_item = Box::new(source.audio_item.clone());
+        let canonical_duration_ms = source.canonical_duration_ms;
         self.state = PlayerState::Playing {
             track_id: track_id.clone(),
             play_request_id,
@@ -3134,7 +3151,11 @@ impl PlayerInternal {
             old_play_request_id,
         ));
         self.send_event(PlayerEvent::PlayRequestIdChanged { play_request_id });
-        self.send_event(PlayerEvent::TrackChanged { audio_item });
+        self.send_event(PlayerEvent::TrackChanged {
+            track_id: track_id.clone(),
+            audio_item,
+            canonical_duration_ms,
+        });
         self.send_event(PlayerEvent::Playing {
             track_id: track_id.clone(),
             play_request_id,
@@ -3165,8 +3186,13 @@ impl PlayerInternal {
     ) {
         self.network_health = RecoveryHealth::Healthy;
         let audio_item = Box::new(source.audio_item.clone());
+        let canonical_duration_ms = source.canonical_duration_ms;
 
-        self.send_event(PlayerEvent::TrackChanged { audio_item });
+        self.send_event(PlayerEvent::TrackChanged {
+            track_id: track_id.clone(),
+            audio_item,
+            canonical_duration_ms,
+        });
 
         let position_ms = source.stream_position_ms;
 
@@ -4468,6 +4494,7 @@ mod tests {
                     disc_number: 1,
                 },
             },
+            canonical_duration_ms: 180_000,
             bytes_per_second: 20 * 1024,
             duration_ms: 180_000,
             stream_position_ms: position_ms,
@@ -4738,7 +4765,12 @@ mod tests {
         set_playing_source(&mut player, track_uri(), scripted_loaded_track(10_000));
 
         let next_track_id = next_track_uri();
-        let next_source = scripted_source(next_track_id.clone(), 0, Box::new(ScriptedDecoder));
+        let mut next_source = scripted_source(next_track_id.clone(), 0, Box::new(ScriptedDecoder));
+        let playable_uri = "spotify:track:2JiDi0qAXsPwhPqA2qaKGt";
+        next_source.audio_item.uri = playable_uri.to_owned();
+        next_source.audio_item.track_id =
+            SpotifyUri::from_uri(playable_uri).expect("playable test URI");
+        next_source.canonical_duration_ms = 354_320;
         let decoder_address = next_source
             .decoder
             .direct_decoder_address()
@@ -4770,10 +4802,18 @@ mod tests {
             event_rx.try_recv(),
             Ok(PlayerEvent::PlayRequestIdChanged { .. })
         ));
-        assert!(matches!(
-            event_rx.try_recv(),
-            Ok(PlayerEvent::TrackChanged { .. })
-        ));
+        match event_rx.try_recv() {
+            Ok(PlayerEvent::TrackChanged {
+                track_id,
+                audio_item,
+                canonical_duration_ms,
+            }) => {
+                assert_eq!(track_id, next_track_id);
+                assert_eq!(audio_item.uri, playable_uri);
+                assert_eq!(canonical_duration_ms, 354_320);
+            }
+            event => panic!("expected resolved TrackChanged identity, got {event:?}"),
+        }
         assert!(matches!(
             event_rx.try_recv(),
             Ok(PlayerEvent::Playing { ref track_id, .. }) if track_id == &next_track_id

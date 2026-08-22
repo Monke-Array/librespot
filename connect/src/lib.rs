@@ -18,6 +18,7 @@ mod spirc;
 pub mod spotify_auto_mix;
 #[allow(dead_code)]
 pub(crate) mod spotify_auto_mix_metadata;
+mod spotify_auto_mix_selection;
 mod spotify_mix;
 mod spotify_mix_hydration;
 mod state;
