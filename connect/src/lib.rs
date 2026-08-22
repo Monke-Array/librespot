@@ -19,6 +19,8 @@ pub mod spotify_auto_mix;
 #[allow(dead_code)]
 pub(crate) mod spotify_auto_mix_metadata;
 mod spotify_auto_mix_selection;
+#[doc(hidden)]
+pub mod spotify_materialized_transition;
 mod spotify_mix;
 mod spotify_mix_hydration;
 mod state;
