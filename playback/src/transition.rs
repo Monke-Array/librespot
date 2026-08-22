@@ -66,6 +66,9 @@ pub enum TransitionPlanError {
     /// Segments must not overlap after sorting by start position.
     #[error("gain curve segments overlap")]
     OverlappingSegments,
+    /// Evaluation requires a finite transition progress.
+    #[error("gain curve progress must be finite")]
+    InvalidProgress,
 }
 
 impl GainCurve {
@@ -113,30 +116,33 @@ impl GainCurve {
         Ok(Self { segments })
     }
 
-    /// Return the normalized linear gain at a transition progress in 0..=1.
-    pub fn gain_at(&self, progress: f64) -> f64 {
+    /// Return the normalized linear gain at a transition progress, clamped to 0..=1.
+    pub fn gain_at(&self, progress: f64) -> Result<f64, TransitionPlanError> {
+        if !progress.is_finite() {
+            return Err(TransitionPlanError::InvalidProgress);
+        }
         let progress = progress.clamp(0.0, 1.0);
         let first = self
             .segments
             .first()
             .expect("validated gain curve is non-empty");
         if progress <= first.start {
-            return Self::segment_gain(first, 0.0);
+            return Ok(Self::segment_gain(first, 0.0));
         }
 
         let mut previous = first;
-        for segment in &self.segments {
+        for (index, segment) in self.segments.iter().enumerate() {
             if progress < segment.start {
-                return Self::segment_gain(previous, 1.0);
+                return Ok(Self::segment_gain(previous, 1.0));
             }
-            if progress <= segment.end {
+            if progress < segment.end || index == self.segments.len() - 1 {
                 let local = (progress - segment.start) / (segment.end - segment.start);
-                return Self::segment_gain(segment, local);
+                return Ok(Self::segment_gain(segment, local));
             }
             previous = segment;
         }
 
-        Self::segment_gain(previous, 1.0)
+        Ok(Self::segment_gain(previous, 1.0))
     }
 
     fn segment_gain(segment: &GainCurveSegment, target_x: f64) -> f64 {
@@ -144,6 +150,13 @@ impl GainCurve {
         let first_x = points.first().expect("validated segment has points").x;
         let last_x = points.last().expect("validated segment has points").x;
         let target_x = target_x.clamp(first_x, last_x);
+
+        // Repeated x coordinates encode a vertical edge. Treat the control points as a
+        // right-continuous polyline so the discontinuity remains a step instead of being
+        // smoothed by the Bezier solver.
+        if points.windows(2).any(|pair| pair[0].x == pair[1].x) {
+            return Self::stepped_polyline_coordinate(points, target_x).clamp(0.0, 1.0);
+        }
 
         // Spotify's editor emits uniformly spaced x controls, for which Bezier x(t) == t.
         // Avoid an iterative solve on every audio frame in that common case.
@@ -169,6 +182,21 @@ impl GainCurve {
         };
 
         Self::bezier_coordinate(points, parameter, |point| point.y).clamp(0.0, 1.0)
+    }
+
+    fn stepped_polyline_coordinate(points: &[GainPoint], target_x: f64) -> f64 {
+        let right = points.partition_point(|point| point.x <= target_x);
+        if right == 0 {
+            return points[0].y;
+        }
+        if right == points.len() {
+            return points[right - 1].y;
+        }
+
+        let left = points[right - 1];
+        let right = points[right];
+        let progress = (target_x - left.x) / (right.x - left.x);
+        left.y + (right.y - left.y) * progress
     }
 
     fn bezier_coordinate(
@@ -383,6 +411,8 @@ pub(crate) enum TransitionError {
     DurationTooLarge,
     #[error("transition source gains must be finite")]
     InvalidGain,
+    #[error("transition gain curve evaluation failed")]
+    InvalidGainCurve,
     #[error("cannot {operation} while transition is {state:?}")]
     InvalidState {
         operation: &'static str,
@@ -566,9 +596,13 @@ impl TransitionEngine {
                         let angle = progress * FRAC_PI_2;
                         (angle.cos(), angle.sin())
                     }
-                    TransitionCurve::GainCurves { current, next } => {
-                        (current.gain_at(progress), next.gain_at(progress))
-                    }
+                    TransitionCurve::GainCurves { current, next } => (
+                        current
+                            .gain_at(progress)
+                            .map_err(|_| TransitionError::InvalidGainCurve)?,
+                        next.gain_at(progress)
+                            .map_err(|_| TransitionError::InvalidGainCurve)?,
+                    ),
                 };
 
                 for (current_sample, next_sample) in current_frame.iter_mut().zip(next_frame.iter())
@@ -648,14 +682,122 @@ mod tests {
         .expect("test curve should validate")
     }
 
+    fn gain_at(curve: &GainCurve, progress: f64) -> f64 {
+        curve
+            .gain_at(progress)
+            .expect("test progress should evaluate")
+    }
+
+    fn one_segment(points: &[(f64, f64)]) -> GainCurve {
+        GainCurve::new(vec![GainCurveSegment {
+            start: 0.0,
+            end: 1.0,
+            points: points.iter().map(|&(x, y)| GainPoint { x, y }).collect(),
+        }])
+        .expect("test curve should validate")
+    }
+
     #[test]
     fn bezier_gain_curve_interpolates_spotify_editor_shape() {
         let curve = smooth_gain(0.0, 1.0);
-        assert_eq!(curve.gain_at(0.0), 0.0);
-        assert!((curve.gain_at(0.25) - 0.15625).abs() < 1e-12);
-        assert!((curve.gain_at(0.5) - 0.5).abs() < 1e-12);
-        assert!((curve.gain_at(0.75) - 0.84375).abs() < 1e-12);
-        assert_eq!(curve.gain_at(1.0), 1.0);
+        assert_eq!(gain_at(&curve, 0.0), 0.0);
+        assert!((gain_at(&curve, 0.25) - 0.15625).abs() < 1e-12);
+        assert!((gain_at(&curve, 0.5) - 0.5).abs() < 1e-12);
+        assert!((gain_at(&curve, 0.75) - 0.84375).abs() < 1e-12);
+        assert_eq!(gain_at(&curve, 1.0), 1.0);
+    }
+
+    #[test]
+    fn gain_curve_evaluates_constant_linear_and_quadratic_segments() {
+        let constant = one_segment(&[(0.0, 0.25), (1.0, 0.25)]);
+        assert_eq!(gain_at(&constant, -1.0), 0.25);
+        assert_eq!(gain_at(&constant, 0.5), 0.25);
+        assert_eq!(gain_at(&constant, 2.0), 0.25);
+
+        let linear = one_segment(&[(0.0, 1.0), (1.0, 0.0)]);
+        assert_eq!(gain_at(&linear, 0.0), 1.0);
+        assert_eq!(gain_at(&linear, 0.25), 0.75);
+        assert_eq!(gain_at(&linear, 1.0), 0.0);
+
+        let quadratic = one_segment(&[(0.0, 0.0), (0.5, 1.0), (1.0, 0.0)]);
+        assert_eq!(gain_at(&quadratic, 0.0), 0.0);
+        assert_eq!(gain_at(&quadratic, 0.5), 0.5);
+        assert_eq!(gain_at(&quadratic, 1.0), 0.0);
+    }
+
+    #[test]
+    fn captured_volume_steps_are_right_continuous() {
+        let outgoing = one_segment(&[(0.0, 1.0), (0.6, 1.0), (0.6, 0.0), (1.0, 0.0)]);
+        assert_eq!(gain_at(&outgoing, 0.0), 1.0);
+        assert_eq!(gain_at(&outgoing, 0.6 - 1.0e-9), 1.0);
+        assert_eq!(gain_at(&outgoing, 0.6), 0.0);
+        assert_eq!(gain_at(&outgoing, 0.6 + 1.0e-9), 0.0);
+        assert_eq!(gain_at(&outgoing, 1.0), 0.0);
+
+        let incoming = one_segment(&[(0.0, 0.0), (0.4, 0.0), (0.4, 1.0), (1.0, 1.0)]);
+        assert_eq!(gain_at(&incoming, 0.0), 0.0);
+        assert_eq!(gain_at(&incoming, 0.4 - 1.0e-9), 0.0);
+        assert_eq!(gain_at(&incoming, 0.4), 1.0);
+        assert_eq!(gain_at(&incoming, 0.4 + 1.0e-9), 1.0);
+        assert_eq!(gain_at(&incoming, 1.0), 1.0);
+    }
+
+    #[test]
+    fn gain_curve_maps_global_progress_into_piecewise_segments() {
+        let curve = GainCurve::new(vec![
+            GainCurveSegment {
+                start: 0.0,
+                end: 0.25,
+                points: vec![GainPoint { x: 0.0, y: 0.0 }, GainPoint { x: 1.0, y: 0.5 }],
+            },
+            GainCurveSegment {
+                start: 0.25,
+                end: 1.0,
+                points: vec![GainPoint { x: 0.0, y: 0.75 }, GainPoint { x: 1.0, y: 1.0 }],
+            },
+        ])
+        .expect("piecewise curve should validate");
+
+        assert_eq!(gain_at(&curve, 0.125), 0.25);
+        assert!(gain_at(&curve, 0.25 - 1.0e-9) < 0.500_000_001);
+        assert_eq!(gain_at(&curve, 0.25), 0.75);
+        assert_eq!(gain_at(&curve, 0.625), 0.875);
+    }
+
+    #[test]
+    fn gain_curve_rejects_invalid_topology_and_progress() {
+        let invalid_bounds = GainCurve::new(vec![GainCurveSegment {
+            start: f64::NAN,
+            end: 1.0,
+            points: vec![GainPoint { x: 0.0, y: 0.0 }, GainPoint { x: 1.0, y: 1.0 }],
+        }]);
+        assert_eq!(
+            invalid_bounds,
+            Err(TransitionPlanError::InvalidSegmentBounds)
+        );
+
+        let invalid_point = GainCurve::new(vec![GainCurveSegment {
+            start: 0.0,
+            end: 1.0,
+            points: vec![
+                GainPoint {
+                    x: 0.0,
+                    y: f64::INFINITY,
+                },
+                GainPoint { x: 1.0, y: 1.0 },
+            ],
+        }]);
+        assert_eq!(invalid_point, Err(TransitionPlanError::InvalidPoint));
+
+        let curve = one_segment(&[(0.0, 0.0), (1.0, 1.0)]);
+        assert_eq!(
+            curve.gain_at(f64::NAN),
+            Err(TransitionPlanError::InvalidProgress)
+        );
+        assert_eq!(
+            curve.gain_at(f64::INFINITY),
+            Err(TransitionPlanError::InvalidProgress)
+        );
     }
 
     #[test]
@@ -680,6 +822,31 @@ mod tests {
             )
             .expect("custom transition should render");
         assert_eq!(into_samples(output), [1.0, 0.5, 0.0]);
+    }
+
+    #[test]
+    fn transition_engine_applies_source_gain_curves_independently_before_summing() {
+        let mut engine = TransitionEngine::new(3, 1);
+        engine
+            .arm(TransitionSpec {
+                duration: Duration::from_secs(1),
+                curve: TransitionCurve::GainCurves {
+                    current: one_segment(&[(0.0, 0.25), (1.0, 0.25)]),
+                    next: one_segment(&[(0.0, 0.5), (1.0, 0.5)]),
+                },
+                current_gain: 1.0,
+                next_gain: 1.0,
+            })
+            .expect("custom transition should arm");
+
+        let output = engine
+            .render(
+                AudioPacket::Samples(vec![2.0; 3]),
+                Some(AudioPacket::Samples(vec![3.0; 3])),
+            )
+            .expect("custom transition should render");
+
+        assert_eq!(into_samples(output), [2.0, 2.0, 2.0]);
     }
 
     #[test]

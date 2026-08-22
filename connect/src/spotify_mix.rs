@@ -376,12 +376,41 @@ pub(crate) fn transition_plan_for_pair(
     log_transition_track("A", outgoing);
     log_transition_track("B", incoming);
 
-    let Some(encoded) = outgoing.metadata.get(RECIPE_ATTRIBUTE) else {
-        debug!("[spotify-mix] no saved recipe; using fallback");
-        return None;
-    };
+    if let Some(encoded) = outgoing.metadata.get(RECIPE_ATTRIBUTE) {
+        if let Some(plan) = transition_plan_for_recipe_pair(outgoing, incoming, encoded) {
+            return Some(plan);
+        }
+    } else {
+        debug!("[spotify-mix] no saved recipe; checking materialized transition");
+    }
 
-    transition_plan_for_recipe_pair(outgoing, incoming, encoded)
+    match crate::spotify_materialized_transition::materialized_transition_plan_for_pair(
+        outgoing, incoming,
+    ) {
+        Ok(Some(materialized)) => match materialized.to_transition_plan() {
+            Ok(plan) => {
+                debug!(
+                    "[spotify-mix] materialized volume transition {} -> {}",
+                    outgoing.uri, incoming.uri
+                );
+                Some(plan)
+            }
+            Err(error) => {
+                debug!(
+                    "[spotify-mix] materialized transition unsupported: {error}; using fallback"
+                );
+                None
+            }
+        },
+        Ok(None) => {
+            debug!("[spotify-mix] no materialized transition; using fallback");
+            None
+        }
+        Err(error) => {
+            debug!("[spotify-mix] invalid materialized transition: {error}; using fallback");
+            None
+        }
+    }
 }
 
 pub(crate) fn transition_plan_for_recipe_pair(
@@ -580,6 +609,40 @@ mod tests {
         track
     }
 
+    fn materialized_volume_pair() -> (ProvidedTrack, ProvidedTrack) {
+        let mut outgoing = track(TRACK_A, None, None);
+        outgoing
+            .metadata
+            .insert("audio.fade_out_start_time".into(), "208960".into());
+        outgoing
+            .metadata
+            .insert("audio.fade_out_duration".into(), "6090".into());
+        outgoing
+            .metadata
+            .insert("automix.auto_preset_id".into(), "1".into());
+        outgoing.metadata.insert(
+            "audio.fade_out_curves".into(),
+            r#"[{"start_point":0,"end_point":1,"fade_curve":[{"x":0,"y":1},{"x":0.6,"y":1},{"x":0.6,"y":0},{"x":1,"y":0}]}]"#.into(),
+        );
+
+        let mut incoming = track(TRACK_B, None, None);
+        incoming
+            .metadata
+            .insert("audio.fade_in_start_time".into(), "2763".into());
+        incoming
+            .metadata
+            .insert("audio.fade_in_duration".into(), "6090".into());
+        incoming
+            .metadata
+            .insert("audio.fade_overlap".into(), "6090".into());
+        incoming.metadata.insert(
+            "audio.fade_in_curves".into(),
+            r#"[{"start_point":0,"end_point":1,"fade_curve":[{"x":0,"y":0},{"x":0.4,"y":0},{"x":0.4,"y":1},{"x":1,"y":1}]}]"#.into(),
+        );
+
+        (outgoing, incoming)
+    }
+
     #[test]
     fn base64_recipe_decodes_and_converts_to_plan() {
         let recipe = SpotifyTransitionRecipe::from_base64(&encoded(&transition()))
@@ -716,6 +779,38 @@ mod tests {
         let outgoing = track(TRACK_A, Some(encoded(&transition())), Some("1.0"));
         let incoming = track(TRACK_B, None, Some("1.0005"));
         assert!(transition_plan_for_pair(&outgoing, &incoming).is_some());
+    }
+
+    #[test]
+    fn materialized_volume_pair_yields_existing_transition_plan() {
+        let (outgoing, incoming) = materialized_volume_pair();
+        let plan = transition_plan_for_pair(&outgoing, &incoming).unwrap();
+
+        assert_eq!(plan.current_start(), Duration::from_millis(208_960));
+        assert_eq!(plan.next_start(), Duration::from_millis(2_763));
+        assert_eq!(plan.duration(), Duration::from_millis(6_090));
+    }
+
+    #[test]
+    fn unsupported_materialized_dsp_falls_through() {
+        let (outgoing, mut incoming) = materialized_volume_pair();
+        incoming.metadata.insert(
+            "audio.speed_automation".into(),
+            r#"[{"from_position":0,"speed":0.90312}]"#.into(),
+        );
+
+        assert!(transition_plan_for_pair(&outgoing, &incoming).is_none());
+    }
+
+    #[test]
+    fn valid_saved_recipe_precedes_materialized_volume_plan() {
+        let (mut outgoing, incoming) = materialized_volume_pair();
+        outgoing
+            .metadata
+            .insert(RECIPE_ATTRIBUTE.into(), encoded(&transition()));
+
+        let plan = transition_plan_for_pair(&outgoing, &incoming).unwrap();
+        assert_eq!(plan.current_start(), Duration::from_millis(175_000));
     }
 
     #[test]

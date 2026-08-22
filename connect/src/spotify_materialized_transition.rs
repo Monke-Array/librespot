@@ -3,8 +3,11 @@
 //! This module deliberately stops at a typed render description. It does not select a transition
 //! or apply volume, EQ, filter, speed, or other DSP automation.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
+use librespot_playback::{
+    GainCurve, GainCurveSegment, GainPoint, TransitionPlan, TransitionPlanError,
+};
 use librespot_protocol::player::ProvidedTrack;
 use serde_json::Value;
 use thiserror::Error;
@@ -124,6 +127,89 @@ pub enum MaterializedTransitionError {
         /// Narrow validation failure.
         reason: String,
     },
+}
+
+/// Why a parsed materialized transition cannot yet become a complete playback plan.
+#[derive(Debug, Error, PartialEq)]
+pub enum MaterializedTransitionRenderError {
+    /// Both source volume envelopes are required for dual-source rendering.
+    #[error("materialized transition is missing {0} volume automation")]
+    MissingVolumeAutomation(&'static str),
+    /// Playback-speed automation requires time stretching, which is not implemented yet.
+    #[error("materialized transition requires speed automation")]
+    UnsupportedSpeedAutomation,
+    /// Unequal source and wall-clock durations require timeline conversion or time stretching.
+    #[error("materialized transition source durations do not match its wall-clock overlap")]
+    UnsupportedTiming,
+    /// EQ automation is parsed but not rendered yet.
+    #[error("materialized transition requires EQ automation")]
+    UnsupportedEqAutomation,
+    /// Filter automation is parsed but not rendered yet.
+    #[error("materialized transition requires filter automation")]
+    UnsupportedFilterAutomation,
+    /// The generic transition plan rejected the timing or gain topology.
+    #[error(transparent)]
+    InvalidPlan(#[from] TransitionPlanError),
+}
+
+impl MaterializedTransitionRenderPlan {
+    /// Convert a fully supported materialized transition into the existing playback plan.
+    ///
+    /// Parsed-but-unsupported DSP keeps the complete transition non-renderable until the
+    /// corresponding renderer exists.
+    pub fn to_transition_plan(&self) -> Result<TransitionPlan, MaterializedTransitionRenderError> {
+        if !self.incoming_speed.is_empty() {
+            return Err(MaterializedTransitionRenderError::UnsupportedSpeedAutomation);
+        }
+        if self.outgoing.duration_ms != self.overlap_ms
+            || self.incoming.duration_ms != self.overlap_ms
+        {
+            return Err(MaterializedTransitionRenderError::UnsupportedTiming);
+        }
+        if self.outgoing_eq_low_gain.is_some() || self.incoming_eq_low_gain.is_some() {
+            return Err(MaterializedTransitionRenderError::UnsupportedEqAutomation);
+        }
+        if self.outgoing_filter_cutoff.is_some() || self.outgoing_filter_resonance.is_some() {
+            return Err(MaterializedTransitionRenderError::UnsupportedFilterAutomation);
+        }
+
+        let outgoing = self.outgoing_volume.as_ref().ok_or(
+            MaterializedTransitionRenderError::MissingVolumeAutomation("outgoing"),
+        )?;
+        let incoming = self.incoming_volume.as_ref().ok_or(
+            MaterializedTransitionRenderError::MissingVolumeAutomation("incoming"),
+        )?;
+
+        TransitionPlan::new(
+            Duration::from_millis(self.outgoing.start_ms),
+            Duration::from_millis(self.incoming.start_ms),
+            Duration::from_millis(self.overlap_ms),
+            adapt_gain_curve(outgoing)?,
+            adapt_gain_curve(incoming)?,
+        )
+        .map_err(Into::into)
+    }
+}
+
+fn adapt_gain_curve(curve: &PiecewiseAutomationCurve) -> Result<GainCurve, TransitionPlanError> {
+    GainCurve::new(
+        curve
+            .segments
+            .iter()
+            .map(|segment| GainCurveSegment {
+                start: segment.start,
+                end: segment.end,
+                points: segment
+                    .points
+                    .iter()
+                    .map(|point| GainPoint {
+                        x: point.x,
+                        y: point.y,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    )
 }
 
 /// Parse one A -> B edge from A's outgoing and B's incoming materialized metadata.
@@ -558,11 +644,47 @@ mod tests {
         assert_eq!(plan.mode.as_deref(), Some("auto"));
         assert_eq!(plan.incoming_audio_automix_mode.as_deref(), Some("auto"));
         assert_eq!(
+            plan.to_transition_plan(),
+            Err(MaterializedTransitionRenderError::UnsupportedSpeedAutomation)
+        );
+        assert_eq!(
             plan.transition_uri.as_deref(),
             Some("spotify:core-auto-transition")
         );
         assert_eq!(plan.outgoing_volume.unwrap().segments.len(), 1);
         assert_eq!(plan.incoming_volume.unwrap().segments[0].points.len(), 4);
+    }
+
+    #[test]
+    fn volume_only_materialized_pair_converts_to_existing_transition_plan() {
+        let mut plan = materialized_transition_plan_for_pair(&outgoing(), &incoming())
+            .unwrap()
+            .unwrap();
+        plan.incoming_speed.clear();
+        plan.outgoing_eq_low_gain = None;
+        plan.incoming.duration_ms = 6_090;
+
+        let transition = plan.to_transition_plan().unwrap();
+
+        assert_eq!(transition.current_start(), Duration::from_millis(208_960));
+        assert_eq!(transition.next_start(), Duration::from_millis(2_763));
+        assert_eq!(transition.duration(), Duration::from_millis(6_090));
+    }
+
+    #[test]
+    fn unequal_source_duration_and_wall_clock_overlap_are_not_renderable_without_speed() {
+        let mut plan = materialized_transition_plan_for_pair(&outgoing(), &incoming())
+            .unwrap()
+            .unwrap();
+        plan.incoming_speed.clear();
+        plan.outgoing_eq_low_gain = None;
+
+        assert_eq!(plan.incoming.duration_ms, 5_500);
+        assert_eq!(plan.overlap_ms, 6_090);
+        assert_eq!(
+            plan.to_transition_plan(),
+            Err(MaterializedTransitionRenderError::UnsupportedTiming)
+        );
     }
 
     #[test]
