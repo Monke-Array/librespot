@@ -3,7 +3,7 @@
 //! This module deliberately stops at a typed render description. It does not select a transition
 //! or apply volume, EQ, filter, speed, or other DSP automation.
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, ffi::OsStr, time::Duration};
 
 use librespot_playback::{
     GainCurve, GainCurveSegment, GainPoint, SpeedAutomation, SpeedPoint, TransitionPlan,
@@ -17,12 +17,18 @@ const FADE_OUT_START: &str = "audio.fade_out_start_time";
 const FADE_OUT_DURATION: &str = "audio.fade_out_duration";
 const FADE_OUT_CURVES: &str = "audio.fade_out_curves";
 const FADE_OUT_EQ_LOW_GAIN_CURVES: &str = "audio.fade_out_eq_low_gain_curves";
+const FADE_OUT_EQ_MID_GAIN_CURVES: &str = "audio.fade_out_eq_mid_gain_curves";
+const FADE_OUT_EQ_HIGH_GAIN_CURVES: &str = "audio.fade_out_eq_high_gain_curves";
 const FADE_OUT_FILTER_CUTOFF_CURVES: &str = "audio.fade_out_filter_cutoff_curves";
 const FADE_OUT_FILTER_RESONANCE_CURVES: &str = "audio.fade_out_filter_resonance_curves";
 const FADE_IN_START: &str = "audio.fade_in_start_time";
 const FADE_IN_DURATION: &str = "audio.fade_in_duration";
 const FADE_IN_CURVES: &str = "audio.fade_in_curves";
 const FADE_IN_EQ_LOW_GAIN_CURVES: &str = "audio.fade_in_eq_low_gain_curves";
+const FADE_IN_EQ_MID_GAIN_CURVES: &str = "audio.fade_in_eq_mid_gain_curves";
+const FADE_IN_EQ_HIGH_GAIN_CURVES: &str = "audio.fade_in_eq_high_gain_curves";
+const FADE_IN_FILTER_CUTOFF_CURVES: &str = "audio.fade_in_filter_cutoff_curves";
+const FADE_IN_FILTER_RESONANCE_CURVES: &str = "audio.fade_in_filter_resonance_curves";
 const FADE_OVERLAP: &str = "audio.fade_overlap";
 const SPEED_AUTOMATION: &str = "audio.speed_automation";
 const ONLY_ALLOW_FADE_ON_ADVANCE: &str = "audio.only_allow_fade_on_advance";
@@ -30,6 +36,7 @@ const AUDIO_AUTOMIX_MODE: &str = "audio.automix_mode";
 const AUTO_PRESET_ID: &str = "automix.auto_preset_id";
 const AUTOMIX_MODE: &str = "automix.mode";
 const TRANSITION_URI: &str = "automix.transition_uri";
+const DEV_BYPASS_MATERIALIZED_EQ_ENV: &str = "LIBRESPOT_DEV_BYPASS_MATERIALIZED_EQ";
 
 /// One control point in a materialized automation curve.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -101,14 +108,49 @@ pub struct MaterializedTransitionRenderPlan {
     pub incoming_volume: Option<PiecewiseAutomationCurve>,
     /// Outgoing low-band EQ automation sourced from A.
     pub outgoing_eq_low_gain: Option<PiecewiseAutomationCurve>,
+    /// Outgoing mid-band EQ automation sourced from A.
+    pub outgoing_eq_mid_gain: Option<PiecewiseAutomationCurve>,
+    /// Outgoing high-band EQ automation sourced from A.
+    pub outgoing_eq_high_gain: Option<PiecewiseAutomationCurve>,
     /// Incoming low-band EQ automation sourced from B.
     pub incoming_eq_low_gain: Option<PiecewiseAutomationCurve>,
+    /// Incoming mid-band EQ automation sourced from B.
+    pub incoming_eq_mid_gain: Option<PiecewiseAutomationCurve>,
+    /// Incoming high-band EQ automation sourced from B.
+    pub incoming_eq_high_gain: Option<PiecewiseAutomationCurve>,
     /// Outgoing filter-cutoff automation sourced from A.
     pub outgoing_filter_cutoff: Option<PiecewiseAutomationCurve>,
     /// Outgoing filter-resonance automation sourced from A.
     pub outgoing_filter_resonance: Option<PiecewiseAutomationCurve>,
+    /// Incoming filter-cutoff automation sourced from B.
+    pub incoming_filter_cutoff: Option<PiecewiseAutomationCurve>,
+    /// Incoming filter-resonance automation sourced from B.
+    pub incoming_filter_resonance: Option<PiecewiseAutomationCurve>,
+    /// Present materialized fade/effect curve metadata that this parser does not render.
+    pub unsupported_effect_key: Option<String>,
     /// Incoming speed automation sourced from B.
     pub incoming_speed: Vec<SpeedAutomationPoint>,
+}
+
+/// Runtime render options for materialized Spotify transitions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MaterializedTransitionRenderOptions {
+    /// Development-only escape hatch for rendering materialized timing, volume, and speed while
+    /// Spotify EQ automation remains unimplemented.
+    pub dev_bypass_materialized_eq: bool,
+}
+
+impl MaterializedTransitionRenderOptions {
+    /// Read render options from process environment.
+    pub fn from_environment() -> Self {
+        Self::from_dev_bypass_value(std::env::var_os(DEV_BYPASS_MATERIALIZED_EQ_ENV).as_deref())
+    }
+
+    fn from_dev_bypass_value(value: Option<&OsStr>) -> Self {
+        Self {
+            dev_bypass_materialized_eq: value.is_some_and(|value| value == OsStr::new("1")),
+        }
+    }
 }
 
 /// Failure to parse a present materialized transition.
@@ -148,6 +190,9 @@ pub enum MaterializedTransitionRenderError {
     /// Filter automation is parsed but not rendered yet.
     #[error("materialized transition requires filter automation")]
     UnsupportedFilterAutomation,
+    /// Unknown effect automation is present and cannot be rendered safely.
+    #[error("materialized transition requires unsupported effect automation")]
+    UnsupportedEffectAutomation,
     /// The generic transition plan rejected the timing or gain topology.
     #[error(transparent)]
     InvalidPlan(#[from] TransitionPlanError),
@@ -159,6 +204,14 @@ impl MaterializedTransitionRenderPlan {
     /// Parsed-but-unsupported DSP keeps the complete transition non-renderable until the
     /// corresponding renderer exists.
     pub fn to_transition_plan(&self) -> Result<TransitionPlan, MaterializedTransitionRenderError> {
+        self.to_transition_plan_with_options(MaterializedTransitionRenderOptions::from_environment())
+    }
+
+    /// Convert a materialized transition with explicit render options.
+    pub fn to_transition_plan_with_options(
+        &self,
+        options: MaterializedTransitionRenderOptions,
+    ) -> Result<TransitionPlan, MaterializedTransitionRenderError> {
         let incoming_speed = (!self.incoming_speed.is_empty())
             .then(|| {
                 SpeedAutomation::new(
@@ -194,11 +247,15 @@ impl MaterializedTransitionRenderPlan {
             }
             None => {}
         }
-        if self.outgoing_eq_low_gain.is_some() || self.incoming_eq_low_gain.is_some() {
+        let bypassed_eq_automation = self.has_eq_automation();
+        if bypassed_eq_automation && !options.dev_bypass_materialized_eq {
             return Err(MaterializedTransitionRenderError::UnsupportedEqAutomation);
         }
-        if self.outgoing_filter_cutoff.is_some() || self.outgoing_filter_resonance.is_some() {
+        if self.has_filter_automation() {
             return Err(MaterializedTransitionRenderError::UnsupportedFilterAutomation);
+        }
+        if self.unsupported_effect_key.is_some() {
+            return Err(MaterializedTransitionRenderError::UnsupportedEffectAutomation);
         }
 
         let outgoing = self.outgoing_volume.as_ref().ok_or(
@@ -215,10 +272,39 @@ impl MaterializedTransitionRenderPlan {
             adapt_gain_curve(outgoing)?,
             adapt_gain_curve(incoming)?,
         )?;
+        if bypassed_eq_automation {
+            warn!(
+                "[spotify-mix] {DEV_BYPASS_MATERIALIZED_EQ_ENV}=1: ignoring Spotify materialized EQ automation for prototype rendering"
+            );
+        }
         Ok(match incoming_speed {
             Some(speed) => plan.with_next_speed_automation(speed),
             None => plan,
         })
+    }
+
+    fn has_eq_automation(&self) -> bool {
+        [
+            self.outgoing_eq_low_gain.as_ref(),
+            self.outgoing_eq_mid_gain.as_ref(),
+            self.outgoing_eq_high_gain.as_ref(),
+            self.incoming_eq_low_gain.as_ref(),
+            self.incoming_eq_mid_gain.as_ref(),
+            self.incoming_eq_high_gain.as_ref(),
+        ]
+        .into_iter()
+        .any(|curve| curve.is_some())
+    }
+
+    fn has_filter_automation(&self) -> bool {
+        [
+            self.outgoing_filter_cutoff.as_ref(),
+            self.outgoing_filter_resonance.as_ref(),
+            self.incoming_filter_cutoff.as_ref(),
+            self.incoming_filter_resonance.as_ref(),
+        ]
+        .into_iter()
+        .any(|curve| curve.is_some())
     }
 }
 
@@ -285,11 +371,46 @@ pub fn materialized_transition_plan_for_pair(
         outgoing_volume: optional_curve(a, FADE_OUT_CURVES)?,
         incoming_volume: optional_curve(b, FADE_IN_CURVES)?,
         outgoing_eq_low_gain: optional_curve(a, FADE_OUT_EQ_LOW_GAIN_CURVES)?,
+        outgoing_eq_mid_gain: optional_curve(a, FADE_OUT_EQ_MID_GAIN_CURVES)?,
+        outgoing_eq_high_gain: optional_curve(a, FADE_OUT_EQ_HIGH_GAIN_CURVES)?,
         incoming_eq_low_gain: optional_curve(b, FADE_IN_EQ_LOW_GAIN_CURVES)?,
+        incoming_eq_mid_gain: optional_curve(b, FADE_IN_EQ_MID_GAIN_CURVES)?,
+        incoming_eq_high_gain: optional_curve(b, FADE_IN_EQ_HIGH_GAIN_CURVES)?,
         outgoing_filter_cutoff: optional_curve(a, FADE_OUT_FILTER_CUTOFF_CURVES)?,
         outgoing_filter_resonance: optional_curve(a, FADE_OUT_FILTER_RESONANCE_CURVES)?,
+        incoming_filter_cutoff: optional_curve(b, FADE_IN_FILTER_CUTOFF_CURVES)?,
+        incoming_filter_resonance: optional_curve(b, FADE_IN_FILTER_RESONANCE_CURVES)?,
+        unsupported_effect_key: unsupported_materialized_effect_key(a)
+            .or_else(|| unsupported_materialized_effect_key(b)),
         incoming_speed: optional_speed_automation(b)?.unwrap_or_default(),
     }))
+}
+
+fn unsupported_materialized_effect_key(metadata: &HashMap<String, String>) -> Option<String> {
+    metadata
+        .keys()
+        .find(|key| is_unknown_materialized_curve_key(key))
+        .cloned()
+}
+
+fn is_unknown_materialized_curve_key(key: &str) -> bool {
+    (key.starts_with("audio.fade_out_") || key.starts_with("audio.fade_in_"))
+        && key.ends_with("_curves")
+        && ![
+            FADE_OUT_CURVES,
+            FADE_OUT_EQ_LOW_GAIN_CURVES,
+            FADE_OUT_EQ_MID_GAIN_CURVES,
+            FADE_OUT_EQ_HIGH_GAIN_CURVES,
+            FADE_OUT_FILTER_CUTOFF_CURVES,
+            FADE_OUT_FILTER_RESONANCE_CURVES,
+            FADE_IN_CURVES,
+            FADE_IN_EQ_LOW_GAIN_CURVES,
+            FADE_IN_EQ_MID_GAIN_CURVES,
+            FADE_IN_EQ_HIGH_GAIN_CURVES,
+            FADE_IN_FILTER_CUTOFF_CURVES,
+            FADE_IN_FILTER_RESONANCE_CURVES,
+        ]
+        .contains(&key)
 }
 
 fn required_u64(
@@ -677,6 +798,121 @@ mod tests {
         )
     }
 
+    fn outgoing_with_all_eq_bands() -> ProvidedTrack {
+        let mut outgoing = outgoing();
+        outgoing.metadata.insert(
+            FADE_OUT_EQ_MID_GAIN_CURVES.to_owned(),
+            CAPTURED_LOW_EQ_SEGMENTED_CURVE.to_owned(),
+        );
+        outgoing.metadata.insert(
+            FADE_OUT_EQ_HIGH_GAIN_CURVES.to_owned(),
+            CAPTURED_LOW_EQ_SEGMENTED_CURVE.to_owned(),
+        );
+        outgoing
+    }
+
+    fn incoming_with_all_eq_bands() -> ProvidedTrack {
+        let mut incoming = incoming();
+        incoming.metadata.insert(
+            FADE_IN_EQ_LOW_GAIN_CURVES.to_owned(),
+            CAPTURED_LOW_EQ_SEGMENTED_CURVE.to_owned(),
+        );
+        incoming.metadata.insert(
+            FADE_IN_EQ_MID_GAIN_CURVES.to_owned(),
+            CAPTURED_LOW_EQ_SEGMENTED_CURVE.to_owned(),
+        );
+        incoming.metadata.insert(
+            FADE_IN_EQ_HIGH_GAIN_CURVES.to_owned(),
+            CAPTURED_LOW_EQ_SEGMENTED_CURVE.to_owned(),
+        );
+        incoming
+    }
+
+    #[test]
+    fn known_eq_bearing_pair_remains_rejected_without_dev_bypass() {
+        let plan = materialized_transition_plan_for_pair(&outgoing(), &incoming())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            plan.to_transition_plan_with_options(MaterializedTransitionRenderOptions::default()),
+            Err(MaterializedTransitionRenderError::UnsupportedEqAutomation)
+        );
+    }
+
+    #[test]
+    fn dev_eq_bypass_allows_known_volume_and_speed_plan() {
+        let plan = materialized_transition_plan_for_pair(
+            &outgoing_with_all_eq_bands(),
+            &incoming_with_all_eq_bands(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(plan.outgoing_eq_low_gain.is_some());
+        assert!(plan.outgoing_eq_mid_gain.is_some());
+        assert!(plan.outgoing_eq_high_gain.is_some());
+        assert!(plan.incoming_eq_low_gain.is_some());
+        assert!(plan.incoming_eq_mid_gain.is_some());
+        assert!(plan.incoming_eq_high_gain.is_some());
+
+        let transition = plan
+            .to_transition_plan_with_options(MaterializedTransitionRenderOptions {
+                dev_bypass_materialized_eq: true,
+            })
+            .unwrap();
+
+        assert_eq!(transition.current_start(), Duration::from_millis(208_960));
+        assert_eq!(transition.next_start(), Duration::from_millis(2_763));
+        assert_eq!(transition.duration(), Duration::from_millis(6_090));
+        let speed = transition.next_speed_automation().unwrap();
+        assert_eq!(speed.points().len(), 21);
+        assert_eq!(speed.points()[0].from_position, Duration::ZERO);
+        assert_eq!(speed.points()[0].speed, 0.90312);
+        assert_eq!(
+            speed.points()[20].from_position,
+            Duration::from_millis(27_763)
+        );
+        assert_eq!(speed.points()[20].speed, 1.0);
+    }
+
+    #[test]
+    fn dev_eq_bypass_does_not_allow_filter_automation() {
+        let mut outgoing = outgoing_with_all_eq_bands();
+        outgoing.metadata.insert(
+            FADE_OUT_FILTER_CUTOFF_CURVES.to_owned(),
+            CAPTURED_LOW_EQ_SEGMENTED_CURVE.to_owned(),
+        );
+        let plan = materialized_transition_plan_for_pair(&outgoing, &incoming_with_all_eq_bands())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            plan.to_transition_plan_with_options(MaterializedTransitionRenderOptions {
+                dev_bypass_materialized_eq: true,
+            }),
+            Err(MaterializedTransitionRenderError::UnsupportedFilterAutomation)
+        );
+    }
+
+    #[test]
+    fn dev_eq_bypass_does_not_allow_unknown_effect_automation() {
+        let mut outgoing = outgoing_with_all_eq_bands();
+        outgoing.metadata.insert(
+            "audio.fade_out_reverb_dry_wet_curves".to_owned(),
+            CAPTURED_LOW_EQ_SEGMENTED_CURVE.to_owned(),
+        );
+        let plan = materialized_transition_plan_for_pair(&outgoing, &incoming_with_all_eq_bands())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            plan.to_transition_plan_with_options(MaterializedTransitionRenderOptions {
+                dev_bypass_materialized_eq: true,
+            }),
+            Err(MaterializedTransitionRenderError::UnsupportedEffectAutomation)
+        );
+    }
+
     #[test]
     fn known_pair_combines_a_outgoing_with_b_incoming_metadata() {
         let plan = materialized_transition_plan_for_pair(&outgoing(), &incoming())
@@ -693,7 +929,7 @@ mod tests {
         assert_eq!(plan.mode.as_deref(), Some("auto"));
         assert_eq!(plan.incoming_audio_automix_mode.as_deref(), Some("auto"));
         assert_eq!(
-            plan.to_transition_plan(),
+            plan.to_transition_plan_with_options(MaterializedTransitionRenderOptions::default()),
             Err(MaterializedTransitionRenderError::UnsupportedEqAutomation)
         );
         assert_eq!(
