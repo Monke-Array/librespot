@@ -14,7 +14,10 @@ use crate::{
     },
     model::SpircPlayStatus,
     protocol::{
-        connect::{Capabilities, Device, DeviceInfo, MemberType, PutStateReason, PutStateRequest},
+        connect::{
+            Capabilities, CapabilitySupportDetails, Device, DeviceInfo, MemberType, PutStateReason,
+            PutStateRequest,
+        },
         media::AudioQuality,
         player::{
             ContextIndex, ContextPlayerOptions, PlayOrigin, PlayerState, ProvidedTrack,
@@ -31,6 +34,7 @@ use log::LevelFilter;
 use protobuf::{EnumOrUnknown, MessageField};
 use std::{
     collections::{HashSet, hash_map::DefaultHasher},
+    env,
     hash::{Hash, Hasher},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -39,6 +43,7 @@ use thiserror::Error;
 // these limitations are essential, otherwise to many tracks will overload the web-player
 const SPOTIFY_MAX_PREV_TRACKS_SIZE: usize = 10;
 const SPOTIFY_MAX_NEXT_TRACKS_SIZE: usize = 80;
+const DEV_CONNECT_CAPABILITY_OVERRIDES_ENV: &str = "LIBRESPOT_DEV_CONNECT_CAPABILITY_OVERRIDES";
 
 #[derive(Debug, Error)]
 pub(super) enum StateError {
@@ -73,6 +78,185 @@ impl From<StateError> for Error {
             CurrentlyDisallowed { .. } | UnsupportedLocalPlayback => Error::unavailable(err),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DevCapabilityOverride {
+    SupportsDj(bool),
+    SupportsSetBackendMetadata(bool),
+    NeedsFullPlayerState(bool),
+    SupportsExternalEpisodes(bool),
+    SupportsLogout(bool),
+    SupportsHifi(bool),
+    SupportedTypesDesktop,
+    SupportedAudioQuality(AudioQuality),
+}
+
+fn apply_dev_connect_capability_overrides(capabilities: &mut Capabilities) {
+    let Ok(spec) = env::var(DEV_CONNECT_CAPABILITY_OVERRIDES_ENV) else {
+        return;
+    };
+    if spec.trim().is_empty() {
+        return;
+    }
+
+    match apply_dev_connect_capability_override_spec(capabilities, &spec) {
+        Ok(applied) => warn!(
+            "[spotify-capability-debug] applying development-only Connect capability overrides from {DEV_CONNECT_CAPABILITY_OVERRIDES_ENV}: {}",
+            applied.join(",")
+        ),
+        Err(error) => warn!(
+            "[spotify-capability-debug] ignoring invalid development-only Connect capability override in {DEV_CONNECT_CAPABILITY_OVERRIDES_ENV}: {error}"
+        ),
+    }
+}
+
+fn apply_dev_connect_capability_override_spec(
+    capabilities: &mut Capabilities,
+    spec: &str,
+) -> Result<Vec<&'static str>, String> {
+    let overrides = parse_dev_connect_capability_override_spec(spec)?;
+    let mut applied = Vec::with_capacity(overrides.len());
+    for override_ in overrides {
+        match override_ {
+            DevCapabilityOverride::SupportsDj(enabled) => {
+                capabilities.supports_dj = enabled;
+                applied.push("supports-dj");
+            }
+            DevCapabilityOverride::SupportsSetBackendMetadata(enabled) => {
+                capabilities.supports_set_backend_metadata = enabled;
+                applied.push("supports-set-backend-metadata");
+            }
+            DevCapabilityOverride::NeedsFullPlayerState(enabled) => {
+                capabilities.needs_full_player_state = enabled;
+                applied.push("needs-full-player-state");
+            }
+            DevCapabilityOverride::SupportsExternalEpisodes(enabled) => {
+                capabilities.supports_external_episodes = enabled;
+                applied.push("supports-external-episodes");
+            }
+            DevCapabilityOverride::SupportsLogout(enabled) => {
+                capabilities.supports_logout = enabled;
+                applied.push("supports-logout");
+            }
+            DevCapabilityOverride::SupportsHifi(enabled) => {
+                capabilities.supports_hifi = if enabled {
+                    MessageField::some(CapabilitySupportDetails {
+                        fully_supported: true,
+                        user_eligible: true,
+                        device_supported: true,
+                        ..Default::default()
+                    })
+                } else {
+                    MessageField::none()
+                };
+                applied.push("supports-hifi");
+            }
+            DevCapabilityOverride::SupportedTypesDesktop => {
+                capabilities.supported_types = desktop_supported_media_types();
+                applied.push("supported-types");
+            }
+            DevCapabilityOverride::SupportedAudioQuality(quality) => {
+                capabilities.supported_audio_quality = EnumOrUnknown::new(quality);
+                applied.push("supported-audio-quality");
+            }
+        }
+    }
+    Ok(applied)
+}
+
+fn parse_dev_connect_capability_override_spec(
+    spec: &str,
+) -> Result<Vec<DevCapabilityOverride>, String> {
+    let mut overrides = Vec::new();
+    for token in spec
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        let Some((key, value)) = token.split_once('=') else {
+            return Err(format!("override token {token:?} must use key=value"));
+        };
+        let key = normalize_override_key(key);
+        let value = value.trim();
+        let override_ = match key.as_str() {
+            "supports-dj" => DevCapabilityOverride::SupportsDj(parse_override_bool(&key, value)?),
+            "supports-set-backend-metadata" => {
+                DevCapabilityOverride::SupportsSetBackendMetadata(parse_override_bool(&key, value)?)
+            }
+            "needs-full-player-state" => {
+                DevCapabilityOverride::NeedsFullPlayerState(parse_override_bool(&key, value)?)
+            }
+            "supports-external-episodes" => {
+                DevCapabilityOverride::SupportsExternalEpisodes(parse_override_bool(&key, value)?)
+            }
+            "supports-logout" => {
+                DevCapabilityOverride::SupportsLogout(parse_override_bool(&key, value)?)
+            }
+            "supports-hifi" => {
+                DevCapabilityOverride::SupportsHifi(parse_override_bool(&key, value)?)
+            }
+            "supported-types" => match value {
+                "desktop" => DevCapabilityOverride::SupportedTypesDesktop,
+                other => {
+                    return Err(format!(
+                        "unsupported supported-types override {other:?}; expected desktop"
+                    ));
+                }
+            },
+            "supported-audio-quality" => match normalize_override_key(value).as_str() {
+                "very-high" => {
+                    DevCapabilityOverride::SupportedAudioQuality(AudioQuality::VERY_HIGH)
+                }
+                "hifi" => DevCapabilityOverride::SupportedAudioQuality(AudioQuality::HIFI),
+                other => {
+                    return Err(format!(
+                        "unsupported supported-audio-quality override {other:?}; expected very-high or hifi"
+                    ));
+                }
+            },
+            other => return Err(format!("unknown capability override {other:?}")),
+        };
+        overrides.push(override_);
+    }
+    Ok(overrides)
+}
+
+fn normalize_override_key(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace('_', "-")
+}
+
+fn parse_override_bool(key: &str, value: &str) -> Result<bool, String> {
+    match normalize_override_key(value).as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!(
+            "override {key:?} has invalid boolean value {value:?}"
+        )),
+    }
+}
+
+fn desktop_supported_media_types() -> Vec<String> {
+    [
+        "audio/ad",
+        "audio/audio",
+        "audio/episode",
+        "audio/episode+track",
+        "audio/interruption",
+        "audio/local",
+        "audio/media",
+        "audio/podcast-chapter",
+        "audio/track",
+        "audio/user-highlight",
+        "video/ad",
+        "video/episode",
+        "video/podcast-chapter",
+        "video/track",
+        "video/user-highlight",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 /// Configuration of the connect device
@@ -139,6 +323,50 @@ impl ConnectState {
     pub fn new(cfg: ConnectConfig, session: &Session) -> Self {
         let volume_step_size = u16::MAX.checked_div(cfg.volume_steps).unwrap_or(1024);
 
+        let mut capabilities = Capabilities {
+            volume_steps: cfg.volume_steps.into(),
+            disable_volume: cfg.disable_volume,
+
+            gaia_eq_connect_id: true,
+            can_be_player: true,
+            needs_full_player_state: true,
+            is_observable: true,
+            is_controllable: true,
+            hidden: false,
+
+            supports_gzip_pushes: true,
+            // todo: enable after logout handling is implemented, see spirc logout_request
+            supports_logout: false,
+            supported_types: vec![
+                "audio/episode".into(),
+                "audio/track".into(),
+                "audio/local".into(),
+            ],
+            supports_playlist_v2: true,
+            supports_playlist_mixing: true,
+            supports_transfer_command: true,
+            supports_command_request: true,
+            supports_set_options_command: true,
+
+            is_voice_enabled: false,
+            restrict_to_local: false,
+            connect_disabled: false,
+            supports_rename: false,
+            supports_external_episodes: false,
+            supports_set_backend_metadata: false,
+            supports_hifi: MessageField::none(),
+            // that "AI" dj thingy only available to specific regions/users
+            supports_dj: false,
+            supports_rooms: false,
+            // AudioQuality::HIFI is available, further investigation necessary
+            supported_audio_quality: EnumOrUnknown::new(AudioQuality::VERY_HIGH),
+
+            command_acks: true,
+
+            ..Default::default()
+        };
+        apply_dev_connect_capability_overrides(&mut capabilities);
+
         let device_info = DeviceInfo {
             can_play: true,
             volume: cfg.initial_volume.into(),
@@ -149,48 +377,7 @@ impl ConnectState {
             spirc_version: version::SPOTIFY_SPIRC_VERSION.to_string(),
             client_id: session.client_id(),
             is_group: cfg.is_group,
-            capabilities: MessageField::some(Capabilities {
-                volume_steps: cfg.volume_steps.into(),
-                disable_volume: cfg.disable_volume,
-
-                gaia_eq_connect_id: true,
-                can_be_player: true,
-                needs_full_player_state: true,
-                is_observable: true,
-                is_controllable: true,
-                hidden: false,
-
-                supports_gzip_pushes: true,
-                // todo: enable after logout handling is implemented, see spirc logout_request
-                supports_logout: false,
-                supported_types: vec![
-                    "audio/episode".into(),
-                    "audio/track".into(),
-                    "audio/local".into(),
-                ],
-                supports_playlist_v2: true,
-                supports_playlist_mixing: true,
-                supports_transfer_command: true,
-                supports_command_request: true,
-                supports_set_options_command: true,
-
-                is_voice_enabled: false,
-                restrict_to_local: false,
-                connect_disabled: false,
-                supports_rename: false,
-                supports_external_episodes: false,
-                supports_set_backend_metadata: false,
-                supports_hifi: MessageField::none(),
-                // that "AI" dj thingy only available to specific regions/users
-                supports_dj: false,
-                supports_rooms: false,
-                // AudioQuality::HIFI is available, further investigation necessary
-                supported_audio_quality: EnumOrUnknown::new(AudioQuality::VERY_HIGH),
-
-                command_acks: true,
-
-                ..Default::default()
-            }),
+            capabilities: MessageField::some(capabilities),
             ..Default::default()
         };
 
@@ -499,5 +686,101 @@ impl ConnectState {
             .spclient()
             .put_connect_state_request(&self.request)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn baseline_capabilities() -> Capabilities {
+        Capabilities {
+            supports_dj: false,
+            supports_set_backend_metadata: false,
+            needs_full_player_state: true,
+            supports_external_episodes: false,
+            supports_logout: false,
+            supported_types: vec![
+                "audio/episode".into(),
+                "audio/track".into(),
+                "audio/local".into(),
+            ],
+            supported_audio_quality: EnumOrUnknown::new(AudioQuality::VERY_HIGH),
+            supports_hifi: MessageField::none(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn dev_capability_override_spec_changes_only_named_capabilities() {
+        let mut capabilities = baseline_capabilities();
+
+        apply_dev_connect_capability_override_spec(
+            &mut capabilities,
+            "supports-dj=1,supports-set-backend-metadata=1,needs-full-player-state=0",
+        )
+        .expect("valid override");
+
+        assert!(capabilities.supports_dj);
+        assert!(capabilities.supports_set_backend_metadata);
+        assert!(!capabilities.needs_full_player_state);
+        assert!(!capabilities.supports_external_episodes);
+        assert_eq!(
+            capabilities.supported_types,
+            ["audio/episode", "audio/track", "audio/local"]
+        );
+    }
+
+    #[test]
+    fn dev_capability_override_spec_can_advertise_desktop_media_shape() {
+        let mut capabilities = baseline_capabilities();
+
+        apply_dev_connect_capability_override_spec(
+            &mut capabilities,
+            "supports-external-episodes=1,supports-logout=1,supported-types=desktop,supported-audio-quality=hifi,supports-hifi=1",
+        )
+        .expect("valid override");
+
+        assert!(capabilities.supports_external_episodes);
+        assert!(capabilities.supports_logout);
+        assert_eq!(
+            capabilities.supported_types,
+            [
+                "audio/ad",
+                "audio/audio",
+                "audio/episode",
+                "audio/episode+track",
+                "audio/interruption",
+                "audio/local",
+                "audio/media",
+                "audio/podcast-chapter",
+                "audio/track",
+                "audio/user-highlight",
+                "video/ad",
+                "video/episode",
+                "video/podcast-chapter",
+                "video/track",
+                "video/user-highlight",
+            ]
+        );
+        assert_eq!(
+            capabilities.supported_audio_quality.enum_value(),
+            Ok(AudioQuality::HIFI)
+        );
+        let supports_hifi = capabilities.supports_hifi.as_ref().expect("hifi support");
+        assert!(supports_hifi.fully_supported);
+        assert!(supports_hifi.user_eligible);
+        assert!(supports_hifi.device_supported);
+    }
+
+    #[test]
+    fn dev_capability_override_spec_rejects_unknown_tokens() {
+        let mut capabilities = baseline_capabilities();
+
+        let error =
+            apply_dev_connect_capability_override_spec(&mut capabilities, "supports-dj=1,typo=1")
+                .expect_err("unknown override token must fail");
+
+        assert!(error.contains("typo"));
     }
 }

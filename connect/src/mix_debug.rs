@@ -8,11 +8,13 @@ use crate::protocol::{
 };
 use protobuf::Message;
 use std::collections::{BTreeSet, HashMap};
+use std::env;
 
 const PREFIX: &str = "[spotify-mix-debug]";
 const TRACK_LIMIT: usize = 8;
 const RECIPE_ATTRIBUTE: &str = "automix.auto_transition_recipe";
 const BACKEND_RECIPE_ATTRIBUTE: &str = "automix.backend_auto_transition";
+const DEV_DUMP_MATERIALIZED_METADATA_ENV: &str = "LIBRESPOT_DEV_DUMP_MATERIALIZED_METADATA";
 
 pub(crate) fn log_cluster(source: &str, cluster: &Cluster) {
     if !enabled() {
@@ -231,6 +233,7 @@ pub(crate) fn log_context_track_before_conversion(track: &ContextTrack) {
         "[spotify-mix] raw ContextTrack field_names={fields:?} metadata_keys={:?}",
         keys(&track.metadata)
     );
+    log_materialized_metadata_values("raw ContextTrack", &track.metadata);
     // ContextTrack has no format-list-attribute field in the current schema.
     debug!("[spotify-mix] raw ContextTrack format_attribute_keys=[]");
     debug!(
@@ -250,6 +253,7 @@ fn log_context_track(label: &str, index: usize, track: &ContextTrack) {
         track.metadata.contains_key(RECIPE_ATTRIBUTE),
         track.metadata.contains_key(BACKEND_RECIPE_ATTRIBUTE)
     );
+    log_materialized_metadata_values(label, &track.metadata);
     unknown("context track", track);
 }
 
@@ -262,7 +266,41 @@ fn log_provided_track(label: &str, index: usize, track: &ProvidedTrack) {
         track.metadata.contains_key(RECIPE_ATTRIBUTE),
         track.metadata.contains_key(BACKEND_RECIPE_ATTRIBUTE)
     );
+    log_materialized_metadata_values(label, &track.metadata);
     unknown("provided track", track);
+}
+
+fn log_materialized_metadata_values(label: &str, metadata: &HashMap<String, String>) {
+    if !dev_dump_materialized_metadata_enabled() {
+        return;
+    }
+
+    let mut values = metadata
+        .iter()
+        .filter(|(key, _)| is_materialized_metadata_key(key))
+        .map(|(key, value)| format!("{}={}", safe_metadata_key(key), safe_metadata_value(value)))
+        .collect::<Vec<_>>();
+    values.sort();
+    values.truncate(128);
+    if !values.is_empty() {
+        debug!("{PREFIX} {label} materialized_metadata_values={values:?}");
+    }
+}
+
+fn is_materialized_metadata_key(key: &str) -> bool {
+    key.starts_with("audio.")
+        || matches!(
+            key,
+            "automix.auto_preset_id"
+                | "automix.mode"
+                | "automix.transition_uri"
+                | "automix.fade_in_cuepoint.origin"
+                | "automix.fade_in_cuepoint.position"
+                | "automix.fade_in_cuepoint.tempo"
+                | "automix.fade_out_cuepoint.origin"
+                | "automix.fade_out_cuepoint.position"
+                | "automix.fade_out_cuepoint.tempo"
+        )
 }
 
 fn unknown<M: Message>(label: &str, message: &M) {
@@ -283,17 +321,37 @@ fn unknown<M: Message>(label: &str, message: &M) {
 fn keys<V>(map: &HashMap<String, V>) -> Vec<String> {
     let mut keys = map
         .keys()
-        .map(|key| {
-            if key.len() <= 96 && !key.chars().any(char::is_control) {
-                key.clone()
-            } else {
-                "<invalid-key>".into()
-            }
-        })
+        .map(|key| safe_metadata_key(key).into_owned())
         .collect::<Vec<_>>();
     keys.sort();
     keys.truncate(128);
     keys
+}
+
+fn safe_metadata_key(value: &str) -> std::borrow::Cow<'_, str> {
+    if value.len() <= 96 && !value.chars().any(char::is_control) {
+        value.into()
+    } else {
+        "<invalid-key>".into()
+    }
+}
+
+fn safe_metadata_value(value: &str) -> String {
+    let mut sanitized = value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    if sanitized.len() > 2048 {
+        sanitized.truncate(2048);
+        sanitized.push_str("<truncated>");
+    }
+    sanitized
 }
 
 fn safe(value: Option<&str>) -> String {
@@ -318,6 +376,10 @@ fn enabled() -> bool {
     log::log_enabled!(log::Level::Debug)
 }
 
+fn dev_dump_materialized_metadata_enabled() -> bool {
+    env::var(DEV_DUMP_MATERIALIZED_METADATA_ENV).as_deref() == Ok("1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +399,24 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(description, ["99:LengthDelimited"]);
         assert!(!description.join(" ").contains("must-not-be-logged"));
+    }
+
+    #[test]
+    fn materialized_metadata_key_filter_is_narrow() {
+        assert!(is_materialized_metadata_key("audio.fade_overlap"));
+        assert!(is_materialized_metadata_key("automix.transition_uri"));
+        assert!(is_materialized_metadata_key("automix.auto_preset_id"));
+        assert!(!is_materialized_metadata_key("added_by_username"));
+        assert!(!is_materialized_metadata_key("context_uri"));
+    }
+
+    #[test]
+    fn metadata_value_sanitizer_removes_controls_and_truncates() {
+        let clean = safe_metadata_value("spotify:core-auto-transition\nsecret");
+        assert_eq!(clean, "spotify:core-auto-transition secret");
+
+        let long = safe_metadata_value(&"a".repeat(3000));
+        assert!(long.ends_with("<truncated>"));
+        assert!(long.len() < 2100);
     }
 }
