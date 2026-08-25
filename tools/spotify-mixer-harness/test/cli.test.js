@@ -1,7 +1,11 @@
 const assert = require("assert");
 const test = require("node:test");
 
-const { DEFAULT_TEST_PAIR, buildControlExpression } = require("../bin/mixer-harness");
+const {
+  DEFAULT_TEST_PAIR,
+  buildControlExpression,
+  buildStageTraceControlExpression,
+} = require("../bin/mixer-harness");
 
 test("mute control expression does not require a URI", () => {
   assert.strictEqual(
@@ -63,5 +67,19 @@ test("transfer control expression requires a target device selector", () => {
   assert.strictEqual(
     buildControlExpression({ action: "transfer", deviceName: "spotifyd-transition DEV" }),
     "window.spotifyMixerOracle.controls.transfer({\"deviceName\":\"spotifyd-transition DEV\"})",
+  );
+});
+
+test("stage trace control expression targets the installed in-page tracer", () => {
+  assert.strictEqual(
+    buildStageTraceControlExpression({ action: "snapshot" }),
+    "window.spotifyMixerStageTracer.snapshot()",
+  );
+});
+
+test("stage trace control expression rejects unknown actions", () => {
+  assert.throws(
+    () => buildStageTraceControlExpression({ action: "play-context" }),
+    /unknown stage trace action/,
   );
 });

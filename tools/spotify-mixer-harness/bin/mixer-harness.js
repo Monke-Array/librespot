@@ -19,6 +19,7 @@ const {
   writeJson,
 } = require("../lib/corpus");
 const { summarizeCoverage } = require("../lib/report");
+const { sanitizeForCorpus } = require("../lib/sanitize");
 const { cargoBuildSpotifyd, runSpotifydFor } = require("../lib/spotifyd");
 const { parseSpotifydLog } = require("../lib/spotifyd-log");
 
@@ -124,12 +125,57 @@ function installOracle(options) {
   return { started, installed };
 }
 
+function installStageTracer(options) {
+  const expressionPath = path.join(repoRoot(), "tools", "spotify-mixer-harness", "xpui", "stage-tracer.js");
+  return evaluateWithPowerShell({
+    repoRoot: repoRoot(),
+    port: Number(options.port ?? 9222),
+    expressionPath,
+  });
+}
+
 function xpuiEval(options, expression) {
   return evaluateWithPowerShell({
     repoRoot: repoRoot(),
     port: Number(options.port ?? 9222),
     expression,
   });
+}
+
+function buildStageTraceControlExpression(options) {
+  const action = requireString(options, "action");
+  if (!/^(?:start|stop|clear|snapshot|status|exportTrace)$/.test(action)) {
+    throw new Error(`unknown stage trace action: ${action}`);
+  }
+  if (action === "exportTrace") return "window.spotifyMixerStageTracer.exportTrace()";
+  return `window.spotifyMixerStageTracer.${action}()`;
+}
+
+function stageTraceExport(options) {
+  const trace = xpuiEval(options, buildStageTraceControlExpression({ action: "exportTrace" }));
+  const sanitized = sanitizeForCorpus(trace);
+  const output = {
+    format: "spotify-mixer-stage-trace-report-v1",
+    capturedAt: new Date().toISOString(),
+    source: {
+      client: "official Spotify Desktop XPUI via CDP",
+      port: Number(options.port ?? 9222),
+    },
+    redactedPaths: sanitized.redactedPaths,
+    trace: sanitized.value,
+  };
+  const corpusRoot = String(options.corpus ?? defaultCorpusRoot());
+  const out = options.out
+    ? String(options.out)
+    : path.join(corpusSubdirs(corpusRoot).reports, `stage-trace-${timestampForFile()}.json`);
+  writeJson(out, output);
+  return {
+    out,
+    records: output.trace.records?.length ?? 0,
+    automixInvocations: output.trace.summary?.automixInvocations ?? 0,
+    edges: output.trace.summary?.edges?.length ?? 0,
+    summary: output.trace.summary,
+  };
 }
 
 function snapshotOfficial(options) {
@@ -494,6 +540,9 @@ Commands:
   targets --port 9222
   start-spotify --port 9222
   install-oracle --port 9222 [--start-spotify]
+  install-stage-tracer --port 9222
+  stage-trace-control --action start|stop|clear|snapshot|status --port 9222
+  stage-trace-export --port 9222 [--corpus PATH] [--out PATH]
   control-status --port 9222
   play-context --context-uri spotify:... [--skip-uri spotify:...] [--skip-index N] [--seek-ms N] [--paused]
   play-pair [--first-uri spotify:...] [--second-uri spotify:...] [--seek-near-transition]
@@ -526,6 +575,21 @@ Commands:
 
   if (command === "install-oracle") {
     printJson(installOracle(options));
+    return;
+  }
+
+  if (command === "install-stage-tracer") {
+    printJson(installStageTracer(options));
+    return;
+  }
+
+  if (command === "stage-trace-control") {
+    printJson(xpuiEval(options, buildStageTraceControlExpression(options)));
+    return;
+  }
+
+  if (command === "stage-trace-export") {
+    printJson(stageTraceExport(options));
     return;
   }
 
@@ -620,6 +684,7 @@ if (require.main === module) {
 module.exports = {
   DEFAULT_TEST_PAIR,
   buildControlExpression,
+  buildStageTraceControlExpression,
   capabilityDiff,
   capabilityExperiment,
 };
