@@ -2,9 +2,32 @@
   const FORMAT = "spotify-mixer-stage-trace-v1";
   const AUTOMIX_SERVICE = "spotify.automix.esperanto.proto.Automix";
   const CONTEXT_PLAYER_SERVICE = "spotify.player.esperanto.proto.ContextPlayer";
+  const CONTEXT_TRANSPORT_HOOK_VERSION = 2;
   const SENSITIVE_KEY = /authorization|cookie|credential|oauth|password|secret|session|token|email|account/i;
   const MIXER_KEY = /^(?:audio\.|automix\.|mix$|mix-|mixer_enabled|has-custom-transitions|can-view-transition|playlist\.revision)/;
   const CONTROL_FEATURE_ID = "spotify_mixer_stage_tracer";
+  const RAW_MIXER_FIELD = /\b(?:audio|automix)\.[A-Za-z0-9_.-]+/g;
+  const RAW_NEEDLES = [
+    "audio.",
+    "audio.fade_in_start_time",
+    "audio.fade_in_duration",
+    "audio.fade_out_start_time",
+    "audio.fade_out_duration",
+    "audio.fade_overlap",
+    "audio.fade_in_curves",
+    "audio.fade_out_curves",
+    "audio.speed_automation",
+    "audio.fade_in_eq_low_gain_curves",
+    "audio.fade_out_eq_low_gain_curves",
+    "audio.fade_in_filter_cutoff_curves",
+    "audio.fade_out_filter_cutoff_curves",
+    "audio.fade_in_filter_resonance_curves",
+    "audio.fade_out_filter_resonance_curves",
+    "automix.auto_preset_id",
+    "automix.transition_uri",
+    "automix.fade_in_cuepoint",
+    "automix.fade_out_cuepoint",
+  ];
 
   const textEncoder = new TextEncoder();
 
@@ -15,6 +38,128 @@
       binary += String.fromCharCode(...bytes.subarray(offset, offset + 32768));
     }
     return btoa(binary);
+  };
+
+  const bytesOf = (value) => {
+    if (value instanceof Uint8Array) return value;
+    if (value instanceof ArrayBuffer) return new Uint8Array(value);
+    return new Uint8Array(value ?? []);
+  };
+
+  const sanitizeSnippet = (value) => String(value)
+    .replace(/\bBearer\s+[-._~+/=A-Za-z0-9]+/g, "Bearer [REDACTED]")
+    .replace(/(authorization|cookie|credential|oauth|password|secret|session|token|email|account)[^,\n\r\t ]*/gi, "$1[REDACTED]");
+
+  const rawNeedleHits = (text) => Object.fromEntries(RAW_NEEDLES.map((needle) => {
+    const positions = [];
+    let cursor = 0;
+    while (positions.length < 5) {
+      const index = text.indexOf(needle, cursor);
+      if (index < 0) break;
+      positions.push(index);
+      cursor = index + needle.length;
+    }
+    return [needle, {
+      present: positions.length > 0,
+      positions,
+      snippets: positions.slice(0, 2).map((position) =>
+        sanitizeSnippet(text.slice(Math.max(0, position - 64), position + needle.length + 96))
+      ),
+    }];
+  }));
+
+  const rawMixerFieldNames = (text) => [...new Set(text.match(RAW_MIXER_FIELD) ?? [])].sort();
+
+  const rawTrackSegment = (text, uri) => {
+    if (!uri) return { found: false, segment: "" };
+    const start = text.indexOf(uri);
+    if (start < 0) return { found: false, segment: "" };
+    const nextTrack = text.indexOf("spotify:track:", start + uri.length);
+    const end = nextTrack >= 0 ? nextTrack : Math.min(text.length, start + 20000);
+    return {
+      found: true,
+      start,
+      end,
+      segment: text.slice(start, end),
+    };
+  };
+
+  const scanRawEdge = (text, edge) => {
+    const outgoing = rawTrackSegment(text, edge?.outgoingUri);
+    const incoming = rawTrackSegment(text, edge?.incomingUri);
+    const outgoingKeys = rawMixerFieldNames(outgoing.segment).filter(isOutgoingKey).sort();
+    const incomingKeys = rawMixerFieldNames(incoming.segment).filter(isIncomingKey).sort();
+    const directionalKeys = [...new Set([...outgoingKeys, ...incomingKeys])].sort();
+    return {
+      outgoing: {
+        uri: edge?.outgoingUri ?? null,
+        found: outgoing.found,
+        start: outgoing.found ? outgoing.start : null,
+        end: outgoing.found ? outgoing.end : null,
+        keys: outgoingKeys,
+      },
+      incoming: {
+        uri: edge?.incomingUri ?? null,
+        found: incoming.found,
+        start: incoming.found ? incoming.start : null,
+        end: incoming.found ? incoming.end : null,
+        keys: incomingKeys,
+      },
+      keys: directionalKeys,
+      groups: groupsForKeys(directionalKeys),
+    };
+  };
+
+  const scanRawBytes = (value, edge = null) => {
+    const bytes = bytesOf(value);
+    const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+    const fieldNames = rawMixerFieldNames(text);
+    const groups = groupsForKeys(fieldNames);
+    const output = {
+      byteLength: bytes.byteLength,
+      groups,
+      mixerFieldNames: fieldNames.slice(0, 120),
+      needleHits: rawNeedleHits(text),
+    };
+    if (edge?.outgoingUri && edge?.incomingUri) {
+      output.edgeDirectional = scanRawEdge(text, edge);
+    }
+    return output;
+  };
+
+  const decodeEsperantoEnvelope = (value) => {
+    const bytes = bytesOf(value);
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const decoder = new TextDecoder("utf-8", { fatal: false });
+    let offset = 0;
+    const readBytes = () => {
+      if (offset + 4 > bytes.byteLength) throw new Error("truncated length prefix");
+      const length = view.getInt32(offset);
+      offset += 4;
+      if (length < 0 || offset + length > bytes.byteLength) throw new Error("invalid length prefix");
+      const part = bytes.slice(offset, offset + length);
+      offset += length;
+      return part;
+    };
+    try {
+      const service = decoder.decode(readBytes());
+      const method = decoder.decode(readBytes());
+      const payload = readBytes();
+      return {
+        service,
+        method,
+        payloadByteLength: payload.byteLength,
+        payloadScan: scanRawBytes(payload),
+        requestByteLength: bytes.byteLength,
+      };
+    } catch (error) {
+      return {
+        service: null,
+        method: null,
+        requestByteLength: bytes.byteLength,
+        error: String(error),
+      };
+    }
   };
 
   const normalize = (value, depth = 0, seen = new WeakSet()) => {
@@ -239,6 +384,10 @@
     : null;
 
   const STAGE_RANK = {
+    "context-player-native-bridge-request": 5,
+    "context-player-native-bridge-response-raw": 6,
+    "context-player-transport-request": 7,
+    "context-player-transport-response-raw": 8,
     "context-player-state-stream": 10,
     "context-player-queue-stream": 20,
     "automix-method-request": 30,
@@ -314,6 +463,14 @@
     if (!playerApi) throw new Error("official PlayerAPI is unavailable; install mixer oracle first");
     return playerApi;
   };
+
+  const edgeIdentityWithGroups = (edge, groups) => ({
+    outgoingUri: edge?.outgoingUri ?? null,
+    incomingUri: edge?.incomingUri ?? null,
+    outgoingUid: edge?.outgoingUid ?? null,
+    incomingUid: edge?.incomingUid ?? null,
+    groups: { ...(groups ?? {}) },
+  });
 
   const existing = window.spotifyMixerStageTracer;
   const tracer = existing ?? {
@@ -445,6 +602,142 @@
     return tracer.hooks.automix;
   };
 
+  const installContextPlayerTransportHook = () => {
+    const modules = window.__webpack_modules__ ?? {};
+    const require = installRspackRequire();
+    const transportModuleId = findModule(modules, (source) =>
+      source.includes("executeEsperantoCall") && source.includes("cancelEsperantoCall")
+    );
+    if (transportModuleId === null) {
+      tracer.hooks.contextPlayerTransport = { installed: false, reason: "Esperanto transport module not found" };
+      return tracer.hooks.contextPlayerTransport;
+    }
+
+    const Transport = require(transportModuleId).h6;
+    const playerEdge = () => summarizePlayerState(getPlayerApi()).edge;
+    const isGetQueue = (request) =>
+      request?.service === CONTEXT_PLAYER_SERVICE && request?.method === "GetQueue";
+
+    if (Transport.prototype.__spotifyStageTracerCallHookVersion !== CONTEXT_TRANSPORT_HOOK_VERSION) {
+      const originalCall = Transport.prototype.__spotifyStageTracerOriginalCall ?? Transport.prototype.call;
+      if (!Transport.prototype.__spotifyStageTracerOriginalCall) {
+        Object.defineProperty(Transport.prototype, "__spotifyStageTracerOriginalCall", {
+          value: originalCall,
+        });
+      }
+      Transport.prototype.call = originalCall;
+      Transport.prototype.call = function (request, persistent, onSuccess, onFailure) {
+        if (!isGetQueue(request)) {
+          return Transport.prototype.__spotifyStageTracerOriginalCall.call(this, request, persistent, onSuccess, onFailure);
+        }
+
+        const requestPayload = request?.payload ?? textEncoder.encode("");
+        const requestScan = scanRawBytes(requestPayload);
+        const requestRecord = record("context-player-transport-request", {
+          edge: edgeIdentityWithGroups(playerEdge(), requestScan.groups),
+          service: request.service,
+          method: request.method,
+          persistent: Boolean(persistent),
+          payload: requestScan,
+        });
+
+        return Transport.prototype.__spotifyStageTracerOriginalCall.call(
+          this,
+          request,
+          persistent,
+          (response) => {
+            const currentEdge = playerEdge();
+            const rawResponse = scanRawBytes(response, currentEdge);
+            const edgeGroups = rawResponse.edgeDirectional?.groups ?? rawResponse.groups;
+            record("context-player-transport-response-raw", {
+              edge: edgeIdentityWithGroups(currentEdge, edgeGroups),
+              service: request.service,
+              method: request.method,
+              persistent: Boolean(persistent),
+              requestSequence: requestRecord.sequence,
+              rawResponse,
+            });
+            return onSuccess(response);
+          },
+          onFailure,
+        );
+      };
+      Object.defineProperty(Transport.prototype, "__spotifyStageTracerCallHookVersion", {
+        value: CONTEXT_TRANSPORT_HOOK_VERSION,
+        configurable: true,
+      });
+    }
+
+    let nativeBridgeHook = false;
+    let nativeBridgeReason = null;
+    try {
+      const transport = getPlayerApi()?._contextPlayer?.transport;
+      if (!transport || typeof transport._onSend !== "function") {
+        nativeBridgeReason = "ContextPlayer transport _onSend is unavailable";
+      } else if (transport.__spotifyStageTracerOnSendHookVersion === CONTEXT_TRANSPORT_HOOK_VERSION) {
+        nativeBridgeHook = true;
+      } else {
+        const originalOnSend = transport.__spotifyStageTracerOriginalOnSend ?? transport._onSend;
+        if (!transport.__spotifyStageTracerOriginalOnSend) {
+          Object.defineProperty(transport, "__spotifyStageTracerOriginalOnSend", {
+            value: originalOnSend,
+          });
+        }
+        transport._onSend = originalOnSend;
+        transport._onSend = function (envelope) {
+          const decodedRequest = decodeEsperantoEnvelope(envelope?.request);
+          if (decodedRequest.service !== CONTEXT_PLAYER_SERVICE || decodedRequest.method !== "GetQueue") {
+            return originalOnSend.call(this, envelope);
+          }
+
+          const requestRecord = record("context-player-native-bridge-request", {
+            edge: edgeIdentityWithGroups(playerEdge(), decodedRequest.payloadScan?.groups ?? groupsForKeys([])),
+            service: decodedRequest.service,
+            method: decodedRequest.method,
+            persistent: Boolean(envelope?.persistent),
+            serializedRequest: decodedRequest,
+          });
+
+          const wrappedEnvelope = {
+            ...envelope,
+            onSuccess: (response) => {
+              const currentEdge = playerEdge();
+              const rawResponse = scanRawBytes(response, currentEdge);
+              const edgeGroups = rawResponse.edgeDirectional?.groups ?? rawResponse.groups;
+              record("context-player-native-bridge-response-raw", {
+                edge: edgeIdentityWithGroups(currentEdge, edgeGroups),
+                service: decodedRequest.service,
+                method: decodedRequest.method,
+                persistent: Boolean(envelope?.persistent),
+                requestSequence: requestRecord.sequence,
+                rawResponse,
+              });
+              return envelope.onSuccess(response);
+            },
+          };
+
+          return originalOnSend.call(this, wrappedEnvelope);
+        };
+        Object.defineProperty(transport, "__spotifyStageTracerOnSendHookVersion", {
+          value: CONTEXT_TRANSPORT_HOOK_VERSION,
+          configurable: true,
+        });
+        nativeBridgeHook = true;
+      }
+    } catch (error) {
+      nativeBridgeReason = String(error);
+    }
+
+    tracer.hooks.contextPlayerTransport = {
+      installed: true,
+      transportModuleId,
+      callHook: true,
+      nativeBridgeHook,
+      nativeBridgeReason,
+    };
+    return tracer.hooks.contextPlayerTransport;
+  };
+
   const installPlayerEventHook = () => {
     const playerApi = getPlayerApi();
     const emitter = playerApi?._events?._emitter;
@@ -497,6 +790,7 @@
   tracer.start = () => {
     const playerApi = getPlayerApi();
     installAutomixHooks();
+    installContextPlayerTransportHook();
     installPlayerEventHook();
     cancelStreams();
     tracer.handles.push(playerApi._contextPlayer.getState({}, (message) => {
@@ -567,6 +861,7 @@
 
   window.spotifyMixerStageTracer = tracer;
   installAutomixHooks();
+  installContextPlayerTransportHook();
   installPlayerEventHook();
 
   return {
