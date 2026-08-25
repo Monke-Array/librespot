@@ -8,6 +8,12 @@ const { ensureDir, timestampForFile, writeJson } = require("./corpus");
 const { sanitizeLogText } = require("./sanitize");
 const { parseSpotifydLog } = require("./spotifyd-log");
 
+const MATERIALIZED_BYPASS_ENV = {
+  LIBRESPOT_DEV_BYPASS_MATERIALIZED_EQ: "1",
+  LIBRESPOT_DEV_BYPASS_MATERIALIZED_FILTER: "1",
+  LIBRESPOT_DEV_DUMP_MATERIALIZED_METADATA: "1",
+};
+
 function cargoBuildSpotifyd({ spotifydRoot, features = "rodio_backend" }) {
   const result = spawnSync("cargo", ["build", "--no-default-features", "--features", features], {
     cwd: spotifydRoot,
@@ -41,6 +47,7 @@ function buildSpotifydArgs(options = {}) {
   if (options.cachePath) args.push("--cache-path", options.cachePath);
   if (options.initialVolume !== undefined) args.push("--initial-volume", String(options.initialVolume));
   if (options.volumeController) args.push("--volume-controller", options.volumeController);
+  if (options.deviceType) args.push("--device-type", options.deviceType);
   if (options.disableDiscovery) args.push("--disable-discovery");
   if (options.noAudioCache) args.push("--no-audio-cache");
   return args;
@@ -53,12 +60,17 @@ function runSpotifydFor({ spotifydRoot, outDir, durationMs = 60000, env = {}, ar
   }
   ensureDir(outDir);
   const startedAt = new Date();
+  const devEnv = Object.fromEntries(
+    Object.entries({
+      ...MATERIALIZED_BYPASS_ENV,
+      ...env,
+    }).filter(([key]) => key.startsWith("LIBRESPOT_DEV_")),
+  );
   const child = spawn(exe, args.length ? args : buildSpotifydArgs(options), {
     cwd: spotifydRoot,
     env: {
       ...process.env,
-      LIBRESPOT_DEV_BYPASS_MATERIALIZED_EQ: "1",
-      ...env,
+      ...devEnv,
     },
     windowsHide: true,
   });
@@ -89,9 +101,7 @@ function runSpotifydFor({ spotifydRoot, outDir, durationMs = 60000, env = {}, ar
         exitCode: code,
         signal,
         args: args.length ? args : buildSpotifydArgs(options),
-        env: {
-          LIBRESPOT_DEV_BYPASS_MATERIALIZED_EQ: "1",
-        },
+        env: devEnv,
         parsed,
         stdout: sanitizedStdout,
         stderr: sanitizedStderr,

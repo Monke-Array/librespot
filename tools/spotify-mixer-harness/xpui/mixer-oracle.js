@@ -422,21 +422,24 @@
     };
   };
 
-  const clickButton = (predicate) => {
-    const button = Array.from(document.querySelectorAll("button,[role='button']")).find((element) =>
+  const clickElement = (selector, predicate) => {
+    const element = Array.from(document.querySelectorAll(selector)).find((element) =>
       predicate({
         element,
         aria: element.getAttribute("aria-label") ?? "",
         testid: element.getAttribute("data-testid") ?? "",
         text: (element.innerText ?? element.textContent ?? "").trim(),
       }) &&
-      !element.disabled &&
+      !Boolean(element.disabled) &&
       element.getAttribute("aria-disabled") !== "true"
     );
-    if (!button) return false;
-    button.click();
+    if (!element) return false;
+    element.scrollIntoView?.({ block: "center" });
+    element.click();
     return true;
   };
+
+  const clickButton = (predicate) => clickElement("button,[role='button']", predicate);
 
   const requireOfficialPlayerApi = () => {
     const playerApi = findOfficialPlayerApi();
@@ -574,7 +577,7 @@
       const opened = clickButton(({ aria }) => /^connect to a device$/i.test(aria));
       if (!opened) throw new Error("Connect device picker button was not found");
       await sleep(1000);
-      const clicked = clickButton(({ text, aria }) =>
+      const clicked = clickElement("li,[role='listitem'],button,[role='button']", ({ text, aria }) =>
         (text && text.includes(options.deviceName)) || (aria && aria.includes(options.deviceName))
       );
       if (!clicked) throw new Error(`Connect device was not visible in the picker: ${options.deviceName}`);

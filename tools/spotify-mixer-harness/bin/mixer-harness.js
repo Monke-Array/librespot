@@ -6,6 +6,7 @@ const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
 
+const { buildCapabilityDiffReport, summarizeMixerEndpointStatus } = require("../lib/capabilities");
 const { evaluateWithPowerShell, listTargets } = require("../lib/cdp");
 const {
   attachClassification,
@@ -329,6 +330,7 @@ function classifyCorpus(options) {
   const classified = attachClassification(records, {
     localResult: localResult ?? {},
     devEqBypass: Boolean(options.devEqBypass),
+    devFilterBypass: Boolean(options.devFilterBypass),
   });
   const report = summarizeCoverage(classified);
   const out = options.out
@@ -339,6 +341,7 @@ function classifyCorpus(options) {
     generatedAt: new Date().toISOString(),
     corpusRoot,
     devEqBypass: Boolean(options.devEqBypass),
+    devFilterBypass: Boolean(options.devFilterBypass),
     report,
     records: classified,
   });
@@ -351,6 +354,7 @@ function compare(options) {
   const records = attachClassification(loadCorpusRecords(corpusRoot), {
     localResult,
     devEqBypass: Boolean(options.devEqBypass),
+    devFilterBypass: Boolean(options.devFilterBypass),
   });
   const report = summarizeCoverage(records);
   const out = options.out
@@ -361,11 +365,124 @@ function compare(options) {
     generatedAt: new Date().toISOString(),
     corpusRoot,
     spotifydRun: options.spotifydRun ?? null,
+    devEqBypass: Boolean(options.devEqBypass),
+    devFilterBypass: Boolean(options.devFilterBypass),
     localResult,
     report,
     records,
   });
   return { out, report };
+}
+
+function capabilityDiff(options) {
+  if (!options.spotifydRun) throw new Error("capability-diff requires --spotifyd-run PATH");
+  const corpusRoot = String(options.corpus ?? defaultCorpusRoot());
+  const run = readJson(String(options.spotifydRun));
+  const logText = `${run.stdout ?? ""}\n${run.stderr ?? ""}`;
+  const report = buildCapabilityDiffReport({
+    logText,
+    officialSource: options.officialSource && options.officialSource !== true ? String(options.officialSource) : undefined,
+    spotifydSource: options.spotifydSource && options.spotifydSource !== true ? String(options.spotifydSource) : undefined,
+  });
+  const out = options.out
+    ? String(options.out)
+    : path.join(corpusSubdirs(corpusRoot).reports, `capability-diff-${timestampForFile()}.json`);
+  writeJson(out, report);
+  return { out, differences: report.differences.length, report };
+}
+
+async function capabilityExperiment(options) {
+  const corpusRoot = String(options.corpus ?? defaultCorpusRoot());
+  const dirs = corpusSubdirs(corpusRoot);
+  const label = String(options.label ?? "capability-experiment");
+  const capabilityOverrides =
+    options.capabilityOverrides && options.capabilityOverrides !== true ? String(options.capabilityOverrides) : "";
+  const env = {};
+  if (capabilityOverrides) {
+    env.LIBRESPOT_DEV_CONNECT_CAPABILITY_OVERRIDES = capabilityOverrides;
+  }
+
+  const beforeStatus = xpuiEval(options, controlCall("status"));
+  const runPromise = runSpotifydFor({
+    spotifydRoot: requireString(options, "spotifydRoot"),
+    outDir: dirs.runs,
+    durationMs: Number(options.durationMs ?? 30000),
+    env,
+    options: {
+      deviceName: String(options.deviceName ?? "spotifyd-transition DEV"),
+      deviceType:
+        options.deviceType && options.deviceType !== true
+          ? String(options.deviceType)
+          : undefined,
+      backend: String(options.backend ?? "rodio"),
+      initialVolume: options.initialVolume === undefined ? 0 : Number(options.initialVolume),
+      volumeController: options.volumeController === undefined ? "none" : String(options.volumeController),
+      disableDiscovery: Boolean(options.disableDiscovery),
+      noAudioCache: Boolean(options.noAudioCache),
+    },
+  });
+
+  await sleep(Number(options.discoveryMs ?? 8000));
+  let transferResult = null;
+  let transferError = null;
+  try {
+    transferResult = xpuiEval(
+      options,
+      controlCall("transfer", {
+        deviceName: String(options.deviceName ?? "spotifyd-transition DEV"),
+      }),
+    );
+  } catch (error) {
+    transferError = String(error.stack ?? error.message ?? error);
+  }
+
+  await sleep(Number(options.settleMs ?? 4000));
+  let afterStatus = null;
+  let afterError = null;
+  try {
+    afterStatus = xpuiEval(options, controlCall("status"));
+  } catch (error) {
+    afterError = String(error.stack ?? error.message ?? error);
+  }
+
+  const runResult = await runPromise;
+  const result = {
+    format: "spotify-mixer-capability-experiment-v1",
+    generatedAt: new Date().toISOString(),
+    label,
+    capabilityOverrides,
+    deviceName: String(options.deviceName ?? "spotifyd-transition DEV"),
+    before: summarizeMixerEndpointStatus(beforeStatus),
+    transfer: {
+      ok: !transferError,
+      result: transferResult,
+      error: transferError,
+    },
+    after: afterStatus ? summarizeMixerEndpointStatus(afterStatus) : null,
+    afterError,
+    spotifydRun: runResult.file,
+    spotifyd: {
+      env: runResult.run.env,
+      parsed: runResult.run.parsed,
+      reason: runResult.run.reason,
+      exitCode: runResult.run.exitCode,
+      signal: runResult.run.signal,
+    },
+  };
+  const out = options.out
+    ? String(options.out)
+    : path.join(dirs.reports, `capability-experiment-${timestampForFile()}.json`);
+  writeJson(out, result);
+  return {
+    out,
+    spotifydRun: runResult.file,
+    label,
+    capabilityOverrides,
+    before: result.before,
+    transfer: result.transfer,
+    after: result.after,
+    spotifyd: result.spotifyd,
+  };
 }
 
 async function main() {
@@ -386,10 +503,13 @@ Commands:
   official-control --action status|mute|pause|next|seek|play-uri|play-context|play-pair|transfer [options]
   snapshot-official --port 9222 [--corpus PATH]
   sample-official --port 9222 [--corpus PATH] [--duration-ms N] [--interval-ms N] [--drive-current-context] [--advance]
-  classify-corpus [--corpus PATH] [--spotifyd-run PATH] [--dev-eq-bypass] [--out PATH]
+  classify-corpus [--corpus PATH] [--spotifyd-run PATH] [--dev-eq-bypass] [--dev-filter-bypass] [--out PATH]
   build-spotifyd --spotifyd-root PATH
   run-spotifyd --spotifyd-root PATH [--corpus PATH] [--duration-ms N] [--device-name NAME]
-  compare [--corpus PATH] --spotifyd-run PATH [--dev-eq-bypass] [--out PATH]
+    [--capability-overrides "supports-dj=1,..."] [--device-type computer]
+  compare [--corpus PATH] --spotifyd-run PATH [--dev-eq-bypass] [--dev-filter-bypass] [--out PATH]
+  capability-diff --spotifyd-run PATH [--corpus PATH] [--out PATH]
+  capability-experiment --spotifyd-root PATH [--label NAME] [--capability-overrides "supports-dj=1,..."] [--device-type computer]
 `);
     return;
   }
@@ -445,12 +565,21 @@ Commands:
   if (command === "run-spotifyd") {
     const corpusRoot = String(options.corpus ?? defaultCorpusRoot());
     const dirs = corpusSubdirs(corpusRoot);
+    const env = {};
+    if (options.capabilityOverrides && options.capabilityOverrides !== true) {
+      env.LIBRESPOT_DEV_CONNECT_CAPABILITY_OVERRIDES = String(options.capabilityOverrides);
+    }
     const result = await runSpotifydFor({
       spotifydRoot: requireString(options, "spotifydRoot"),
       outDir: dirs.runs,
       durationMs: Number(options.durationMs ?? 60000),
+      env,
       options: {
         deviceName: String(options.deviceName ?? "spotifyd-transition DEV"),
+        deviceType:
+          options.deviceType && options.deviceType !== true
+            ? String(options.deviceType)
+            : undefined,
         backend: String(options.backend ?? "rodio"),
         initialVolume: options.initialVolume === undefined ? 0 : Number(options.initialVolume),
         volumeController: options.volumeController === undefined ? "none" : String(options.volumeController),
@@ -468,6 +597,16 @@ Commands:
     return;
   }
 
+  if (command === "capability-diff") {
+    printJson(capabilityDiff(options));
+    return;
+  }
+
+  if (command === "capability-experiment") {
+    printJson(await capabilityExperiment(options));
+    return;
+  }
+
   throw new Error(`unknown command: ${command}`);
 }
 
@@ -481,4 +620,6 @@ if (require.main === module) {
 module.exports = {
   DEFAULT_TEST_PAIR,
   buildControlExpression,
+  capabilityDiff,
+  capabilityExperiment,
 };

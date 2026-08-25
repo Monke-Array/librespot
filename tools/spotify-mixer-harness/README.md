@@ -57,15 +57,16 @@ node tools\spotify-mixer-harness\bin\mixer-harness.js build-spotifyd --spotifyd-
 node tools\spotify-mixer-harness\bin\mixer-harness.js run-spotifyd --spotifyd-root C:\Users\janni\Desktop\Projects\spotifyd --duration-ms 60000 --device-name "spotifyd-transition DEV"
 ```
 
-`run-spotifyd` sets `LIBRESPOT_DEV_BYPASS_MATERIALIZED_EQ=1` for that process.
+`run-spotifyd` sets `LIBRESPOT_DEV_BYPASS_MATERIALIZED_EQ=1` and
+`LIBRESPOT_DEV_BYPASS_MATERIALIZED_FILTER=1` for that process.
 Use Spotify Desktop to transfer playback to `spotifyd-transition DEV` when XPUI
 device transfer is not available.
 
 Classify and compare:
 
 ```powershell
-node tools\spotify-mixer-harness\bin\mixer-harness.js classify-corpus --dev-eq-bypass
-node tools\spotify-mixer-harness\bin\mixer-harness.js compare --spotifyd-run tools\spotify-mixer-harness\corpus\runs\spotifyd-...json --dev-eq-bypass
+node tools\spotify-mixer-harness\bin\mixer-harness.js classify-corpus --dev-eq-bypass --dev-filter-bypass
+node tools\spotify-mixer-harness\bin\mixer-harness.js compare --spotifyd-run tools\spotify-mixer-harness\corpus\runs\spotifyd-...json --dev-eq-bypass --dev-filter-bypass
 ```
 
 ## Coverage Model
@@ -78,6 +79,8 @@ The report classifies each transition as:
 
 - `SUPPORTED`
 - `DEV-EQ-BYPASS`
+- `DEV-FILTER-BYPASS`
+- `DEV-EQ-FILTER-BYPASS`
 - `UNSUPPORTED-EQ`
 - `UNSUPPORTED-FILTER`
 - `UNSUPPORTED-FX`
