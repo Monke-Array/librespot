@@ -37,6 +37,7 @@ const AUTO_PRESET_ID: &str = "automix.auto_preset_id";
 const AUTOMIX_MODE: &str = "automix.mode";
 const TRANSITION_URI: &str = "automix.transition_uri";
 const DEV_BYPASS_MATERIALIZED_EQ_ENV: &str = "LIBRESPOT_DEV_BYPASS_MATERIALIZED_EQ";
+const DEV_BYPASS_MATERIALIZED_FILTER_ENV: &str = "LIBRESPOT_DEV_BYPASS_MATERIALIZED_FILTER";
 
 /// One control point in a materialized automation curve.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -138,17 +139,25 @@ pub struct MaterializedTransitionRenderOptions {
     /// Development-only escape hatch for rendering materialized timing, volume, and speed while
     /// Spotify EQ automation remains unimplemented.
     pub dev_bypass_materialized_eq: bool,
+    /// Development-only escape hatch for rendering materialized timing, volume, and speed while
+    /// Spotify filter cutoff/resonance automation remains unimplemented.
+    pub dev_bypass_materialized_filter: bool,
 }
 
 impl MaterializedTransitionRenderOptions {
     /// Read render options from process environment.
     pub fn from_environment() -> Self {
-        Self::from_dev_bypass_value(std::env::var_os(DEV_BYPASS_MATERIALIZED_EQ_ENV).as_deref())
+        Self::from_dev_bypass_values(
+            std::env::var_os(DEV_BYPASS_MATERIALIZED_EQ_ENV).as_deref(),
+            std::env::var_os(DEV_BYPASS_MATERIALIZED_FILTER_ENV).as_deref(),
+        )
     }
 
-    fn from_dev_bypass_value(value: Option<&OsStr>) -> Self {
+    fn from_dev_bypass_values(eq_value: Option<&OsStr>, filter_value: Option<&OsStr>) -> Self {
         Self {
-            dev_bypass_materialized_eq: value.is_some_and(|value| value == OsStr::new("1")),
+            dev_bypass_materialized_eq: eq_value.is_some_and(|value| value == OsStr::new("1")),
+            dev_bypass_materialized_filter: filter_value
+                .is_some_and(|value| value == OsStr::new("1")),
         }
     }
 }
@@ -251,7 +260,8 @@ impl MaterializedTransitionRenderPlan {
         if bypassed_eq_automation && !options.dev_bypass_materialized_eq {
             return Err(MaterializedTransitionRenderError::UnsupportedEqAutomation);
         }
-        if self.has_filter_automation() {
+        let bypassed_filter_automation = self.has_filter_automation();
+        if bypassed_filter_automation && !options.dev_bypass_materialized_filter {
             return Err(MaterializedTransitionRenderError::UnsupportedFilterAutomation);
         }
         if self.unsupported_effect_key.is_some() {
@@ -275,6 +285,11 @@ impl MaterializedTransitionRenderPlan {
         if bypassed_eq_automation {
             warn!(
                 "[spotify-mix] {DEV_BYPASS_MATERIALIZED_EQ_ENV}=1: ignoring Spotify materialized EQ automation for prototype rendering"
+            );
+        }
+        if bypassed_filter_automation {
+            warn!(
+                "[spotify-mix] {DEV_BYPASS_MATERIALIZED_FILTER_ENV}=1: ignoring Spotify materialized filter cutoff/resonance automation for prototype rendering"
             );
         }
         Ok(match incoming_speed {
@@ -756,6 +771,65 @@ mod tests {
             ]
         }
     ]"#;
+    const CAPTURED_FILTER_OUT_CUTOFF_CURVE: &str = r#"[
+        {
+            "start_point": 0,
+            "end_point": 0.5,
+            "fade_curve": [
+                {"x":0,"y":0.5},
+                {"x":1,"y":0.5}
+            ]
+        },
+        {
+            "start_point": 0.5,
+            "end_point": 1,
+            "fade_curve": [
+                {"x":0,"y":0.5},
+                {"x":0,"y":0.5},
+                {"x":1,"y":1},
+                {"x":1,"y":1}
+            ]
+        }
+    ]"#;
+    const CAPTURED_FILTER_IN_CUTOFF_CURVE: &str = r#"[
+        {
+            "start_point": 0,
+            "end_point": 0.5,
+            "fade_curve": [
+                {"x":0,"y":1},
+                {"x":0,"y":1},
+                {"x":1,"y":0.5},
+                {"x":1,"y":0.5}
+            ]
+        },
+        {
+            "start_point": 0.5,
+            "end_point": 1,
+            "fade_curve": [
+                {"x":0,"y":0.5},
+                {"x":1,"y":0.5}
+            ]
+        }
+    ]"#;
+    const CAPTURED_FILTER_RESONANCE_CURVE: &str = r#"[
+        {
+            "start_point": 0,
+            "end_point": 1,
+            "fade_curve": [
+                {"x":0,"y":0.5},
+                {"x":1,"y":0.5}
+            ]
+        }
+    ]"#;
+    const MALFORMED_FILTER_CURVE: &str = r#"[
+        {
+            "start_point": 0,
+            "end_point": 1,
+            "fade_curve": [
+                {"x":0,"y":0.5}
+            ]
+        }
+    ]"#;
 
     fn track(uri: &str, metadata: &[(&str, &str)]) -> ProvidedTrack {
         ProvidedTrack {
@@ -828,6 +902,68 @@ mod tests {
         incoming
     }
 
+    fn outgoing_without_eq() -> ProvidedTrack {
+        let mut outgoing = outgoing();
+        outgoing.metadata.remove(FADE_OUT_EQ_LOW_GAIN_CURVES);
+        outgoing
+    }
+
+    fn filter_pair_without_eq() -> (ProvidedTrack, ProvidedTrack) {
+        let mut outgoing = outgoing_without_eq();
+        outgoing.metadata.insert(
+            FADE_OUT_FILTER_CUTOFF_CURVES.to_owned(),
+            CAPTURED_FILTER_OUT_CUTOFF_CURVE.to_owned(),
+        );
+        outgoing.metadata.insert(
+            FADE_OUT_FILTER_RESONANCE_CURVES.to_owned(),
+            CAPTURED_FILTER_RESONANCE_CURVE.to_owned(),
+        );
+
+        let mut incoming = incoming();
+        incoming.metadata.insert(
+            FADE_IN_FILTER_CUTOFF_CURVES.to_owned(),
+            CAPTURED_FILTER_IN_CUTOFF_CURVE.to_owned(),
+        );
+        incoming.metadata.insert(
+            FADE_IN_FILTER_RESONANCE_CURVES.to_owned(),
+            CAPTURED_FILTER_RESONANCE_CURVE.to_owned(),
+        );
+
+        (outgoing, incoming)
+    }
+
+    fn filter_pair_with_all_eq_bands() -> (ProvidedTrack, ProvidedTrack) {
+        let (mut outgoing, mut incoming) = filter_pair_without_eq();
+        for (key, value) in outgoing_with_all_eq_bands().metadata {
+            outgoing.metadata.insert(key, value);
+        }
+        for (key, value) in incoming_with_all_eq_bands().metadata {
+            incoming.metadata.insert(key, value);
+        }
+        (outgoing, incoming)
+    }
+
+    #[test]
+    fn render_options_parse_eq_and_filter_dev_bypass_values() {
+        assert_eq!(
+            MaterializedTransitionRenderOptions::from_dev_bypass_values(
+                Some(OsStr::new("1")),
+                Some(OsStr::new("1")),
+            ),
+            MaterializedTransitionRenderOptions {
+                dev_bypass_materialized_eq: true,
+                dev_bypass_materialized_filter: true,
+            }
+        );
+        assert_eq!(
+            MaterializedTransitionRenderOptions::from_dev_bypass_values(
+                Some(OsStr::new("true")),
+                Some(OsStr::new("0")),
+            ),
+            MaterializedTransitionRenderOptions::default()
+        );
+    }
+
     #[test]
     fn known_eq_bearing_pair_remains_rejected_without_dev_bypass() {
         let plan = materialized_transition_plan_for_pair(&outgoing(), &incoming())
@@ -858,6 +994,7 @@ mod tests {
         let transition = plan
             .to_transition_plan_with_options(MaterializedTransitionRenderOptions {
                 dev_bypass_materialized_eq: true,
+                dev_bypass_materialized_filter: false,
             })
             .unwrap();
 
@@ -876,22 +1013,68 @@ mod tests {
     }
 
     #[test]
-    fn dev_eq_bypass_does_not_allow_filter_automation() {
-        let mut outgoing = outgoing_with_all_eq_bands();
-        outgoing.metadata.insert(
-            FADE_OUT_FILTER_CUTOFF_CURVES.to_owned(),
-            CAPTURED_LOW_EQ_SEGMENTED_CURVE.to_owned(),
-        );
-        let plan = materialized_transition_plan_for_pair(&outgoing, &incoming_with_all_eq_bands())
+    fn filter_bearing_transition_remains_rejected_without_filter_bypass() {
+        let (outgoing, incoming) = filter_pair_without_eq();
+        let plan = materialized_transition_plan_for_pair(&outgoing, &incoming)
             .unwrap()
             .unwrap();
+        assert!(plan.outgoing_filter_cutoff.is_some());
+        assert!(plan.outgoing_filter_resonance.is_some());
+        assert!(plan.incoming_filter_cutoff.is_some());
+        assert!(plan.incoming_filter_resonance.is_some());
 
         assert_eq!(
             plan.to_transition_plan_with_options(MaterializedTransitionRenderOptions {
                 dev_bypass_materialized_eq: true,
+                dev_bypass_materialized_filter: false,
             }),
             Err(MaterializedTransitionRenderError::UnsupportedFilterAutomation)
         );
+    }
+
+    #[test]
+    fn dev_filter_bypass_allows_filter_bearing_volume_and_speed_plan() {
+        let (outgoing, incoming) = filter_pair_without_eq();
+        let plan = materialized_transition_plan_for_pair(&outgoing, &incoming)
+            .unwrap()
+            .unwrap();
+
+        let transition = plan
+            .to_transition_plan_with_options(MaterializedTransitionRenderOptions {
+                dev_bypass_materialized_eq: false,
+                dev_bypass_materialized_filter: true,
+            })
+            .unwrap();
+
+        assert_eq!(transition.current_start(), Duration::from_millis(208_960));
+        assert_eq!(transition.next_start(), Duration::from_millis(2_763));
+        assert_eq!(transition.duration(), Duration::from_millis(6_090));
+        let speed = transition.next_speed_automation().unwrap();
+        assert_eq!(speed.points().len(), 21);
+        assert_eq!(speed.points()[0].speed, 0.90312);
+        assert_eq!(speed.points()[20].speed, 1.0);
+    }
+
+    #[test]
+    fn dev_eq_and_filter_bypass_compose_for_filter_and_eq_bearing_plan() {
+        let (outgoing, incoming) = filter_pair_with_all_eq_bands();
+        let plan = materialized_transition_plan_for_pair(&outgoing, &incoming)
+            .unwrap()
+            .unwrap();
+        assert!(plan.has_eq_automation());
+        assert!(plan.has_filter_automation());
+
+        let transition = plan
+            .to_transition_plan_with_options(MaterializedTransitionRenderOptions {
+                dev_bypass_materialized_eq: true,
+                dev_bypass_materialized_filter: true,
+            })
+            .unwrap();
+
+        assert_eq!(transition.current_start(), Duration::from_millis(208_960));
+        assert_eq!(transition.next_start(), Duration::from_millis(2_763));
+        assert_eq!(transition.duration(), Duration::from_millis(6_090));
+        assert!(transition.next_speed_automation().is_some());
     }
 
     #[test]
@@ -908,9 +1091,77 @@ mod tests {
         assert_eq!(
             plan.to_transition_plan_with_options(MaterializedTransitionRenderOptions {
                 dev_bypass_materialized_eq: true,
+                dev_bypass_materialized_filter: false,
             }),
             Err(MaterializedTransitionRenderError::UnsupportedEffectAutomation)
         );
+    }
+
+    #[test]
+    fn dev_eq_and_filter_bypass_do_not_allow_unknown_effect_automation() {
+        let (mut outgoing, incoming) = filter_pair_with_all_eq_bands();
+        outgoing.metadata.insert(
+            "audio.fade_out_reverb_dry_wet_curves".to_owned(),
+            CAPTURED_LOW_EQ_SEGMENTED_CURVE.to_owned(),
+        );
+        let plan = materialized_transition_plan_for_pair(&outgoing, &incoming)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            plan.to_transition_plan_with_options(MaterializedTransitionRenderOptions {
+                dev_bypass_materialized_eq: true,
+                dev_bypass_materialized_filter: true,
+            }),
+            Err(MaterializedTransitionRenderError::UnsupportedEffectAutomation)
+        );
+    }
+
+    #[test]
+    fn dev_filter_bypass_keeps_timing_and_speed_validation_closed() {
+        let (outgoing, incoming) = filter_pair_without_eq();
+        let mut plan = materialized_transition_plan_for_pair(&outgoing, &incoming)
+            .unwrap()
+            .unwrap();
+        plan.incoming_speed.clear();
+
+        assert_eq!(
+            plan.to_transition_plan_with_options(MaterializedTransitionRenderOptions {
+                dev_bypass_materialized_eq: false,
+                dev_bypass_materialized_filter: true,
+            }),
+            Err(MaterializedTransitionRenderError::UnsupportedTiming)
+        );
+
+        let mut plan = materialized_transition_plan_for_pair(&outgoing, &incoming)
+            .unwrap()
+            .unwrap();
+        plan.incoming_speed[0].speed = 5.0;
+
+        assert_eq!(
+            plan.to_transition_plan_with_options(MaterializedTransitionRenderOptions {
+                dev_bypass_materialized_eq: false,
+                dev_bypass_materialized_filter: true,
+            }),
+            Err(MaterializedTransitionRenderError::UnsupportedSpeedAutomation)
+        );
+    }
+
+    #[test]
+    fn dev_filter_bypass_does_not_allow_malformed_filter_curves() {
+        let mut outgoing = outgoing_without_eq();
+        outgoing.metadata.insert(
+            FADE_OUT_FILTER_CUTOFF_CURVES.to_owned(),
+            MALFORMED_FILTER_CURVE.to_owned(),
+        );
+
+        assert!(matches!(
+            materialized_transition_plan_for_pair(&outgoing, &incoming()),
+            Err(MaterializedTransitionError::InvalidJson {
+                key: FADE_OUT_FILTER_CUTOFF_CURVES,
+                ..
+            })
+        ));
     }
 
     #[test]
