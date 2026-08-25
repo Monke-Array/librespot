@@ -2,13 +2,14 @@ use std::{collections::BTreeSet, time::Duration};
 
 use data_encoding::BASE64;
 use librespot_playback::{
-    GainCurve, GainCurveSegment, GainPoint, TransitionPlan, TransitionPlanError,
+    GainCurve, GainCurveSegment, GainPoint, SpeedAutomation, SpeedPoint, TransitionPlan,
+    TransitionPlanError,
 };
 use librespot_protocol::{
     automix_transition::{CurveSet, Overlap, Preset, Transition},
     player::ProvidedTrack,
 };
-use protobuf::{Message, MessageField};
+use protobuf::Message;
 use thiserror::Error;
 
 pub(crate) const RECIPE_ATTRIBUTE: &str = "automix.auto_transition_recipe";
@@ -74,6 +75,7 @@ impl SpotifyTransitionRecipe {
         Ok(recipe)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_local_auto(
         outgoing: &ProvidedTrack,
         incoming: &ProvidedTrack,
@@ -95,7 +97,7 @@ impl SpotifyTransitionRecipe {
         let duration_bars = i32::try_from(overlap.duration_bars)
             .map_err(|_| SpotifyTransitionError::InvalidDuration)?;
         let transition = Transition {
-            overlap: MessageField::some(Overlap {
+            overlap: protobuf::MessageField::some(Overlap {
                 track_a_row_id: (!outgoing.uid.is_empty()).then(|| outgoing.uid.clone()),
                 track_b_row_id: (!incoming.uid.is_empty()).then(|| incoming.uid.clone()),
                 start_a_ms: Some(start_a_ms),
@@ -115,7 +117,7 @@ impl SpotifyTransitionRecipe {
                 item_speed_b: Some(f64::from(item_speed_b)),
                 ..Default::default()
             }),
-            preset: MessageField::some(Preset {
+            preset: protobuf::MessageField::some(Preset {
                 id: Some(i32::from(preset_id)),
                 ..Default::default()
             }),
@@ -435,12 +437,51 @@ pub(crate) fn transition_plan_for_decoded_pair(
     transition_plan_for_decoded_pair_with_origin(outgoing, incoming, recipe, "saved", true)
 }
 
-pub(crate) fn transition_plan_for_local_auto_pair(
-    outgoing: &ProvidedTrack,
-    incoming: &ProvidedTrack,
-    recipe: &SpotifyTransitionRecipe,
-) -> Option<TransitionPlan> {
-    transition_plan_for_decoded_pair_with_origin(outgoing, incoming, recipe, "local Auto", false)
+pub(crate) fn transition_plan_for_local_auto_transition(
+    transition: &crate::spotify_auto_mix::AutoRankedTransition,
+) -> Result<TransitionPlan, SpotifyTransitionError> {
+    let overlap = transition.overlap;
+    if overlap.duration_ms <= 0 || overlap.start_a_ms < 0 || overlap.start_b_ms < 0 {
+        return Err(SpotifyTransitionError::InvalidDuration);
+    }
+    if !overlap.speed_a.is_finite()
+        || !overlap.speed_b.is_finite()
+        || overlap.speed_a <= 0.0
+        || overlap.speed_b <= 0.0
+    {
+        return Err(SpotifyTransitionError::InvalidAnalysisValue);
+    }
+    if (overlap.speed_a - 1.0).abs() > ITEM_SPEED_TOLERANCE as f32 {
+        return Err(SpotifyTransitionError::UnsupportedTempo(
+            "speedA",
+            overlap.speed_a,
+        ));
+    }
+
+    let mut plan = TransitionPlan::new(
+        Duration::from_millis(u64::try_from(overlap.start_a_ms).unwrap()),
+        Duration::from_millis(u64::try_from(overlap.start_b_ms).unwrap()),
+        Duration::from_millis(u64::try_from(overlap.duration_ms).unwrap()),
+        linear_gain_curve(1.0, 0.0)?,
+        linear_gain_curve(0.0, 1.0)?,
+    )?;
+    if (overlap.speed_b - 1.0).abs() > ITEM_SPEED_TOLERANCE as f32 {
+        let speed = SpeedAutomation::new(vec![SpeedPoint {
+            from_position: Duration::from_millis(u64::try_from(overlap.start_b_ms).unwrap()),
+            speed: f64::from(overlap.speed_b),
+        }])
+        .map_err(|_| SpotifyTransitionError::UnsupportedTempo("speedB", overlap.speed_b))?;
+        plan = plan.with_next_speed_automation(speed);
+    }
+    Ok(plan)
+}
+
+fn linear_gain_curve(from: f64, to: f64) -> Result<GainCurve, TransitionPlanError> {
+    GainCurve::new(vec![GainCurveSegment {
+        start: 0.0,
+        end: 1.0,
+        points: vec![GainPoint { x: 0.0, y: from }, GainPoint { x: 1.0, y: to }],
+    }])
 }
 
 fn transition_plan_for_decoded_pair_with_origin(
@@ -521,6 +562,7 @@ mod tests {
     use super::*;
     use librespot_protocol::automix_transition::{Curve, CurvePoint, PresetType};
     use protobuf::{EnumOrUnknown, MessageField};
+    use serde_json::Value;
 
     const TRACK_A: &str = "spotify:track:2TpxZ7JUBn3uw46aR7qd6V";
     const TRACK_B: &str = "spotify:track:4uLU6hMCjMI75M1A2tKUQC";
@@ -643,6 +685,40 @@ mod tests {
         (outgoing, incoming)
     }
 
+    fn read_json(path: impl AsRef<std::path::Path>) -> Value {
+        let path = path.as_ref();
+        serde_json::from_str(
+            &std::fs::read_to_string(path)
+                .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display())),
+        )
+        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()))
+    }
+
+    fn required<'a>(value: &'a Value, key: &str) -> &'a Value {
+        value
+            .get(key)
+            .unwrap_or_else(|| panic!("fixture field {key:?} is missing from {value}"))
+    }
+
+    fn fixture_i64(value: &Value, key: &str) -> i64 {
+        required(value, key)
+            .as_i64()
+            .unwrap_or_else(|| panic!("fixture field {key:?} is not an integer in {value}"))
+    }
+
+    fn fixture_f32(value: &Value, key: &str) -> f32 {
+        required(value, key)
+            .as_f64()
+            .unwrap_or_else(|| panic!("fixture field {key:?} is not a number in {value}"))
+            as f32
+    }
+
+    fn fixture_bool(value: &Value, key: &str) -> bool {
+        required(value, key)
+            .as_bool()
+            .unwrap_or_else(|| panic!("fixture field {key:?} is not a bool in {value}"))
+    }
+
     #[test]
     fn base64_recipe_decodes_and_converts_to_plan() {
         let recipe = SpotifyTransitionRecipe::from_base64(&encoded(&transition()))
@@ -701,6 +777,109 @@ mod tests {
         assert!(overlap.is_beatmatched());
         assert_eq!(overlap.item_speed_a(), 1.25);
         assert_eq!(recipe.preset().unwrap().id(), 1);
+    }
+
+    #[test]
+    fn local_auto_transition_materializes_oracle_geometry_and_speed() {
+        let transition = crate::spotify_auto_mix::AutoRankedTransition {
+            overlap: crate::spotify_auto_mix::AutoTransitionOverlap {
+                start_a_ms: 208_960,
+                start_b_ms: 2_763,
+                duration_ms: 6_090,
+                duration_bars: 2,
+                speed_a: 1.0,
+                speed_b: 0.903_120_4,
+                is_beatmatched: true,
+            },
+            computed_score: 3.755_000_1,
+            components: None,
+            pareto_layer: Some(0),
+            ranked_presets: vec![crate::spotify_auto_mix::AutoRankedPreset {
+                preset_id: 1,
+                computed_score: 1.0,
+            }],
+        };
+
+        let plan = transition_plan_for_local_auto_transition(&transition)
+            .expect("oracle local Auto transition should materialize");
+
+        assert_eq!(plan.current_start(), Duration::from_millis(208_960));
+        assert_eq!(plan.next_start(), Duration::from_millis(2_763));
+        assert_eq!(plan.duration(), Duration::from_millis(6_090));
+        let speed = plan
+            .next_speed_automation()
+            .expect("non-1.0 speedB should be attached");
+        assert!((speed.speed_at(Duration::from_millis(2_763)) - 0.903_120_398_5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn top_ranked_oracle_beatmatched_local_auto_transitions_materialize() {
+        let oracle = read_json(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../tools/spotify-automix-oracle/get_computed_transitions_2026-08-14.json"),
+        );
+        let computed = required(
+            required(&oracle["runs"][0], "response"),
+            "computedTransitions",
+        )
+        .as_array()
+        .expect("computedTransitions must be an array");
+        let mut checked = 0;
+
+        for entry in computed {
+            let ranked = &required(entry, "rankedTransitions")
+                .as_array()
+                .expect("rankedTransitions must be an array")[0];
+            let overlap = required(ranked, "overlap");
+            if !fixture_bool(overlap, "isBeatmatched") {
+                continue;
+            }
+            let start_a_ms = fixture_i64(overlap, "startAMs");
+            let start_b_ms = fixture_i64(overlap, "startBMs");
+            let duration_ms = fixture_i64(overlap, "durationMs");
+            let speed_b = fixture_f32(overlap, "speedB");
+            let transition = crate::spotify_auto_mix::AutoRankedTransition {
+                overlap: crate::spotify_auto_mix::AutoTransitionOverlap {
+                    start_a_ms,
+                    start_b_ms,
+                    duration_ms,
+                    duration_bars: fixture_i64(overlap, "durationBars") as usize,
+                    speed_a: fixture_f32(overlap, "speedA"),
+                    speed_b,
+                    is_beatmatched: true,
+                },
+                computed_score: fixture_f32(ranked, "computedScore"),
+                components: None,
+                pareto_layer: Some(0),
+                ranked_presets: vec![crate::spotify_auto_mix::AutoRankedPreset {
+                    preset_id: fixture_i64(
+                        required(&required(ranked, "rankedPresets")[0], "preset"),
+                        "id",
+                    ) as u8,
+                    computed_score: 1.0,
+                }],
+            };
+
+            let plan = transition_plan_for_local_auto_transition(&transition)
+                .expect("top-ranked oracle beatmatch should materialize");
+            assert_eq!(
+                plan.current_start(),
+                Duration::from_millis(start_a_ms as u64)
+            );
+            assert_eq!(plan.next_start(), Duration::from_millis(start_b_ms as u64));
+            assert_eq!(plan.duration(), Duration::from_millis(duration_ms as u64));
+            let speed = plan
+                .next_speed_automation()
+                .expect("beatmatched oracle transition should preserve speedB");
+            assert!(
+                (speed.speed_at(Duration::from_millis(start_b_ms as u64)) - f64::from(speed_b))
+                    .abs()
+                    < 1e-6
+            );
+            checked += 1;
+        }
+
+        assert_eq!(checked, 6);
     }
 
     #[test]

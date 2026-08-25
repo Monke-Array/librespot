@@ -1,8 +1,7 @@
 //! Live Spotify Auto transition selection.
 //!
 //! Metadata acquisition and the pure ranking algorithm remain separate; this module only joins
-//! them and adapts the native first-ranked transition/preset into the existing Spotify recipe
-//! representation.
+//! them and selects the native first-ranked transition/preset for the local materializer.
 
 use librespot_core::Session;
 use librespot_protocol::player::ProvidedTrack;
@@ -16,7 +15,6 @@ use crate::{
     spotify_auto_mix_metadata::{
         AutoMetadataError, AutoMixMetadataClient, AutoTrackIdentity, LoadedAutoTrackMetadata,
     },
-    spotify_mix::{SpotifyTransitionError, SpotifyTransitionRecipe},
 };
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -28,8 +26,6 @@ pub(crate) struct LocalAutoPairKey {
 #[derive(Clone, Debug)]
 pub(crate) struct LocalAutoRequest {
     pub key: LocalAutoPairKey,
-    pub outgoing: ProvidedTrack,
-    pub incoming: ProvidedTrack,
     pub track_a: AutoTrackIdentity,
     pub track_b: AutoTrackIdentity,
     pub item_speed_a: f32,
@@ -50,8 +46,6 @@ impl LocalAutoRequest {
             },
             item_speed_a: crate::spotify_mix::provided_item_speed_or_default(&outgoing),
             item_speed_b: crate::spotify_mix::provided_item_speed_or_default(&incoming),
-            outgoing,
-            incoming,
             track_a,
             track_b,
         }
@@ -60,7 +54,6 @@ impl LocalAutoRequest {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LocalAutoTransition {
-    pub recipe: SpotifyTransitionRecipe,
     pub transition: AutoRankedTransition,
     pub preset: AutoRankedPreset,
 }
@@ -73,8 +66,6 @@ pub(crate) enum LocalAutoError {
     MissingTransition,
     #[error("Auto ranking returned no preset")]
     MissingPreset,
-    #[error(transparent)]
-    Recipe(#[from] SpotifyTransitionError),
 }
 
 pub(crate) async fn generate_local_auto(
@@ -102,23 +93,7 @@ fn adapt_loaded_pair(
         AutoGeometryConfig::default(),
     );
     let (transition, preset) = select_native_result(pipeline)?;
-    let recipe = SpotifyTransitionRecipe::from_local_auto(
-        &request.outgoing,
-        &request.incoming,
-        &request.track_a.playable_uri,
-        &request.track_b.playable_uri,
-        track_a.scoring_input.bpm,
-        track_b.scoring_input.bpm,
-        request.item_speed_a,
-        request.item_speed_b,
-        transition.overlap,
-        preset.preset_id,
-    )?;
-    Ok(LocalAutoTransition {
-        recipe,
-        transition,
-        preset,
-    })
+    Ok(LocalAutoTransition { transition, preset })
 }
 
 fn select_native_result(

@@ -2276,13 +2276,16 @@ impl SpircTask {
             selected.preset.computed_score,
         );
 
-        let Some(plan) = crate::spotify_mix::transition_plan_for_local_auto_pair(
-            &outgoing,
-            &incoming,
-            &selected.recipe,
-        ) else {
-            debug!("[spotify-auto] selected result is not renderable yet; using fallback");
-            return;
+        let plan = match crate::spotify_mix::transition_plan_for_local_auto_transition(
+            &selected.transition,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                debug!(
+                    "[spotify-auto] selected result could not be materialized: {error}; using fallback"
+                );
+                return;
+            }
         };
         let Some(track_id) = self.connect_state.preview_next_track() else {
             return;
