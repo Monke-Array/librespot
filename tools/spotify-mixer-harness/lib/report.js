@@ -1,6 +1,11 @@
 "use strict";
 
-const SUPPORTED_STATUSES = new Set(["SUPPORTED", "DEV-EQ-BYPASS"]);
+const SUPPORTED_STATUSES = new Set([
+  "SUPPORTED",
+  "DEV-EQ-BYPASS",
+  "DEV-FILTER-BYPASS",
+  "DEV-EQ-FILTER-BYPASS",
+]);
 
 function increment(map, key, amount = 1) {
   const normalized = key ?? "UNKNOWN";
@@ -58,4 +63,3 @@ function summarizeCoverage(records) {
 module.exports = {
   summarizeCoverage,
 };
-

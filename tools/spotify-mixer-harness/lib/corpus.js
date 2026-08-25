@@ -114,6 +114,7 @@ function attachClassification(records, options = {}) {
       materialized: record.materialized,
       localResult: record.localResult ?? localResultForRecord(options.localResult ?? {}, record) ?? {},
       devEqBypass: options.devEqBypass ?? false,
+      devFilterBypass: options.devFilterBypass ?? false,
     }),
   }));
 }

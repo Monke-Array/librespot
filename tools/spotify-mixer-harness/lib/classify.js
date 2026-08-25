@@ -10,6 +10,8 @@ const {
 const STATUSES = {
   SUPPORTED: "SUPPORTED",
   DEV_EQ_BYPASS: "DEV-EQ-BYPASS",
+  DEV_FILTER_BYPASS: "DEV-FILTER-BYPASS",
+  DEV_EQ_FILTER_BYPASS: "DEV-EQ-FILTER-BYPASS",
   UNSUPPORTED_EQ: "UNSUPPORTED-EQ",
   UNSUPPORTED_FILTER: "UNSUPPORTED-FILTER",
   UNSUPPORTED_FX: "UNSUPPORTED-FX",
@@ -23,9 +25,12 @@ function rejectionText(localResult) {
   return (localResult?.rejectionReasons ?? []).join("\n").toLowerCase();
 }
 
-function classifyTransition({ materialized, localResult = {}, devEqBypass = false }) {
+function classifyTransition({ materialized, localResult = {}, devEqBypass = false, devFilterBypass = false }) {
   const blockers = [];
   const text = rejectionText(localResult);
+  const eqAutomation = hasEqAutomation(materialized);
+  const filterAutomation = hasFilterAutomation(materialized);
+  const fxAutomation = hasFxAutomation(materialized) || unknownAudioFields(materialized).length > 0;
 
   if ((localResult.runtimeFailures ?? []).length > 0) {
     return {
@@ -48,7 +53,7 @@ function classifyTransition({ materialized, localResult = {}, devEqBypass = fals
     };
   }
 
-  if (hasFilterAutomation(materialized)) {
+  if (filterAutomation && !devFilterBypass) {
     blockers.push("filter");
     return {
       status: STATUSES.UNSUPPORTED_FILTER,
@@ -56,7 +61,7 @@ function classifyTransition({ materialized, localResult = {}, devEqBypass = fals
     };
   }
 
-  if (hasFxAutomation(materialized) || unknownAudioFields(materialized).length > 0) {
+  if (fxAutomation) {
     blockers.push("fx");
     return {
       status: STATUSES.UNSUPPORTED_FX,
@@ -64,17 +69,32 @@ function classifyTransition({ materialized, localResult = {}, devEqBypass = fals
     };
   }
 
-  if (hasEqAutomation(materialized)) {
-    if (devEqBypass && localResult.selectedPath === "materialized") {
+  if (eqAutomation && !devEqBypass) {
+    return {
+      status: STATUSES.UNSUPPORTED_EQ,
+      blockers: ["eq"],
+    };
+  }
+
+  if (eqAutomation || filterAutomation) {
+    if (devEqBypass && devFilterBypass && eqAutomation && filterAutomation) {
+      return {
+        status: STATUSES.DEV_EQ_FILTER_BYPASS,
+        blockers,
+      };
+    }
+    if (devFilterBypass && filterAutomation) {
+      return {
+        status: STATUSES.DEV_FILTER_BYPASS,
+        blockers,
+      };
+    }
+    if (devEqBypass && eqAutomation) {
       return {
         status: STATUSES.DEV_EQ_BYPASS,
         blockers,
       };
     }
-    return {
-      status: STATUSES.UNSUPPORTED_EQ,
-      blockers: ["eq"],
-    };
   }
 
   if (localResult.selectedPath === "materialized" || localResult.selectedPath === "saved") {
@@ -101,4 +121,3 @@ module.exports = {
   STATUSES,
   classifyTransition,
 };
-

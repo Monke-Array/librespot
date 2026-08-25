@@ -11,11 +11,11 @@ test("coverage report counts statuses, signatures, presets, and largest blocker"
     },
     {
       signature: { hash: "sig-b", summary: { presetId: "2", effects: ["filter"], transitionMs: 8000 } },
-      classification: { status: "UNSUPPORTED-FILTER", blockers: ["filter"] },
+      classification: { status: "DEV-FILTER-BYPASS", blockers: [] },
     },
     {
       signature: { hash: "sig-b", summary: { presetId: "2", effects: ["filter"], transitionMs: 8000 } },
-      classification: { status: "UNSUPPORTED-FILTER", blockers: ["filter"] },
+      classification: { status: "DEV-EQ-FILTER-BYPASS", blockers: [] },
     },
   ]);
 
@@ -23,10 +23,10 @@ test("coverage report counts statuses, signatures, presets, and largest blocker"
   assert.strictEqual(report.distinctDspSignatures, 2);
   assert.deepStrictEqual(report.statusCounts, {
     "DEV-EQ-BYPASS": 1,
-    "UNSUPPORTED-FILTER": 2,
+    "DEV-FILTER-BYPASS": 1,
+    "DEV-EQ-FILTER-BYPASS": 1,
   });
   assert.deepStrictEqual(report.presetCoverage, { 1: 1, 2: 2 });
-  assert.deepStrictEqual(report.largestBlockers, [{ blocker: "filter", count: 2 }]);
-  assert.strictEqual(report.supportedCorpusPercentage, 33.33);
+  assert.deepStrictEqual(report.largestBlockers, []);
+  assert.strictEqual(report.supportedCorpusPercentage, 100);
 });
-

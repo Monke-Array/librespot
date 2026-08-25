@@ -34,6 +34,7 @@ test("classifier keeps filter and FX failures ahead of EQ bypass", () => {
   assert.strictEqual(
     classifyTransition({
       devEqBypass: true,
+      devFilterBypass: false,
       materialized: materialized({
         outgoing: {
           "audio.fade_out_eq_low_gain_curves": "[]",
@@ -48,6 +49,7 @@ test("classifier keeps filter and FX failures ahead of EQ bypass", () => {
   assert.strictEqual(
     classifyTransition({
       devEqBypass: true,
+      devFilterBypass: true,
       materialized: materialized({
         outgoing: {
           "audio.fade_out_reverb_dry_wet_curves": "[]",
@@ -59,10 +61,74 @@ test("classifier keeps filter and FX failures ahead of EQ bypass", () => {
   );
 });
 
+test("classifier reports dev filter bypass when filter is explicitly ignored", () => {
+  const classification = classifyTransition({
+    devFilterBypass: true,
+    materialized: materialized({
+      outgoing: {
+        "audio.fade_out_filter_cutoff_curves": "[]",
+        "audio.fade_out_filter_resonance_curves": "[]",
+      },
+    }),
+    localResult: {},
+  });
+
+  assert.strictEqual(classification.status, "DEV-FILTER-BYPASS");
+  assert.deepStrictEqual(classification.blockers, []);
+});
+
+test("classifier reports combined dev EQ and filter bypass only when both are enabled", () => {
+  const bothBlocked = materialized({
+    outgoing: {
+      "audio.fade_out_eq_low_gain_curves": "[]",
+      "audio.fade_out_filter_cutoff_curves": "[]",
+    },
+  });
+
+  assert.strictEqual(
+    classifyTransition({
+      devEqBypass: true,
+      devFilterBypass: false,
+      materialized: bothBlocked,
+      localResult: {},
+    }).status,
+    "UNSUPPORTED-FILTER",
+  );
+
+  const classification = classifyTransition({
+    devEqBypass: true,
+    devFilterBypass: true,
+    materialized: bothBlocked,
+    localResult: {},
+  });
+
+  assert.strictEqual(classification.status, "DEV-EQ-FILTER-BYPASS");
+  assert.deepStrictEqual(classification.blockers, []);
+});
+
+test("classifier does not bypass unknown FX even when EQ and filter bypasses are enabled", () => {
+  const classification = classifyTransition({
+    devEqBypass: true,
+    devFilterBypass: true,
+    materialized: materialized({
+      outgoing: {
+        "audio.fade_out_eq_low_gain_curves": "[]",
+        "audio.fade_out_filter_cutoff_curves": "[]",
+        "audio.fade_out_echo_dry_wet_curves": "[]",
+      },
+    }),
+    localResult: {},
+  });
+
+  assert.strictEqual(classification.status, "UNSUPPORTED-FX");
+  assert.deepStrictEqual(classification.blockers, ["fx"]);
+});
+
 test("classifier uses local rejection reason for timing and speed failures", () => {
   assert.strictEqual(
     classifyTransition({
       devEqBypass: true,
+      devFilterBypass: true,
       materialized: materialized({}),
       localResult: {
         rejectionReasons: [
@@ -76,6 +142,7 @@ test("classifier uses local rejection reason for timing and speed failures", () 
   assert.strictEqual(
     classifyTransition({
       devEqBypass: true,
+      devFilterBypass: true,
       materialized: materialized({}),
       localResult: {
         rejectionReasons: [
