@@ -33,7 +33,7 @@ use crate::{
 use log::LevelFilter;
 use protobuf::{EnumOrUnknown, MessageField};
 use std::{
-    collections::{HashSet, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     env,
     hash::{Hash, Hasher},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -44,6 +44,21 @@ use thiserror::Error;
 const SPOTIFY_MAX_PREV_TRACKS_SIZE: usize = 10;
 const SPOTIFY_MAX_NEXT_TRACKS_SIZE: usize = 80;
 const DEV_CONNECT_CAPABILITY_OVERRIDES_ENV: &str = "LIBRESPOT_DEV_CONNECT_CAPABILITY_OVERRIDES";
+
+fn metadata_flag_is_true(metadata: &HashMap<String, String>, key: &str) -> bool {
+    metadata.get(key).is_some_and(|value| {
+        let value = value.trim();
+        value == "1" || value.eq_ignore_ascii_case("true")
+    })
+}
+
+fn context_metadata_is_mixer(metadata: &HashMap<String, String>) -> bool {
+    metadata_flag_is_true(metadata, "mix")
+        || (metadata_flag_is_true(metadata, "automix.queue")
+            && metadata
+                .get("automix.mode")
+                .is_some_and(|value| value.eq_ignore_ascii_case("auto")))
+}
 
 #[derive(Debug, Error)]
 pub(super) enum StateError {
@@ -465,6 +480,10 @@ impl ConnectState {
         player.is_playing && player.is_paused && player.is_buffering
     }
 
+    pub fn is_mixer_context(&self) -> bool {
+        context_metadata_is_mixer(&self.player().context_metadata)
+    }
+
     pub fn set_volume(&mut self, volume: u32) {
         self.device_mut()
             .device_info
@@ -709,6 +728,27 @@ mod tests {
             supports_hifi: MessageField::none(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn mixer_context_metadata_is_detected_from_existing_connect_markers() {
+        let mut metadata = HashMap::new();
+        metadata.insert("mix".to_owned(), "true".to_owned());
+        assert!(context_metadata_is_mixer(&metadata));
+
+        metadata.clear();
+        metadata.insert("automix.queue".to_owned(), "1".to_owned());
+        metadata.insert("automix.mode".to_owned(), "auto".to_owned());
+        assert!(context_metadata_is_mixer(&metadata));
+    }
+
+    #[test]
+    fn ordinary_context_metadata_is_not_mixer_eligible() {
+        let mut metadata = HashMap::new();
+        metadata.insert("context_description".to_owned(), "playlist".to_owned());
+        metadata.insert("playlist.revision".to_owned(), "123".to_owned());
+
+        assert!(!context_metadata_is_mixer(&metadata));
     }
 
     #[test]

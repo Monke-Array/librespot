@@ -36,7 +36,8 @@ use crate::{
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
     secondary::{
-        Decoder, SECONDARY_PCM_CHUNK_FRAMES, SecondaryPcmBlock, SecondaryRead, SourceDecoder,
+        Decoder, SECONDARY_PCM_CHUNK_FRAMES, SecondaryPcmBlock, SecondaryPcmReadiness,
+        SecondaryRead, SourceDecoder,
     },
     transition::{
         FixedDurationTransitionPolicy, ScheduledTransitionPolicy, TransitionEngine, TransitionPlan,
@@ -2068,33 +2069,10 @@ impl Future for PlayerInternal {
                 let transition_plan = transition_plan.clone();
                 match loader.as_mut().poll(cx) {
                     Poll::Ready(Ok(source)) => {
-                        let secondary_trim_frames = transition_plan
-                            .as_ref()
-                            .map(|plan| {
-                                let requested_ms = u64::try_from(plan.next_start().as_millis())
-                                    .unwrap_or(u64::MAX);
-                                let source_start =
-                                    Duration::from_millis(u64::from(source.stream_position_ms));
-                                let source_trim = Duration::from_millis(
-                                    requested_ms
-                                        .saturating_sub(u64::from(source.stream_position_ms)),
-                                );
-                                let wall_trim = plan
-                                    .next_speed_automation()
-                                    .map(|speed| {
-                                        speed.wall_duration_for_source_time(
-                                            source_start,
-                                            source_trim,
-                                        )
-                                    })
-                                    .unwrap_or(source_trim);
-                                wall_trim
-                                    .as_nanos()
-                                    .saturating_mul(u128::from(SAMPLE_RATE))
-                                    .div_ceil(1_000_000_000)
-                            })
-                            .and_then(|frames| usize::try_from(frames).ok())
-                            .unwrap_or(0);
+                        let secondary_trim_frames = Self::secondary_trim_frames_for_plan(
+                            transition_plan.as_ref(),
+                            source.stream_position_ms,
+                        );
                         self.send_event(PlayerEvent::Preloading {
                             track_id: track_id.clone(),
                             playable_uri: source.audio_item.uri.clone(),
@@ -2419,6 +2397,51 @@ impl PlayerInternal {
         )
     }
 
+    fn secondary_trim_frames_for_plan(
+        transition_plan: Option<&TransitionPlan>,
+        source_position_ms: u32,
+    ) -> usize {
+        transition_plan
+            .map(|plan| {
+                let requested_ms = u64::try_from(plan.next_start().as_millis()).unwrap_or(u64::MAX);
+                let source_start = Duration::from_millis(u64::from(source_position_ms));
+                let source_trim = Duration::from_millis(
+                    requested_ms.saturating_sub(u64::from(source_position_ms)),
+                );
+                let wall_trim = plan
+                    .next_speed_automation()
+                    .map(|speed| speed.wall_duration_for_source_time(source_start, source_trim))
+                    .unwrap_or(source_trim);
+                wall_trim
+                    .as_nanos()
+                    .saturating_mul(u128::from(SAMPLE_RATE))
+                    .div_ceil(1_000_000_000)
+            })
+            .and_then(|frames| usize::try_from(frames).ok())
+            .unwrap_or(0)
+    }
+
+    fn mark_transition_attempted(&mut self) {
+        if let Some(source) = self.state.source_mut() {
+            source.transition_attempted = true;
+        }
+    }
+
+    fn secondary_pcm_readiness(&mut self, samples: usize) -> SecondaryPcmReadiness {
+        let PlayerPreload::Ready {
+            source,
+            secondary_trim_frames,
+            ..
+        } = &mut self.preload
+        else {
+            return SecondaryPcmReadiness::Unavailable;
+        };
+
+        source.decoder.secondary_pcm_readiness(
+            samples.saturating_add(secondary_trim_frames.saturating_mul(NUM_CHANNELS as usize)),
+        )
+    }
+
     /// Non-blocking aligned handoff. Terminal secondary events remain isolated from the current
     /// decoder/error path.
     fn try_take_secondary_frames(&mut self, samples: usize) -> SecondaryFrameRead {
@@ -2517,6 +2540,61 @@ impl PlayerInternal {
         }
     }
 
+    fn update_ready_preload_transition_plan(
+        &mut self,
+        track_id: &SpotifyUri,
+        transition_plan: Option<TransitionPlan>,
+    ) -> bool {
+        if self.transition.state() != TransitionState::Idle {
+            return false;
+        }
+
+        let PlayerPreload::Ready {
+            track_id: loaded_track_id,
+            transition_plan: current_plan,
+            secondary_trim_frames,
+            source,
+        } = &mut self.preload
+        else {
+            return false;
+        };
+
+        if loaded_track_id != track_id || source.decoder.is_worker() {
+            return false;
+        }
+
+        if *current_plan == transition_plan {
+            return true;
+        }
+
+        let position_ms = transition_plan
+            .as_ref()
+            .and_then(|plan| u32::try_from(plan.next_start().as_millis()).ok())
+            .unwrap_or(0);
+        if source.stream_position_ms != position_ms {
+            match source.decoder.seek(position_ms) {
+                Ok(actual_position_ms) => source.stream_position_ms = actual_position_ms,
+                Err(error) => {
+                    debug!(
+                        "Unable to retarget ready secondary source for <{track_id}> to {position_ms} ms: {error}"
+                    );
+                    return false;
+                }
+            }
+        }
+
+        *secondary_trim_frames = Self::secondary_trim_frames_for_plan(
+            transition_plan.as_ref(),
+            source.stream_position_ms,
+        );
+        *current_plan = transition_plan;
+        debug!(
+            "[transition] secondary preload updated track=<{track_id}> position_ms={} trim_frames={}",
+            source.stream_position_ms, *secondary_trim_frames
+        );
+        true
+    }
+
     fn promote_preloaded_source(
         &mut self,
         requested_track_id: &SpotifyUri,
@@ -2591,12 +2669,20 @@ impl PlayerInternal {
             return;
         }
 
-        let spec = if let Some(plan) = self.preload.transition_plan() {
-            ScheduledTransitionPolicy::new(plan, SCHEDULED_TRANSITION_PREPARATION)
-                .plan(current_position, current_duration)
+        let transition_plan = self.preload.transition_plan().cloned();
+        let (spec, should_start_now) = if let Some(plan) = transition_plan.as_ref() {
+            let policy = ScheduledTransitionPolicy::new(plan, SCHEDULED_TRANSITION_PREPARATION);
+            (
+                policy.plan(current_position, current_duration),
+                policy.should_start(current_position, current_duration),
+            )
         } else {
-            self.transition_policy
-                .plan(current_position, current_duration)
+            (
+                self.transition_policy
+                    .plan(current_position, current_duration),
+                self.transition_policy
+                    .should_start(current_position, current_duration),
+            )
         };
         let Some(spec) = spec else {
             return;
@@ -2604,9 +2690,7 @@ impl PlayerInternal {
 
         if self.config.passthrough {
             debug!("Transition policy selected PCM mixing while encoded passthrough is active");
-            if let Some(source) = self.state.source_mut() {
-                source.transition_attempted = true;
-            }
+            self.mark_transition_attempted();
             return;
         }
 
@@ -2616,21 +2700,43 @@ impl PlayerInternal {
                 NormalisationData::get_factor(&normalisation_config, source.normalisation_data);
         }
 
+        match self.start_secondary_decode() {
+            Ok(_) => {}
+            Err(e) => {
+                warn!("Unable to start secondary decoder: {e}");
+                self.mark_transition_attempted();
+                self.cancel_secondary_source("secondary decoder could not start");
+                return;
+            }
+        }
+
+        let readiness_samples = SECONDARY_PCM_CHUNK_FRAMES * NUM_CHANNELS as usize;
+        match self.secondary_pcm_readiness(readiness_samples) {
+            SecondaryPcmReadiness::Ready => {
+                if let PlayerPreload::Ready { track_id, .. } = &self.preload {
+                    debug!("[transition] secondary PCM ready track=<{track_id}>");
+                }
+            }
+            SecondaryPcmReadiness::Pending if !should_start_now => return,
+            SecondaryPcmReadiness::Pending => {
+                debug!("Transition skipped: secondary PCM was not ready before transition start");
+                self.mark_transition_attempted();
+                self.cancel_secondary_source("secondary PCM was not ready before transition start");
+                return;
+            }
+            SecondaryPcmReadiness::Unavailable => {
+                debug!("Transition skipped: secondary PCM was unavailable before transition start");
+                self.mark_transition_attempted();
+                self.cancel_secondary_source("secondary PCM unavailable before transition start");
+                return;
+            }
+        }
+
         match self.transition.arm(spec) {
-            Ok(()) => match self.start_secondary_decode() {
-                Ok(true) => {
-                    if let Some(source) = self.state.source_mut() {
-                        source.transition_attempted = true;
-                    }
-                }
-                Ok(false) => {
-                    self.cancel_secondary_source("secondary decoder did not start");
-                }
-                Err(e) => {
-                    warn!("Unable to start secondary decoder: {e}");
-                    self.cancel_secondary_source("secondary decoder could not start");
-                }
-            },
+            Ok(()) => {
+                debug!("[transition] transition armed");
+                self.mark_transition_attempted();
+            }
             Err(e) => warn!("Unable to arm transition: {e}"),
         }
     }
@@ -2918,6 +3024,24 @@ impl PlayerInternal {
                 }
             }
             None => {
+                if self.transition.state() == TransitionState::Active
+                    && matches!(self.preload, PlayerPreload::Ready { .. })
+                {
+                    match self
+                        .transition
+                        .finish_after_current_eof()
+                        .map_err(|error| Error::internal(error.to_string()))
+                        .and_then(|_| self.complete_crossfade())
+                    {
+                        Ok(()) => return,
+                        Err(error) => {
+                            error!("Unable to complete active transition at current EOF: {error}");
+                            self.transition.cancel("promotion failed at current EOF");
+                            self.handle_pause();
+                            return;
+                        }
+                    }
+                }
                 self.transition
                     .cancel("current source reached EOF before transition completion");
                 self.state.playing_to_end_of_track();
@@ -3136,6 +3260,7 @@ impl PlayerInternal {
         self.transition
             .complete()
             .map_err(|error| Error::internal(error.to_string()))?;
+        debug!("[transition] transition completed");
 
         let PlayerState::Playing {
             track_id: old_track_id,
@@ -3190,6 +3315,7 @@ impl PlayerInternal {
             position_ms,
         });
         debug!("Secondary promoted for <{track_id}> at {position_ms} ms");
+        debug!("[transition] promotion completed track=<{track_id}> position_ms={position_ms}");
         Ok(())
     }
 
@@ -3509,12 +3635,18 @@ impl PlayerInternal {
         debug!("Preloading track");
         let mut preload_track = true;
         // check whether the track is already loaded somewhere or being loaded.
-        if let Some(currently_loading) = self.preload.track_id() {
-            if *currently_loading == track_id
-                && self.preload.transition_plan() == transition_plan.as_ref()
-            {
-                // we're already preloading the requested track.
-                preload_track = false;
+        if let Some(currently_loading) = self.preload.track_id().cloned() {
+            if currently_loading == track_id {
+                if self.preload.transition_plan() == transition_plan.as_ref()
+                    || self.update_ready_preload_transition_plan(&track_id, transition_plan.clone())
+                    || matches!(self.preload, PlayerPreload::Ready { .. })
+                {
+                    // we're already preloading the requested track, or a dormant ready preload was
+                    // retargeted to the new scheduled transition plan.
+                    preload_track = false;
+                } else {
+                    self.cancel_secondary_source("next-track preload was replaced");
+                }
             } else {
                 // we're preloading something else - cancel it.
                 self.cancel_secondary_source("next-track preload was replaced");
@@ -3546,6 +3678,9 @@ impl PlayerInternal {
                 .as_ref()
                 .and_then(|plan| u32::try_from(plan.next_start().as_millis()).ok())
                 .unwrap_or(0);
+            debug!(
+                "[transition] secondary preload start track=<{track_id}> position_ms={position_ms}"
+            );
             let loader = self.load_track(track_id.clone(), position_ms, true);
             self.preload = PlayerPreload::Loading {
                 track_id,
@@ -3757,6 +3892,30 @@ impl PlayerInternal {
                     play_request_id,
                     start_playback,
                     position_ms,
+                    loader,
+                };
+            }
+
+            let preload_restart = match &self.preload {
+                PlayerPreload::Loading {
+                    track_id,
+                    transition_plan,
+                    ..
+                } => Some((track_id.clone(), transition_plan.clone())),
+                PlayerPreload::None | PlayerPreload::Ready { .. } => None,
+            };
+            if let Some((track_id, transition_plan)) = preload_restart {
+                let position_ms = transition_plan
+                    .as_ref()
+                    .and_then(|plan| u32::try_from(plan.next_start().as_millis()).ok())
+                    .unwrap_or(0);
+                debug!(
+                    "Restarting in-flight secondary preload for <{track_id}> at {position_ms} ms on replacement session"
+                );
+                let loader = Box::pin(self.load_track(track_id.clone(), position_ms, true));
+                self.preload = PlayerPreload::Loading {
+                    track_id,
+                    transition_plan,
                     loader,
                 };
             }
@@ -4356,6 +4515,30 @@ mod tests {
         }
     }
 
+    struct DropTrackingLoader {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Future for DropTrackingLoader {
+        type Output = Result<PlaybackSource, PlayerLoadError>;
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl FusedFuture for DropTrackingLoader {
+        fn is_terminated(&self) -> bool {
+            false
+        }
+    }
+
+    impl Drop for DropTrackingLoader {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
     struct CountingPcmDecoder {
         calls: Arc<AtomicUsize>,
         packets_remaining: Option<usize>,
@@ -4727,6 +4910,47 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn same_track_ready_preload_accepts_scheduled_plan_without_reloading() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(800));
+
+        let next_track_id = next_track_uri();
+        let next_source = scripted_source(next_track_id.clone(), 0, Box::new(ScriptedDecoder));
+        let decoder_address = next_source
+            .decoder
+            .direct_decoder_address()
+            .expect("ready preload should own a direct decoder");
+        set_ready_secondary(&mut player, next_track_id.clone(), next_source);
+
+        let _guard = runtime.enter();
+        player.handle_command_preload(next_track_id.clone(), Some(scheduled_test_plan()));
+
+        let PlayerPreload::Ready {
+            track_id,
+            transition_plan,
+            secondary_trim_frames,
+            source,
+        } = &player.preload
+        else {
+            panic!("same-track plan upgrade should preserve the ready preload");
+        };
+        assert_eq!(track_id, &next_track_id);
+        assert_eq!(
+            source
+                .decoder
+                .direct_decoder_address()
+                .expect("plan upgrade should not rebuild the decoder"),
+            decoder_address
+        );
+        assert!(transition_plan.is_some());
+        assert_eq!(source.stream_position_ms, 12_000);
+        assert_eq!(*secondary_trim_frames, 0);
     }
 
     fn poll_recovery_once(player: &mut PlayerInternal) -> bool {
@@ -5367,6 +5591,12 @@ mod tests {
 
         player.arm_transition_if_selected();
 
+        assert_eq!(player.transition.state(), TransitionState::Idle);
+        wait_until("preparing secondary worker did not advance", || {
+            decode_calls.load(Ordering::Acquire) > 0
+        });
+        player.arm_transition_if_selected();
+
         assert_eq!(player.transition.state(), TransitionState::Armed);
         let PlayerPreload::Ready { source, .. } = &player.preload else {
             panic!("secondary should remain ready");
@@ -5376,9 +5606,49 @@ mod tests {
             &player.state,
             PlayerState::Playing { source, .. } if source.transition_attempted
         ));
-        wait_until("armed secondary worker did not advance", || {
-            decode_calls.load(Ordering::Acquire) > 0
-        });
+    }
+
+    #[test]
+    fn scheduled_transition_waits_for_secondary_pcm_before_arming() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        let mut current = scripted_loaded_track(800);
+        current.duration_ms = 10_000;
+        set_playing_source(&mut player, track_uri(), current);
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = std_mpsc::channel();
+        player.preload = PlayerPreload::Ready {
+            track_id: next_track_uri(),
+            transition_plan: Some(scheduled_test_plan()),
+            secondary_trim_frames: 0,
+            source: Box::new(scripted_source(
+                next_track_uri(),
+                12_000,
+                Box::new(CancellationBlockedDecoder {
+                    cancelled: cancelled.clone(),
+                    entered: Some(entered_tx),
+                }),
+            )),
+        };
+
+        player.arm_transition_if_selected();
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("secondary preparation should start");
+
+        assert_eq!(player.transition.state(), TransitionState::Idle);
+        assert!(matches!(
+            &player.preload,
+            PlayerPreload::Ready { source, .. } if source.decoder.is_worker()
+        ));
+        assert!(matches!(
+            &player.state,
+            PlayerState::Playing { source, .. } if !source.transition_attempted
+        ));
+        player.cancel_secondary_source("test cleanup");
     }
 
     #[test]
@@ -5549,11 +5819,14 @@ mod tests {
             )),
         };
 
-        player.arm_transition_if_selected();
-        assert_eq!(player.transition.state(), TransitionState::Armed);
+        player
+            .start_secondary_decode()
+            .expect("secondary worker should start");
         wait_until("time-stretched secondary queue did not fill", || {
             decode_calls.load(Ordering::Acquire) >= 9
         });
+        player.arm_transition_if_selected();
+        assert_eq!(player.transition.state(), TransitionState::Armed);
 
         player.handle_packet(
             Some((
@@ -5749,6 +6022,85 @@ mod tests {
                 source,
                 ..
             } if *play_request_id == promoted_request_id && source.stream_position_ms == 100
+        ));
+    }
+
+    #[test]
+    fn current_eof_during_active_transition_promotes_secondary() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts.clone(), stops.clone());
+        let mut current = scripted_loaded_track(0);
+        current.transition_attempted = true;
+        set_playing_source(&mut player, track_uri(), current);
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        set_ready_secondary(
+            &mut player,
+            next_track_uri(),
+            scripted_source(
+                next_track_uri(),
+                0,
+                Box::new(CountingPcmDecoder {
+                    calls: decode_calls.clone(),
+                    packets_remaining: None,
+                }),
+            ),
+        );
+        player
+            .start_secondary_decode()
+            .expect("secondary worker should start");
+        wait_until("secondary queue did not fill", || {
+            decode_calls.load(Ordering::Acquire) >= 2
+        });
+        player
+            .transition
+            .arm(TransitionSpec {
+                duration: Duration::from_secs(1),
+                curve: TransitionCurve::Linear,
+                current_gain: 1.0,
+                next_gain: 1.0,
+            })
+            .expect("test transition should arm");
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        player.event_senders.push(event_tx);
+
+        let _ = player
+            .transition
+            .render(
+                AudioPacket::Samples(vec![1.0; 4 * NUM_CHANNELS as usize]),
+                Some(AudioPacket::Samples(vec![0.25; 4 * NUM_CHANNELS as usize])),
+            )
+            .expect("transition should become active");
+        assert_eq!(player.transition.state(), TransitionState::Active);
+
+        player.handle_packet(None, 1.0);
+
+        let PlayerState::Playing {
+            track_id,
+            play_request_id,
+            source,
+        } = &player.state
+        else {
+            panic!("active transition EOF should promote secondary");
+        };
+        let promoted_request_id = *play_request_id;
+        assert_eq!(track_id, &next_track_uri());
+        assert!(source.decoder.is_worker());
+        assert_eq!(player.transition.state(), TransitionState::Idle);
+        assert_eq!(starts.load(Ordering::Acquire), 0);
+        assert_eq!(stops.load(Ordering::Acquire), 0);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(PlayerEvent::EndOfTrack {
+                play_request_id: 7,
+                ref track_id,
+            }) if track_id == &track_uri()
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(PlayerEvent::PlayRequestIdChanged { play_request_id })
+                if play_request_id == promoted_request_id
         ));
     }
 
@@ -6403,6 +6755,44 @@ mod tests {
         assert!(recovery.start_playback);
         assert!(recovery.generation > 11);
         assert!(matches!(recovery.phase, RecoveryPhase::Waiting(_)));
+    }
+
+    #[test]
+    fn replacement_session_restarts_in_flight_secondary_preload() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        player.session.shutdown();
+
+        let track_id = SpotifyUri::from_uri("spotify:local:test:test:test:100")
+            .expect("test local URI should be valid");
+        let transition_plan = scheduled_test_plan();
+        let old_loader_dropped = Arc::new(AtomicBool::new(false));
+        player.preload = PlayerPreload::Loading {
+            track_id: track_id.clone(),
+            transition_plan: Some(transition_plan.clone()),
+            loader: Box::pin(DropTrackingLoader {
+                dropped: old_loader_dropped.clone(),
+            }),
+        };
+
+        let replacement = session(&runtime);
+        let _guard = runtime.enter();
+        player.handle_set_session(replacement);
+
+        assert!(
+            old_loader_dropped.load(Ordering::Acquire),
+            "replacement session should drop the invalid in-flight secondary preload loader"
+        );
+        assert!(matches!(
+            &player.preload,
+            PlayerPreload::Loading {
+                track_id: restarted,
+                transition_plan: Some(restarted_plan),
+                ..
+            } if restarted == &track_id && restarted_plan == &transition_plan
+        ));
     }
 
     #[test]

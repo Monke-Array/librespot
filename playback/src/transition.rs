@@ -564,6 +564,17 @@ impl TransitionEngine {
         Ok(())
     }
 
+    /// The current source can reach EOF shortly before a planned overlap fully expires. Once the
+    /// next source has already been audible, promote it instead of cancelling back to the old path.
+    pub(crate) fn finish_after_current_eof(&mut self) -> Result<(), TransitionError> {
+        if self.state != TransitionState::Active {
+            return Err(self.invalid_state("finish after current EOF"));
+        }
+        debug!("Transition current source ended; awaiting next-source promotion");
+        self.state = TransitionState::Finishing;
+        Ok(())
+    }
+
     fn mix_pcm(
         &mut self,
         current: AudioPacket,

@@ -77,11 +77,19 @@ struct LocalAutoTaskResult {
     result: Result<LocalAutoTransition, LocalAutoError>,
 }
 
+#[derive(Clone)]
+struct PreparedLocalAutoTransition {
+    selected: LocalAutoTransition,
+    plan: librespot_playback::TransitionPlan,
+}
+
 struct LocalAutoPairState {
     key: LocalAutoPairKey,
-    eligible: bool,
+    higher_priority: HigherPriorityTransitionState,
     attempted: bool,
     incoming_identity: Option<AutoTrackIdentity>,
+    prepared_transition: Option<PreparedLocalAutoTransition>,
+    selected_local_auto: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,7 +100,43 @@ enum HigherPriorityTransitionState {
 }
 
 fn local_auto_is_eligible(state: HigherPriorityTransitionState) -> bool {
-    matches!(state, HigherPriorityTransitionState::Exhausted)
+    !matches!(state, HigherPriorityTransitionState::SavedSelected)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CachedLocalAutoSelectionGate {
+    Select,
+    Suppressed,
+    Stale,
+    MissedWindow,
+}
+
+fn cached_local_auto_selection_gate(
+    higher_priority: HigherPriorityTransitionState,
+    selected_local_auto: bool,
+    prepared_key: &LocalAutoPairKey,
+    active_key: &LocalAutoPairKey,
+    plan_can_still_apply: bool,
+) -> CachedLocalAutoSelectionGate {
+    if !local_auto_is_eligible(higher_priority) || selected_local_auto {
+        return CachedLocalAutoSelectionGate::Suppressed;
+    }
+    if prepared_key != active_key {
+        return CachedLocalAutoSelectionGate::Stale;
+    }
+    if !plan_can_still_apply {
+        return CachedLocalAutoSelectionGate::MissedWindow;
+    }
+    CachedLocalAutoSelectionGate::Select
+}
+
+fn mixer_auto_edge_is_eligible(
+    has_transition_plan: bool,
+    has_transition_uri: bool,
+    has_backend_auto_transition: bool,
+    context_is_mixer: bool,
+) -> bool {
+    has_transition_plan || has_transition_uri || has_backend_auto_transition || context_is_mixer
 }
 
 impl From<SpircError> for Error {
@@ -384,7 +428,7 @@ impl Spirc {
             Err(why) => error!("failed to update initial volume: {why}"),
         };
 
-        Ok((spirc, task.run()))
+        Ok((spirc, Box::pin(task.run())))
     }
 
     /// Replace a failed AP session without reconstructing the player or Connect state.
@@ -1008,6 +1052,7 @@ impl SpircTask {
                 self.local_auto_current_identity = None;
                 debug!("[spotify-auto] current track had an invalid canonical URI");
             }
+            self.maybe_start_local_auto();
             self.connect_state.update_duration(audio_item.duration_ms);
             self.update_state = true;
             return Ok(());
@@ -1056,6 +1101,7 @@ impl SpircTask {
                         "{} of <{track_id}> failed with {error:?}; preserving the queue",
                         if is_preload { "preload" } else { "load" }
                     );
+                    self.cancel_transition_hydrations();
                 }
                 return Ok(());
             }
@@ -1425,8 +1471,14 @@ impl SpircTask {
                 self.handle_repeat_context(repeat_context.value)?
             }
             SetRepeatingTrack(repeat_track) => self.handle_repeat_track(repeat_track.value),
-            AddToQueue(add_to_queue) => self.connect_state.add_to_queue(add_to_queue.track, true),
-            SetQueue(set_queue) => self.connect_state.handle_set_queue(set_queue),
+            AddToQueue(add_to_queue) => {
+                self.cancel_transition_hydrations();
+                self.connect_state.add_to_queue(add_to_queue.track, true);
+            }
+            SetQueue(set_queue) => {
+                self.cancel_transition_hydrations();
+                self.connect_state.handle_set_queue(set_queue);
+            }
             SetOptions(set_options) => {
                 if let Some(repeat_context) = set_options.repeating_context {
                     self.handle_repeat_context(repeat_context)?
@@ -1642,14 +1694,7 @@ impl SpircTask {
         page: Option<ContextPage>,
         fallback_index: Option<usize>,
     ) -> Result<(), Error> {
-        let context_changed = match &cmd.context {
-            PlayContext::Uri(uri) => uri != self.connect_state.context_uri(),
-            PlayContext::Tracks(_) => true,
-        };
-        if context_changed {
-            self.cancel_transition_hydrations();
-        }
-
+        self.cancel_transition_hydrations();
         self.connect_state
             .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
                 ResetContext::WhenDifferent(uri)
@@ -1876,6 +1921,7 @@ impl SpircTask {
     }
 
     fn handle_seek(&mut self, position_ms: u32) {
+        self.cancel_transition_hydrations();
         let duration = self.connect_state.player().duration;
         if i64::from(position_ms) > duration {
             warn!("tried to seek to {position_ms}ms of {duration}ms");
@@ -1945,30 +1991,47 @@ impl SpircTask {
             let outgoing = self
                 .connect_state
                 .current_track(|track| track.as_ref().cloned());
-            if let Some(outgoing) = outgoing.as_ref() {
-                self.prepare_local_auto_pair(&outgoing.uri, &incoming.uri);
+            let Some(outgoing) = outgoing else {
+                self.cancel_local_auto();
+                debug!("[spotify-mix] hydration unavailable; using fallback");
+                self.player.preload(track_id.clone());
+                return;
+            };
+
+            let transition_plan =
+                crate::spotify_mix::transition_plan_for_pair(&outgoing, &incoming);
+            let transition_uri = transition_uri(&outgoing).map(str::to_owned);
+            let mixer_edge_known = mixer_auto_edge_is_eligible(
+                transition_plan.is_some(),
+                transition_uri.is_some(),
+                outgoing
+                    .metadata
+                    .contains_key(crate::spotify_mix::BACKEND_RECIPE_ATTRIBUTE),
+                self.connect_state.is_mixer_context(),
+            );
+            if mixer_edge_known {
+                self.prepare_local_auto_pair(&outgoing, &incoming);
             } else {
                 self.cancel_local_auto();
             }
-            let transition_plan = outgoing.as_ref().and_then(|outgoing| {
-                crate::spotify_mix::transition_plan_for_pair(outgoing, &incoming)
-            });
             self.player
                 .preload_with_transition(track_id.clone(), transition_plan.clone());
 
             // Retain support for contexts that already carry the recipe inline.
             if transition_plan.is_some() {
+                debug!(
+                    "[spotify-auto] official transition selected edge={}->{}",
+                    outgoing.uri, incoming.uri
+                );
                 self.suppress_local_auto(HigherPriorityTransitionState::SavedSelected);
                 return;
             }
 
-            let Some(outgoing) = outgoing else {
-                debug!("[spotify-mix] hydration unavailable; using fallback");
-                return;
-            };
-            let Some(transition_uri) = transition_uri(&outgoing).map(str::to_owned) else {
+            let Some(transition_uri) = transition_uri else {
                 debug!("[spotify-mix] hydration unavailable; considering local Auto");
-                self.enable_local_auto(&outgoing, &incoming);
+                if mixer_edge_known {
+                    self.enable_local_auto(&outgoing, &incoming);
+                }
                 return;
             };
             debug!("[spotify-mix] transition uri found uri={transition_uri}");
@@ -2006,11 +2069,11 @@ impl SpircTask {
                         key,
                         request_id,
                     ));
-                    debug!("[spotify-mix] hydration started; deferring local Auto");
+                    debug!("[spotify-mix] hydration started; local Auto running speculatively");
                 }
                 CacheLookup::Pending => {
                     self.suppress_local_auto(HigherPriorityTransitionState::Pending);
-                    debug!("[spotify-mix] hydration pending; deferring local Auto");
+                    debug!("[spotify-mix] hydration pending; local Auto running speculatively");
                 }
                 CacheLookup::Unavailable => {
                     debug!("[spotify-mix] hydration unavailable; considering local Auto");
@@ -2023,6 +2086,10 @@ impl SpircTask {
                         &transition.recipe,
                     ) {
                         debug!("[spotify-mix] saved transition plan selected");
+                        debug!(
+                            "[spotify-auto] official transition selected edge={}->{}",
+                            outgoing.uri, incoming.uri
+                        );
                         self.suppress_local_auto(HigherPriorityTransitionState::SavedSelected);
                         self.player.preload_with_transition(track_id, Some(plan));
                     } else {
@@ -2104,15 +2171,20 @@ impl SpircTask {
         }
 
         debug!("[spotify-mix] saved transition plan selected");
+        debug!(
+            "[spotify-auto] official transition selected edge={}->{}",
+            outgoing.uri, incoming.uri
+        );
         self.suppress_local_auto(HigherPriorityTransitionState::SavedSelected);
         self.player.preload_with_transition(track_id, Some(plan));
     }
 
-    fn prepare_local_auto_pair(&mut self, outgoing_uri: &str, incoming_uri: &str) {
-        let key = LocalAutoPairKey {
-            outgoing_uri: outgoing_uri.to_owned(),
-            incoming_uri: incoming_uri.to_owned(),
-        };
+    fn prepare_local_auto_pair(&mut self, outgoing: &ProvidedTrack, incoming: &ProvidedTrack) {
+        let key = LocalAutoPairKey::from_edge(
+            self.connect_state.context_uri().clone(),
+            outgoing,
+            incoming,
+        );
         if self
             .local_auto_pair
             .as_ref()
@@ -2124,14 +2196,16 @@ impl SpircTask {
         self.local_auto_tasks.abort_all();
         self.local_auto_pair = Some(LocalAutoPairState {
             key,
-            eligible: local_auto_is_eligible(HigherPriorityTransitionState::Pending),
+            higher_priority: HigherPriorityTransitionState::Pending,
             attempted: false,
             incoming_identity: None,
+            prepared_transition: None,
+            selected_local_auto: false,
         });
     }
 
     fn enable_local_auto(&mut self, outgoing: &ProvidedTrack, incoming: &ProvidedTrack) {
-        self.prepare_local_auto_pair(&outgoing.uri, &incoming.uri);
+        self.prepare_local_auto_pair(outgoing, incoming);
         if outgoing
             .metadata
             .contains_key(crate::spotify_mix::BACKEND_RECIPE_ATTRIBUTE)
@@ -2141,18 +2215,22 @@ impl SpircTask {
             );
         }
         if let Some(state) = self.local_auto_pair.as_mut() {
-            state.eligible = local_auto_is_eligible(HigherPriorityTransitionState::Exhausted);
+            state.higher_priority = HigherPriorityTransitionState::Exhausted;
         }
         self.maybe_start_local_auto();
+        self.maybe_select_cached_local_auto();
     }
 
     fn suppress_local_auto(&mut self, higher_priority: HigherPriorityTransitionState) {
         if local_auto_is_eligible(higher_priority) {
+            if let Some(state) = self.local_auto_pair.as_mut() {
+                state.higher_priority = higher_priority;
+            }
             return;
         }
         self.local_auto_tasks.abort_all();
         if let Some(state) = self.local_auto_pair.as_mut() {
-            state.eligible = false;
+            state.higher_priority = higher_priority;
         }
     }
 
@@ -2171,7 +2249,7 @@ impl SpircTask {
         let Some(state) = self.local_auto_pair.as_ref() else {
             return;
         };
-        if !state.eligible || state.attempted {
+        if !local_auto_is_eligible(state.higher_priority) || state.attempted {
             return;
         }
         let key = state.key.clone();
@@ -2193,16 +2271,29 @@ impl SpircTask {
         let Some(incoming) = self.connect_state.preview_next_provided_track().cloned() else {
             return;
         };
-        if outgoing.uri != key.outgoing_uri || incoming.uri != key.incoming_uri {
+        if LocalAutoPairKey::from_edge(
+            self.connect_state.context_uri().clone(),
+            &outgoing,
+            &incoming,
+        ) != key
+        {
             return;
         }
 
-        let request = LocalAutoRequest::from_resolved_pair(outgoing, incoming, track_a, track_b);
+        let request = LocalAutoRequest::from_resolved_pair(
+            self.connect_state.context_uri().clone(),
+            outgoing,
+            incoming,
+            track_a,
+            track_b,
+        );
         if let Some(state) = self.local_auto_pair.as_mut() {
             state.attempted = true;
         }
         debug!(
-            "[spotify-auto] attempting local Auto canonicalA={} playableA={} canonicalB={} playableB={}",
+            "[spotify-auto] speculative Auto started edge={}->{} canonicalA={} playableA={} canonicalB={} playableB={}",
+            request.key.outgoing_uri,
+            request.key.incoming_uri,
             request.track_a.canonical_uri,
             request.track_a.playable_uri,
             request.track_b.canonical_uri,
@@ -2223,7 +2314,10 @@ impl SpircTask {
             return;
         };
         if state.key != result.key {
-            debug!("[spotify-auto] discarded stale local Auto result");
+            debug!(
+                "[spotify-auto] stale Auto result discarded edge={}->{}",
+                result.key.outgoing_uri, result.key.incoming_uri
+            );
             return;
         }
         let Some(track_a) = self.local_auto_current_identity.as_ref() else {
@@ -2243,10 +2337,18 @@ impl SpircTask {
         };
         if outgoing.uri != result.key.outgoing_uri
             || incoming.uri != result.key.incoming_uri
+            || LocalAutoPairKey::from_edge(
+                self.connect_state.context_uri().clone(),
+                &outgoing,
+                &incoming,
+            ) != result.key
             || track_a.canonical_uri != result.key.outgoing_uri
             || track_b.canonical_uri != result.key.incoming_uri
         {
-            debug!("[spotify-auto] discarded stale local Auto result");
+            debug!(
+                "[spotify-auto] stale Auto result discarded edge={}->{}",
+                result.key.outgoing_uri, result.key.incoming_uri
+            );
             return;
         }
 
@@ -2287,15 +2389,95 @@ impl SpircTask {
                 return;
             }
         };
+        debug!(
+            "[spotify-auto] speculative Auto ready edge={}->{} startA={} startB={} duration={} speedA={} speedB={} preset={}",
+            result.key.outgoing_uri,
+            result.key.incoming_uri,
+            overlap.start_a_ms,
+            overlap.start_b_ms,
+            overlap.duration_ms,
+            overlap.speed_a,
+            overlap.speed_b,
+            selected.preset.preset_id
+        );
+        if let Some(state) = self.local_auto_pair.as_mut() {
+            state.prepared_transition = Some(PreparedLocalAutoTransition { selected, plan });
+        }
+        self.maybe_select_cached_local_auto();
+    }
+
+    fn maybe_select_cached_local_auto(&mut self) {
+        let Some(state) = self.local_auto_pair.as_ref() else {
+            return;
+        };
+        if !local_auto_is_eligible(state.higher_priority) || state.selected_local_auto {
+            return;
+        }
+        let Some(prepared) = state.prepared_transition.clone() else {
+            return;
+        };
+        let key = state.key.clone();
+
+        let Some(outgoing) = self
+            .connect_state
+            .current_track(|track| track.as_ref().cloned())
+        else {
+            return;
+        };
+        let Some(incoming) = self.connect_state.preview_next_provided_track().cloned() else {
+            return;
+        };
+        let active_key = LocalAutoPairKey::from_edge(
+            self.connect_state.context_uri().clone(),
+            &outgoing,
+            &incoming,
+        );
         let Some(track_id) = self.connect_state.preview_next_track() else {
             return;
         };
-        if !self.transition_plan_can_still_apply(&plan) {
-            debug!("[spotify-auto] selected result arrived too late; using fallback");
-            return;
+
+        match cached_local_auto_selection_gate(
+            state.higher_priority,
+            state.selected_local_auto,
+            &key,
+            &active_key,
+            self.transition_plan_can_still_apply(&prepared.plan),
+        ) {
+            CachedLocalAutoSelectionGate::Select => {}
+            CachedLocalAutoSelectionGate::Suppressed => return,
+            CachedLocalAutoSelectionGate::Stale => {
+                debug!(
+                    "[spotify-auto] stale Auto result discarded edge={}->{}",
+                    key.outgoing_uri, key.incoming_uri
+                );
+                return;
+            }
+            CachedLocalAutoSelectionGate::MissedWindow => {
+                debug!(
+                    "[spotify-auto] cached local Auto transition missed transition window edge={}->{}",
+                    key.outgoing_uri, key.incoming_uri
+                );
+                return;
+            }
         }
-        debug!("[spotify-auto] local Auto transition plan selected");
-        self.player.preload_with_transition(track_id, Some(plan));
+
+        let overlap = prepared.selected.transition.overlap;
+        debug!(
+            "[spotify-auto] cached local Auto transition selected edge={}->{} startA={} startB={} duration={} speedA={} speedB={} preset={}",
+            key.outgoing_uri,
+            key.incoming_uri,
+            overlap.start_a_ms,
+            overlap.start_b_ms,
+            overlap.duration_ms,
+            overlap.speed_a,
+            overlap.speed_b,
+            prepared.selected.preset.preset_id
+        );
+        if let Some(state) = self.local_auto_pair.as_mut() {
+            state.selected_local_auto = true;
+        }
+        self.player
+            .preload_with_transition(track_id, Some(prepared.plan));
     }
 
     fn transition_plan_can_still_apply(&self, plan: &librespot_playback::TransitionPlan) -> bool {
@@ -2367,6 +2549,7 @@ impl SpircTask {
     }
 
     fn handle_next(&mut self, track_uri: Option<String>) -> Result<(), Error> {
+        self.cancel_transition_hydrations();
         let continue_playing = self.connect_state.is_playing();
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
@@ -2397,6 +2580,7 @@ impl SpircTask {
     }
 
     fn handle_prev(&mut self) -> Result<(), Error> {
+        self.cancel_transition_hydrations();
         // Previous behaves differently based on the position
         // Under 3s it goes to the previous song (starts playing)
         // Over 3s it seeks to zero (retains previous play status)
@@ -2599,16 +2783,89 @@ mod tests {
     const LATER_URI: &str = "spotify:track:7ouMYWpwJ422jRcDASZB7P";
 
     #[test]
-    fn local_auto_is_considered_only_after_saved_transition_paths() {
+    fn speculative_local_auto_starts_while_hydration_is_pending_but_not_after_official_selection() {
         assert!(!local_auto_is_eligible(
             HigherPriorityTransitionState::SavedSelected
         ));
-        assert!(!local_auto_is_eligible(
+        assert!(local_auto_is_eligible(
             HigherPriorityTransitionState::Pending
         ));
         assert!(local_auto_is_eligible(
             HigherPriorityTransitionState::Exhausted
         ));
+    }
+
+    fn local_auto_key(
+        context_uri: &str,
+        outgoing_uri: &str,
+        incoming_uri: &str,
+        outgoing_uid: &str,
+        incoming_uid: &str,
+    ) -> LocalAutoPairKey {
+        LocalAutoPairKey {
+            context_uri: context_uri.to_owned(),
+            outgoing_uri: outgoing_uri.to_owned(),
+            incoming_uri: incoming_uri.to_owned(),
+            outgoing_uid: outgoing_uid.to_owned(),
+            incoming_uid: incoming_uid.to_owned(),
+        }
+    }
+
+    #[test]
+    fn official_transition_selection_suppresses_ready_speculative_local_auto() {
+        let key = local_auto_key(
+            "spotify:playlist:mixer",
+            CURRENT_URI,
+            NEXT_URI,
+            "current-row",
+            "next-row",
+        );
+
+        assert_eq!(
+            cached_local_auto_selection_gate(
+                HigherPriorityTransitionState::SavedSelected,
+                false,
+                &key,
+                &key,
+                true,
+            ),
+            CachedLocalAutoSelectionGate::Suppressed
+        );
+    }
+
+    #[test]
+    fn stale_cached_auto_result_is_not_selected_for_replaced_next_track() {
+        let prepared = local_auto_key(
+            "spotify:playlist:mixer",
+            CURRENT_URI,
+            NEXT_URI,
+            "current-row",
+            "next-row",
+        );
+        let active = local_auto_key(
+            "spotify:playlist:mixer",
+            CURRENT_URI,
+            LATER_URI,
+            "current-row",
+            "later-row",
+        );
+
+        assert_eq!(
+            cached_local_auto_selection_gate(
+                HigherPriorityTransitionState::Exhausted,
+                false,
+                &prepared,
+                &active,
+                true,
+            ),
+            CachedLocalAutoSelectionGate::Stale
+        );
+    }
+
+    #[test]
+    fn mixer_context_without_per_edge_metadata_is_local_auto_eligible() {
+        assert!(mixer_auto_edge_is_eligible(false, false, false, true));
+        assert!(!mixer_auto_edge_is_eligible(false, false, false, false));
     }
 
     #[test]

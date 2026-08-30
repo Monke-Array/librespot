@@ -23,7 +23,7 @@ pub(crate) const SECONDARY_PCM_CHUNK_FRAMES: usize = 1024;
 pub(crate) const SECONDARY_PCM_CHANNEL_CAPACITY: usize = 8;
 
 const SECONDARY_PCM_CHUNK_SAMPLES: usize = SECONDARY_PCM_CHUNK_FRAMES * NUM_CHANNELS as usize;
-const SECONDARY_PCM_ASSEMBLER_SAMPLES: usize = SECONDARY_PCM_CHUNK_SAMPLES * 2;
+pub(crate) const SECONDARY_PCM_ASSEMBLER_SAMPLES: usize = SECONDARY_PCM_CHUNK_SAMPLES * 2;
 
 pub(crate) type Decoder = Box<dyn AudioDecoder + Send>;
 
@@ -121,6 +121,18 @@ impl SourceDecoder {
         }
     }
 
+    pub(crate) fn secondary_pcm_readiness(&mut self, samples: usize) -> SecondaryPcmReadiness {
+        if samples > SECONDARY_PCM_ASSEMBLER_SAMPLES {
+            return SecondaryPcmReadiness::Pending;
+        }
+
+        match self {
+            Self::Worker(worker) => worker.has_pcm(samples),
+            Self::Direct(_) => SecondaryPcmReadiness::Pending,
+            Self::Invalid => SecondaryPcmReadiness::Unavailable,
+        }
+    }
+
     pub(crate) fn is_worker(&self) -> bool {
         matches!(self, Self::Worker(_))
     }
@@ -175,6 +187,13 @@ pub(crate) enum SecondaryRead {
         error: DecoderError,
     },
     Disconnected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SecondaryPcmReadiness {
+    Pending,
+    Ready,
+    Unavailable,
 }
 
 pub(crate) struct SecondaryDecodeWorker {
@@ -243,6 +262,16 @@ impl SecondaryDecodeWorker {
             })
             .map_err(DecoderError::Io)?;
 
+        let time_stretch = speed_automation.and_then(|automation| {
+            PitchPreservingTimeStretch::new(
+                automation,
+                std::time::Duration::from_millis(u64::from(source_position_ms)),
+            )
+        });
+        if time_stretch.is_some() {
+            debug!("[transition] incoming speed automation active track=<{track_label}>");
+        }
+
         Ok(Self {
             receiver: Some(receiver),
             cancelled,
@@ -255,27 +284,13 @@ impl SecondaryDecodeWorker {
             pcm_consumed_frames: 0,
             pcm_generation: None,
             pending_terminal: None,
-            time_stretch: speed_automation.and_then(|automation| {
-                PitchPreservingTimeStretch::new(
-                    automation,
-                    std::time::Duration::from_millis(u64::from(source_position_ms)),
-                )
-            }),
+            time_stretch,
             time_stretch_flushed: false,
         })
     }
 
     fn try_read(&mut self, samples: usize) -> SecondaryRead {
-        assert!(samples > 0, "secondary PCM read must request samples");
-        assert!(
-            samples <= SECONDARY_PCM_CHUNK_SAMPLES,
-            "secondary PCM read exceeds the bounded assembler quantum"
-        );
-        assert_eq!(
-            samples % NUM_CHANNELS as usize,
-            0,
-            "secondary PCM read must be frame-aligned"
-        );
+        Self::assert_read_request(samples);
 
         if self.time_stretch.is_some() {
             return self.try_read_stretched(samples);
@@ -336,6 +351,78 @@ impl SecondaryDecodeWorker {
         }
     }
 
+    fn has_pcm(&mut self, samples: usize) -> SecondaryPcmReadiness {
+        Self::assert_readiness_request(samples);
+
+        if self.time_stretch.is_some() {
+            return self.has_stretched_pcm(samples);
+        }
+
+        while self.pcm_buffer.len() < samples && self.pending_terminal.is_none() {
+            let message = match self
+                .receiver
+                .as_ref()
+                .ok_or(TryRecvError::Disconnected)
+                .and_then(Receiver::try_recv)
+            {
+                Ok(message) => message,
+                Err(TryRecvError::Empty) => return SecondaryPcmReadiness::Pending,
+                Err(TryRecvError::Disconnected) => return SecondaryPcmReadiness::Unavailable,
+            };
+
+            match message.event {
+                SecondaryDecodeEvent::Packet(position, AudioPacket::Samples(packet)) => {
+                    self.push_pcm(message.generation, position, packet);
+                }
+                SecondaryDecodeEvent::Packet(_, AudioPacket::Raw(_)) => {
+                    self.pending_terminal = Some(SecondaryDecodeMessage {
+                        generation: message.generation,
+                        event: SecondaryDecodeEvent::Failed(DecoderError::PassthroughDecoder(
+                            "secondary PCM assembler received encoded audio".into(),
+                        )),
+                    });
+                }
+                event @ (SecondaryDecodeEvent::Eof | SecondaryDecodeEvent::Failed(_)) => {
+                    self.pending_terminal = Some(SecondaryDecodeMessage {
+                        generation: message.generation,
+                        event,
+                    });
+                }
+            }
+        }
+
+        if self.pcm_buffer.len() >= samples {
+            SecondaryPcmReadiness::Ready
+        } else {
+            SecondaryPcmReadiness::Unavailable
+        }
+    }
+
+    fn assert_read_request(samples: usize) {
+        Self::assert_sample_alignment(samples);
+        assert!(
+            samples <= SECONDARY_PCM_CHUNK_SAMPLES,
+            "secondary PCM read exceeds the bounded assembler quantum"
+        );
+    }
+
+    fn assert_readiness_request(samples: usize) {
+        Self::assert_sample_alignment(samples);
+        assert!(
+            samples <= SECONDARY_PCM_ASSEMBLER_SAMPLES,
+            "secondary PCM readiness exceeds the bounded assembler capacity"
+        );
+    }
+
+    fn assert_sample_alignment(samples: usize) {
+        assert!(samples > 0, "secondary PCM read must request samples");
+        assert_eq!(
+            samples % NUM_CHANNELS as usize,
+            0,
+            "secondary PCM read must be frame-aligned"
+        );
+    }
+
     fn take_pcm(&mut self, samples: usize) -> SecondaryPcmBlock {
         let channels = NUM_CHANNELS as usize;
         let frames = samples / channels;
@@ -384,6 +471,47 @@ impl SecondaryDecodeWorker {
                 Ok(message) => message,
                 Err(TryRecvError::Empty) => return SecondaryRead::Pending,
                 Err(TryRecvError::Disconnected) => return SecondaryRead::Disconnected,
+            };
+            self.push_stretched_message(message);
+        }
+    }
+
+    fn has_stretched_pcm(&mut self, samples: usize) -> SecondaryPcmReadiness {
+        loop {
+            {
+                let stretch = self
+                    .time_stretch
+                    .as_mut()
+                    .expect("stretched readiness requires a processor");
+                stretch.fill_output(samples);
+                if stretch.available_samples() >= samples && self.pcm_generation.is_some() {
+                    return SecondaryPcmReadiness::Ready;
+                }
+            }
+
+            if self.pending_terminal.is_some() {
+                self.flush_time_stretch();
+                let stretch = self
+                    .time_stretch
+                    .as_mut()
+                    .expect("stretched readiness requires a processor");
+                stretch.fill_output(samples);
+                return if stretch.available_samples() >= samples && self.pcm_generation.is_some() {
+                    SecondaryPcmReadiness::Ready
+                } else {
+                    SecondaryPcmReadiness::Unavailable
+                };
+            }
+
+            let message = match self
+                .receiver
+                .as_ref()
+                .ok_or(TryRecvError::Disconnected)
+                .and_then(Receiver::try_recv)
+            {
+                Ok(message) => message,
+                Err(TryRecvError::Empty) => return SecondaryPcmReadiness::Pending,
+                Err(TryRecvError::Disconnected) => return SecondaryPcmReadiness::Unavailable,
             };
             self.push_stretched_message(message);
         }

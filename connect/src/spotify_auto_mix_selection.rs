@@ -19,8 +19,27 @@ use crate::{
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct LocalAutoPairKey {
+    pub context_uri: String,
     pub outgoing_uri: String,
     pub incoming_uri: String,
+    pub outgoing_uid: String,
+    pub incoming_uid: String,
+}
+
+impl LocalAutoPairKey {
+    pub(crate) fn from_edge(
+        context_uri: impl Into<String>,
+        outgoing: &ProvidedTrack,
+        incoming: &ProvidedTrack,
+    ) -> Self {
+        Self {
+            context_uri: context_uri.into(),
+            outgoing_uri: outgoing.uri.clone(),
+            incoming_uri: incoming.uri.clone(),
+            outgoing_uid: outgoing.uid.clone(),
+            incoming_uid: incoming.uid.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -34,16 +53,15 @@ pub(crate) struct LocalAutoRequest {
 
 impl LocalAutoRequest {
     pub(crate) fn from_resolved_pair(
+        context_uri: impl Into<String>,
         outgoing: ProvidedTrack,
         incoming: ProvidedTrack,
         track_a: AutoTrackIdentity,
         track_b: AutoTrackIdentity,
     ) -> Self {
+        let key = LocalAutoPairKey::from_edge(context_uri, &outgoing, &incoming);
         Self {
-            key: LocalAutoPairKey {
-                outgoing_uri: outgoing.uri.clone(),
-                incoming_uri: incoming.uri.clone(),
-            },
+            key,
             item_speed_a: crate::spotify_mix::provided_item_speed_or_default(&outgoing),
             item_speed_b: crate::spotify_mix::provided_item_speed_or_default(&incoming),
             track_a,
@@ -125,17 +143,21 @@ mod tests {
     fn request() -> LocalAutoRequest {
         let mut outgoing = ProvidedTrack {
             uri: CANONICAL_A.to_owned(),
+            uid: "row-a".to_owned(),
             ..Default::default()
         };
         outgoing
             .metadata
             .insert("item.speed".to_owned(), "1.125".to_owned());
+        let incoming = ProvidedTrack {
+            uri: CANONICAL_B.to_owned(),
+            uid: "row-b".to_owned(),
+            ..Default::default()
+        };
         LocalAutoRequest::from_resolved_pair(
+            "spotify:playlist:mixer-context",
             outgoing,
-            ProvidedTrack {
-                uri: CANONICAL_B.to_owned(),
-                ..Default::default()
-            },
+            incoming,
             AutoTrackIdentity {
                 canonical_uri: CANONICAL_A.to_owned(),
                 playable_uri: PLAYABLE_A.to_owned(),
@@ -216,8 +238,11 @@ mod tests {
     fn resolved_canonical_and_playable_identities_reach_the_loader_request_unchanged() {
         let request = request();
 
+        assert_eq!(request.key.context_uri, "spotify:playlist:mixer-context");
         assert_eq!(request.key.outgoing_uri, CANONICAL_A);
         assert_eq!(request.key.incoming_uri, CANONICAL_B);
+        assert_eq!(request.key.outgoing_uid, "row-a");
+        assert_eq!(request.key.incoming_uid, "row-b");
         assert_eq!(request.track_a.canonical_uri, CANONICAL_A);
         assert_eq!(request.track_a.playable_uri, PLAYABLE_A);
         assert_eq!(request.track_a.canonical_duration_ms, 354_320);
@@ -226,6 +251,33 @@ mod tests {
         assert_eq!(request.track_b.canonical_duration_ms, 222_973);
         assert_eq!(request.item_speed_a, 1.125);
         assert_eq!(request.item_speed_b, 1.0);
+    }
+
+    #[test]
+    fn pair_key_separates_reused_tracks_across_context_and_rows() {
+        let mut outgoing = ProvidedTrack {
+            uri: CANONICAL_A.to_owned(),
+            uid: "row-a".to_owned(),
+            ..Default::default()
+        };
+        let incoming = ProvidedTrack {
+            uri: CANONICAL_B.to_owned(),
+            uid: "row-b".to_owned(),
+            ..Default::default()
+        };
+
+        let first = LocalAutoPairKey::from_edge("spotify:playlist:mixer-one", &outgoing, &incoming);
+        let same = LocalAutoPairKey::from_edge("spotify:playlist:mixer-one", &outgoing, &incoming);
+        assert_eq!(first, same);
+
+        let other_context =
+            LocalAutoPairKey::from_edge("spotify:playlist:mixer-two", &outgoing, &incoming);
+        assert_ne!(first, other_context);
+
+        outgoing.uid = "row-a-replaced".to_owned();
+        let other_row =
+            LocalAutoPairKey::from_edge("spotify:playlist:mixer-one", &outgoing, &incoming);
+        assert_ne!(first, other_row);
     }
 
     #[test]
