@@ -36,8 +36,8 @@ use crate::{
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
     secondary::{
-        Decoder, SECONDARY_PCM_CHUNK_FRAMES, SecondaryPcmBlock, SecondaryPcmReadiness,
-        SecondaryRead, SourceDecoder,
+        Decoder, SECONDARY_PCM_CHANNEL_CAPACITY, SECONDARY_PCM_CHUNK_FRAMES, SecondaryPcmBlock,
+        SecondaryPcmReadiness, SecondaryRead, SourceDecoder,
     },
     transition::{
         FixedDurationTransitionPolicy, ScheduledTransitionPolicy, TransitionEngine, TransitionPlan,
@@ -253,6 +253,13 @@ enum SecondaryFrameRead {
     Unavailable,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectedTransitionKind {
+    Scheduled,
+    NormalCrossfade,
+    SafetyFallback,
+}
+
 enum PlayerCommand {
     Load {
         track_id: SpotifyUri,
@@ -261,7 +268,7 @@ enum PlayerCommand {
     },
     Preload {
         track_id: SpotifyUri,
-        transition_plan: Option<TransitionPlan>,
+        transition: PreloadTransition,
     },
     Play,
     Pause,
@@ -756,7 +763,17 @@ impl Player {
     }
 
     pub fn preload(&self, track_id: SpotifyUri) {
-        self.preload_with_transition(track_id, None);
+        self.command(PlayerCommand::Preload {
+            track_id,
+            transition: PreloadTransition::SafetyFallback,
+        });
+    }
+
+    pub fn preload_with_normal_crossfade(&self, track_id: SpotifyUri) {
+        self.command(PlayerCommand::Preload {
+            track_id,
+            transition: PreloadTransition::NormalCrossfade,
+        });
     }
 
     /// Preload a next track with an optional scheduled transition plan.
@@ -767,7 +784,9 @@ impl Player {
     ) {
         self.command(PlayerCommand::Preload {
             track_id,
-            transition_plan,
+            transition: transition_plan
+                .map(PreloadTransition::Scheduled)
+                .unwrap_or(PreloadTransition::SafetyFallback),
         });
     }
 
@@ -981,17 +1000,39 @@ enum PlayerPreload {
     None,
     Loading {
         track_id: SpotifyUri,
-        transition_plan: Option<TransitionPlan>,
+        transition: PreloadTransition,
         loader: TrackLoaderFuture,
     },
     Ready {
         track_id: SpotifyUri,
-        transition_plan: Option<TransitionPlan>,
+        transition: PreloadTransition,
         secondary_trim_frames: usize,
         // Remains dormant until transition policy arms; it then advances only on its bounded
         // worker and is still movable into current ownership.
         source: Box<PlaybackSource>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum PreloadTransition {
+    NormalCrossfade,
+    SafetyFallback,
+    Scheduled(TransitionPlan),
+}
+
+impl PreloadTransition {
+    fn scheduled_plan(&self) -> Option<&TransitionPlan> {
+        match self {
+            Self::Scheduled(plan) => Some(plan),
+            Self::NormalCrossfade | Self::SafetyFallback => None,
+        }
+    }
+
+    fn next_start_position_ms(&self) -> u32 {
+        self.scheduled_plan()
+            .and_then(|plan| u32::try_from(plan.next_start().as_millis()).ok())
+            .unwrap_or(0)
+    }
 }
 
 impl PlayerPreload {
@@ -1002,16 +1043,16 @@ impl PlayerPreload {
         }
     }
 
-    fn transition_plan(&self) -> Option<&TransitionPlan> {
+    fn transition(&self) -> Option<&PreloadTransition> {
         match self {
-            Self::Loading {
-                transition_plan, ..
-            }
-            | Self::Ready {
-                transition_plan, ..
-            } => transition_plan.as_ref(),
+            Self::Loading { transition, .. } | Self::Ready { transition, .. } => Some(transition),
             Self::None => None,
         }
+    }
+
+    fn transition_plan(&self) -> Option<&TransitionPlan> {
+        self.transition()
+            .and_then(PreloadTransition::scheduled_plan)
     }
 }
 
@@ -2062,15 +2103,15 @@ impl Future for PlayerInternal {
             if let PlayerPreload::Loading {
                 ref mut loader,
                 ref track_id,
-                ref transition_plan,
+                ref transition,
             } = self.preload
             {
                 let track_id = track_id.clone();
-                let transition_plan = transition_plan.clone();
+                let transition = transition.clone();
                 match loader.as_mut().poll(cx) {
                     Poll::Ready(Ok(source)) => {
                         let secondary_trim_frames = Self::secondary_trim_frames_for_plan(
-                            transition_plan.as_ref(),
+                            transition.scheduled_plan(),
                             source.stream_position_ms,
                         );
                         self.send_event(PlayerEvent::Preloading {
@@ -2081,7 +2122,7 @@ impl Future for PlayerInternal {
                         debug!("Secondary playback source ready for <{track_id}>");
                         self.preload = PlayerPreload::Ready {
                             track_id,
-                            transition_plan,
+                            transition,
                             secondary_trim_frames,
                             source: Box::new(source),
                         };
@@ -2379,6 +2420,16 @@ impl PlayerInternal {
             .transition_plan()
             .and_then(TransitionPlan::next_speed_automation)
             .cloned();
+        let pcm_channel_capacity = match self.preload.transition() {
+            Some(PreloadTransition::NormalCrossfade) => {
+                Self::duration_frame_count(self.config.normal_crossfade_duration)
+                    .div_ceil(SECONDARY_PCM_CHUNK_FRAMES)
+                    .max(SECONDARY_PCM_CHANNEL_CAPACITY)
+            }
+            Some(PreloadTransition::SafetyFallback | PreloadTransition::Scheduled(_)) | None => {
+                SECONDARY_PCM_CHANNEL_CAPACITY
+            }
+        };
 
         let generation = self.next_secondary_generation();
         let PlayerPreload::Ready {
@@ -2394,7 +2445,16 @@ impl PlayerInternal {
             track_id.to_string(),
             speed_automation,
             source.stream_position_ms,
+            pcm_channel_capacity,
         )
+    }
+
+    fn duration_frame_count(duration: Duration) -> usize {
+        let frames = duration
+            .as_nanos()
+            .saturating_mul(u128::from(SAMPLE_RATE))
+            .div_ceil(1_000_000_000);
+        usize::try_from(frames).unwrap_or(usize::MAX)
     }
 
     fn secondary_trim_frames_for_plan(
@@ -2540,10 +2600,10 @@ impl PlayerInternal {
         }
     }
 
-    fn update_ready_preload_transition_plan(
+    fn update_ready_preload_transition(
         &mut self,
         track_id: &SpotifyUri,
-        transition_plan: Option<TransitionPlan>,
+        transition: PreloadTransition,
     ) -> bool {
         if self.transition.state() != TransitionState::Idle {
             return false;
@@ -2551,7 +2611,7 @@ impl PlayerInternal {
 
         let PlayerPreload::Ready {
             track_id: loaded_track_id,
-            transition_plan: current_plan,
+            transition: current_transition,
             secondary_trim_frames,
             source,
         } = &mut self.preload
@@ -2563,14 +2623,11 @@ impl PlayerInternal {
             return false;
         }
 
-        if *current_plan == transition_plan {
+        if *current_transition == transition {
             return true;
         }
 
-        let position_ms = transition_plan
-            .as_ref()
-            .and_then(|plan| u32::try_from(plan.next_start().as_millis()).ok())
-            .unwrap_or(0);
+        let position_ms = transition.next_start_position_ms();
         if source.stream_position_ms != position_ms {
             match source.decoder.seek(position_ms) {
                 Ok(actual_position_ms) => source.stream_position_ms = actual_position_ms,
@@ -2584,10 +2641,10 @@ impl PlayerInternal {
         }
 
         *secondary_trim_frames = Self::secondary_trim_frames_for_plan(
-            transition_plan.as_ref(),
+            transition.scheduled_plan(),
             source.stream_position_ms,
         );
-        *current_plan = transition_plan;
+        *current_transition = transition;
         debug!(
             "[transition] secondary preload updated track=<{track_id}> position_ms={} trim_frames={}",
             source.stream_position_ms, *secondary_trim_frames
@@ -2621,17 +2678,17 @@ impl PlayerInternal {
         let PlayerPreload::Ready {
             track_id,
             mut source,
-            transition_plan,
+            transition,
             secondary_trim_frames,
         } = mem::replace(&mut self.preload, PlayerPreload::None)
         else {
             unreachable!("ready preload changed while being promoted");
         };
 
-        if transition_plan.is_some() && position_ms != source.stream_position_ms {
+        if transition.scheduled_plan().is_some() && position_ms != source.stream_position_ms {
             self.preload = PlayerPreload::Ready {
                 track_id,
-                transition_plan,
+                transition,
                 secondary_trim_frames,
                 source,
             };
@@ -2669,20 +2726,47 @@ impl PlayerInternal {
             return;
         }
 
-        let transition_plan = self.preload.transition_plan().cloned();
-        let (spec, should_start_now) = if let Some(plan) = transition_plan.as_ref() {
-            let policy = ScheduledTransitionPolicy::new(plan, SCHEDULED_TRANSITION_PREPARATION);
-            (
-                policy.plan(current_position, current_duration),
-                policy.should_start(current_position, current_duration),
-            )
-        } else {
-            (
+        let Some(preload_transition) = self.preload.transition().cloned() else {
+            return;
+        };
+        let prepare_normal_crossfade =
+            matches!(preload_transition, PreloadTransition::NormalCrossfade)
+                && !self.config.normal_crossfade_duration.is_zero();
+        if prepare_normal_crossfade {
+            if let Err(e) = self.start_secondary_decode() {
+                warn!("Unable to start secondary decoder: {e}");
+                self.mark_transition_attempted();
+                self.cancel_secondary_source("secondary decoder could not start");
+                return;
+            }
+        }
+        let (spec, should_start_now, transition_kind) = match &preload_transition {
+            PreloadTransition::Scheduled(plan) => {
+                let policy = ScheduledTransitionPolicy::new(plan, SCHEDULED_TRANSITION_PREPARATION);
+                (
+                    policy.plan(current_position, current_duration),
+                    policy.should_start(current_position, current_duration),
+                    SelectedTransitionKind::Scheduled,
+                )
+            }
+            PreloadTransition::NormalCrossfade => {
+                let policy = FixedDurationTransitionPolicy::new(
+                    self.config.normal_crossfade_duration,
+                    SCHEDULED_TRANSITION_PREPARATION,
+                );
+                (
+                    policy.plan(current_position, current_duration),
+                    policy.should_start(current_position, current_duration),
+                    SelectedTransitionKind::NormalCrossfade,
+                )
+            }
+            PreloadTransition::SafetyFallback => (
                 self.transition_policy
                     .plan(current_position, current_duration),
                 self.transition_policy
                     .should_start(current_position, current_duration),
-            )
+                SelectedTransitionKind::SafetyFallback,
+            ),
         };
         let Some(spec) = spec else {
             return;
@@ -2700,17 +2784,24 @@ impl PlayerInternal {
                 NormalisationData::get_factor(&normalisation_config, source.normalisation_data);
         }
 
-        match self.start_secondary_decode() {
-            Ok(_) => {}
-            Err(e) => {
-                warn!("Unable to start secondary decoder: {e}");
-                self.mark_transition_attempted();
-                self.cancel_secondary_source("secondary decoder could not start");
-                return;
+        if !prepare_normal_crossfade {
+            match self.start_secondary_decode() {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("Unable to start secondary decoder: {e}");
+                    self.mark_transition_attempted();
+                    self.cancel_secondary_source("secondary decoder could not start");
+                    return;
+                }
             }
         }
 
-        let readiness_samples = SECONDARY_PCM_CHUNK_FRAMES * NUM_CHANNELS as usize;
+        let readiness_samples = if prepare_normal_crossfade {
+            Self::duration_frame_count(self.config.normal_crossfade_duration)
+                .saturating_mul(NUM_CHANNELS as usize)
+        } else {
+            SECONDARY_PCM_CHUNK_FRAMES * NUM_CHANNELS as usize
+        };
         match self.secondary_pcm_readiness(readiness_samples) {
             SecondaryPcmReadiness::Ready => {
                 if let PlayerPreload::Ready { track_id, .. } = &self.preload {
@@ -2721,19 +2812,35 @@ impl PlayerInternal {
             SecondaryPcmReadiness::Pending => {
                 debug!("Transition skipped: secondary PCM was not ready before transition start");
                 self.mark_transition_attempted();
-                self.cancel_secondary_source("secondary PCM was not ready before transition start");
+                if !prepare_normal_crossfade {
+                    self.cancel_secondary_source(
+                        "secondary PCM was not ready before transition start",
+                    );
+                }
                 return;
             }
             SecondaryPcmReadiness::Unavailable => {
                 debug!("Transition skipped: secondary PCM was unavailable before transition start");
                 self.mark_transition_attempted();
-                self.cancel_secondary_source("secondary PCM unavailable before transition start");
+                if !prepare_normal_crossfade {
+                    self.cancel_secondary_source(
+                        "secondary PCM unavailable before transition start",
+                    );
+                }
                 return;
             }
         }
 
         match self.transition.arm(spec) {
             Ok(()) => {
+                if transition_kind == SelectedTransitionKind::NormalCrossfade {
+                    debug!(
+                        "[transition] normal crossfade selected duration_ms={}",
+                        self.config.normal_crossfade_duration.as_millis()
+                    );
+                } else if transition_kind == SelectedTransitionKind::SafetyFallback {
+                    debug!("[transition] safety fallback selected");
+                }
                 debug!("[transition] transition armed");
                 self.mark_transition_attempted();
             }
@@ -2747,12 +2854,20 @@ impl PlayerInternal {
         };
         let current_position = Duration::from_millis(u64::from(source.stream_position_ms));
         let current_duration = Duration::from_millis(u64::from(source.duration_ms));
-        if let Some(plan) = self.preload.transition_plan() {
-            ScheduledTransitionPolicy::new(plan, SCHEDULED_TRANSITION_PREPARATION)
-                .should_start(current_position, current_duration)
-        } else {
-            self.transition_policy
-                .should_start(current_position, current_duration)
+        match self.preload.transition() {
+            Some(PreloadTransition::Scheduled(plan)) => {
+                ScheduledTransitionPolicy::new(plan, SCHEDULED_TRANSITION_PREPARATION)
+                    .should_start(current_position, current_duration)
+            }
+            Some(PreloadTransition::NormalCrossfade) => FixedDurationTransitionPolicy::new(
+                self.config.normal_crossfade_duration,
+                SCHEDULED_TRANSITION_PREPARATION,
+            )
+            .should_start(current_position, current_duration),
+            Some(PreloadTransition::SafetyFallback) => self
+                .transition_policy
+                .should_start(current_position, current_duration),
+            None => false,
         }
     }
 
@@ -2767,7 +2882,7 @@ impl PlayerInternal {
             TransitionState::Idle | TransitionState::Finishing => return None,
         }
 
-        let Some(plan) = self.preload.transition_plan() else {
+        let Some(PreloadTransition::Scheduled(plan)) = self.preload.transition() else {
             return self.transition_should_start().then_some(0);
         };
         let start_ms = u64::try_from(plan.current_start().as_millis()).unwrap_or(u64::MAX);
@@ -3620,11 +3735,7 @@ impl PlayerInternal {
         Ok(())
     }
 
-    fn handle_command_preload(
-        &mut self,
-        track_id: SpotifyUri,
-        transition_plan: Option<TransitionPlan>,
-    ) {
+    fn handle_command_preload(&mut self, track_id: SpotifyUri, transition: PreloadTransition) {
         if self.recovery.is_some() || self.network_health != RecoveryHealth::Healthy {
             debug!(
                 "Deferring preload of <{track_id}> while current-track networking is degraded or recovering"
@@ -3637,8 +3748,8 @@ impl PlayerInternal {
         // check whether the track is already loaded somewhere or being loaded.
         if let Some(currently_loading) = self.preload.track_id().cloned() {
             if currently_loading == track_id {
-                if self.preload.transition_plan() == transition_plan.as_ref()
-                    || self.update_ready_preload_transition_plan(&track_id, transition_plan.clone())
+                if self.preload.transition() == Some(&transition)
+                    || self.update_ready_preload_transition(&track_id, transition.clone())
                     || matches!(self.preload, PlayerPreload::Ready { .. })
                 {
                     // we're already preloading the requested track, or a dormant ready preload was
@@ -3674,17 +3785,14 @@ impl PlayerInternal {
 
         // schedule the preload of the current track if desired.
         if preload_track {
-            let position_ms = transition_plan
-                .as_ref()
-                .and_then(|plan| u32::try_from(plan.next_start().as_millis()).ok())
-                .unwrap_or(0);
+            let position_ms = transition.next_start_position_ms();
             debug!(
                 "[transition] secondary preload start track=<{track_id}> position_ms={position_ms}"
             );
             let loader = self.load_track(track_id.clone(), position_ms, true);
             self.preload = PlayerPreload::Loading {
                 track_id,
-                transition_plan,
+                transition,
                 loader: Box::pin(loader),
             }
         }
@@ -3899,23 +4007,20 @@ impl PlayerInternal {
             let preload_restart = match &self.preload {
                 PlayerPreload::Loading {
                     track_id,
-                    transition_plan,
+                    transition,
                     ..
-                } => Some((track_id.clone(), transition_plan.clone())),
+                } => Some((track_id.clone(), transition.clone())),
                 PlayerPreload::None | PlayerPreload::Ready { .. } => None,
             };
-            if let Some((track_id, transition_plan)) = preload_restart {
-                let position_ms = transition_plan
-                    .as_ref()
-                    .and_then(|plan| u32::try_from(plan.next_start().as_millis()).ok())
-                    .unwrap_or(0);
+            if let Some((track_id, transition)) = preload_restart {
+                let position_ms = transition.next_start_position_ms();
                 debug!(
                     "Restarting in-flight secondary preload for <{track_id}> at {position_ms} ms on replacement session"
                 );
                 let loader = Box::pin(self.load_track(track_id.clone(), position_ms, true));
                 self.preload = PlayerPreload::Loading {
                     track_id,
-                    transition_plan,
+                    transition,
                     loader,
                 };
             }
@@ -3933,8 +4038,8 @@ impl PlayerInternal {
 
             PlayerCommand::Preload {
                 track_id,
-                transition_plan,
-            } => self.handle_command_preload(track_id, transition_plan),
+                transition,
+            } => self.handle_command_preload(track_id, transition),
 
             PlayerCommand::Seek(position_ms) => self.handle_command_seek(position_ms)?,
 
@@ -4741,7 +4846,7 @@ mod tests {
     ) {
         player.preload = PlayerPreload::Ready {
             track_id,
-            transition_plan: None,
+            transition: PreloadTransition::SafetyFallback,
             secondary_trim_frames: 0,
             source: Box::new(source),
         };
@@ -4866,7 +4971,7 @@ mod tests {
         let mut player = player_internal_with_sink(&runtime, starts, stops);
         player.preload = PlayerPreload::Ready {
             track_id: next_track_uri(),
-            transition_plan: Some(scheduled_test_plan()),
+            transition: PreloadTransition::Scheduled(scheduled_test_plan()),
             secondary_trim_frames: 0,
             source: Box::new(scripted_source(
                 next_track_uri(),
@@ -4889,7 +4994,7 @@ mod tests {
         let mut player = player_internal_with_sink(&runtime, starts, stops);
         player.preload = PlayerPreload::Ready {
             track_id: next_track_uri(),
-            transition_plan: Some(scheduled_test_plan()),
+            transition: PreloadTransition::Scheduled(scheduled_test_plan()),
             secondary_trim_frames: 0,
             source: Box::new(scripted_source(
                 next_track_uri(),
@@ -4906,7 +5011,7 @@ mod tests {
         assert!(matches!(
             player.preload,
             PlayerPreload::Ready {
-                transition_plan: Some(_),
+                transition: PreloadTransition::Scheduled(_),
                 ..
             }
         ));
@@ -4929,11 +5034,14 @@ mod tests {
         set_ready_secondary(&mut player, next_track_id.clone(), next_source);
 
         let _guard = runtime.enter();
-        player.handle_command_preload(next_track_id.clone(), Some(scheduled_test_plan()));
+        player.handle_command_preload(
+            next_track_id.clone(),
+            PreloadTransition::Scheduled(scheduled_test_plan()),
+        );
 
         let PlayerPreload::Ready {
             track_id,
-            transition_plan,
+            transition,
             secondary_trim_frames,
             source,
         } = &player.preload
@@ -4948,9 +5056,116 @@ mod tests {
                 .expect("plan upgrade should not rebuild the decoder"),
             decoder_address
         );
-        assert!(transition_plan.is_some());
+        assert!(matches!(transition, PreloadTransition::Scheduled(_)));
         assert_eq!(source.stream_position_ms, 12_000);
         assert_eq!(*secondary_trim_frames, 0);
+    }
+
+    #[test]
+    fn normal_crossfade_uses_configured_duration_after_secondary_pcm_is_ready() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        player.config.normal_crossfade_duration = Duration::from_secs(5);
+        let mut current = scripted_loaded_track(94_800);
+        current.duration_ms = 100_000;
+        set_playing_source(&mut player, track_uri(), current);
+
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        player.preload = PlayerPreload::Ready {
+            track_id: next_track_uri(),
+            transition: PreloadTransition::NormalCrossfade,
+            secondary_trim_frames: 0,
+            source: Box::new(scripted_source(
+                next_track_uri(),
+                0,
+                Box::new(CountingPcmDecoder {
+                    calls: decode_calls.clone(),
+                    packets_remaining: None,
+                }),
+            )),
+        };
+
+        player.arm_transition_if_selected();
+        assert_eq!(player.transition.state(), TransitionState::Idle);
+        let required_chunks = PlayerInternal::duration_frame_count(Duration::from_secs(5))
+            .div_ceil(SECONDARY_PCM_CHUNK_FRAMES);
+        wait_until("normal crossfade secondary worker did not advance", || {
+            decode_calls.load(Ordering::Acquire) > required_chunks
+        });
+        player.arm_transition_if_selected();
+
+        assert_eq!(player.transition.state(), TransitionState::Armed);
+        assert_eq!(player.transition.total_frames(), 220_500);
+    }
+
+    #[test]
+    fn normal_crossfade_does_not_arm_with_only_one_pcm_chunk() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        player.config.normal_crossfade_duration = Duration::from_millis(100);
+        let mut current = scripted_loaded_track(99_700);
+        current.duration_ms = 100_000;
+        set_playing_source(&mut player, track_uri(), current);
+
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        player.preload = PlayerPreload::Ready {
+            track_id: next_track_uri(),
+            transition: PreloadTransition::NormalCrossfade,
+            secondary_trim_frames: 0,
+            source: Box::new(scripted_source(
+                next_track_uri(),
+                0,
+                Box::new(CountingPcmDecoder {
+                    calls: decode_calls.clone(),
+                    packets_remaining: Some(1),
+                }),
+            )),
+        };
+
+        player.arm_transition_if_selected();
+        wait_until("normal crossfade secondary worker did not advance", || {
+            decode_calls.load(Ordering::Acquire) >= 2
+        });
+        player.arm_transition_if_selected();
+
+        assert_eq!(player.transition.state(), TransitionState::Idle);
+        assert!(matches!(player.preload, PlayerPreload::Ready { .. }));
+    }
+
+    #[test]
+    fn zero_normal_crossfade_duration_does_not_start_secondary_pcm_decode() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        player.config.normal_crossfade_duration = Duration::ZERO;
+        let mut current = scripted_loaded_track(99_900);
+        current.duration_ms = 100_000;
+        set_playing_source(&mut player, track_uri(), current);
+
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        player.preload = PlayerPreload::Ready {
+            track_id: next_track_uri(),
+            transition: PreloadTransition::NormalCrossfade,
+            secondary_trim_frames: 0,
+            source: Box::new(scripted_source(
+                next_track_uri(),
+                0,
+                Box::new(CountingPcmDecoder {
+                    calls: decode_calls.clone(),
+                    packets_remaining: None,
+                }),
+            )),
+        };
+
+        player.arm_transition_if_selected();
+
+        assert_eq!(player.transition.state(), TransitionState::Idle);
+        assert_eq!(decode_calls.load(Ordering::Acquire), 0);
     }
 
     fn poll_recovery_once(player: &mut PlayerInternal) -> bool {
@@ -5622,7 +5837,7 @@ mod tests {
         let (entered_tx, entered_rx) = std_mpsc::channel();
         player.preload = PlayerPreload::Ready {
             track_id: next_track_uri(),
-            transition_plan: Some(scheduled_test_plan()),
+            transition: PreloadTransition::Scheduled(scheduled_test_plan()),
             secondary_trim_frames: 0,
             source: Box::new(scripted_source(
                 next_track_uri(),
@@ -5803,7 +6018,7 @@ mod tests {
         let decode_calls = Arc::new(AtomicUsize::new(0));
         player.preload = PlayerPreload::Ready {
             track_id: next_track_uri(),
-            transition_plan: Some(speed_transition_plan(
+            transition: PreloadTransition::Scheduled(speed_transition_plan(
                 Duration::from_millis(100),
                 Duration::from_millis(2_763),
                 0.90312,
@@ -6771,7 +6986,7 @@ mod tests {
         let old_loader_dropped = Arc::new(AtomicBool::new(false));
         player.preload = PlayerPreload::Loading {
             track_id: track_id.clone(),
-            transition_plan: Some(transition_plan.clone()),
+            transition: PreloadTransition::Scheduled(transition_plan.clone()),
             loader: Box::pin(DropTrackingLoader {
                 dropped: old_loader_dropped.clone(),
             }),
@@ -6789,7 +7004,7 @@ mod tests {
             &player.preload,
             PlayerPreload::Loading {
                 track_id: restarted,
-                transition_plan: Some(restarted_plan),
+                transition: PreloadTransition::Scheduled(restarted_plan),
                 ..
             } if restarted == &track_id && restarted_plan == &transition_plan
         ));

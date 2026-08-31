@@ -373,6 +373,10 @@ impl TransitionPolicy for FixedDurationTransitionPolicy {
         current_position: Duration,
         current_duration: Duration,
     ) -> Option<TransitionSpec> {
+        if self.duration.is_zero() {
+            return None;
+        }
+
         let remaining = Self::remaining(current_position, current_duration)?;
         if remaining > self.duration.saturating_add(self.preparation) {
             return None;
@@ -387,6 +391,10 @@ impl TransitionPolicy for FixedDurationTransitionPolicy {
     }
 
     fn should_start(&self, current_position: Duration, current_duration: Duration) -> bool {
+        if self.duration.is_zero() {
+            return false;
+        }
+
         Self::remaining(current_position, current_duration)
             .is_some_and(|remaining| remaining <= self.duration)
     }
@@ -919,6 +927,34 @@ mod tests {
         assert_eq!(spec.curve, TransitionCurve::Linear);
         assert!(!policy.should_start(Duration::from_millis(94_999), duration));
         assert!(policy.should_start(Duration::from_millis(95_000), duration));
+    }
+
+    #[test]
+    fn fixed_policy_uses_configured_duration_and_zero_disables_transition() {
+        let track_duration = Duration::from_secs(100);
+        let preparation = Duration::from_millis(200);
+        for seconds in [3, 8] {
+            let policy =
+                FixedDurationTransitionPolicy::new(Duration::from_secs(seconds), preparation);
+            let position = track_duration - Duration::from_secs(seconds) - preparation;
+            let spec = policy
+                .plan(position, track_duration)
+                .expect("configured overlap should enter preparation window");
+            assert_eq!(spec.duration, Duration::from_secs(seconds));
+            assert_eq!(spec.curve, TransitionCurve::Linear);
+            assert!(!policy.should_start(position, track_duration));
+            assert!(policy.should_start(
+                track_duration - Duration::from_secs(seconds),
+                track_duration
+            ));
+        }
+
+        let disabled = FixedDurationTransitionPolicy::new(Duration::ZERO, preparation);
+        assert_eq!(
+            disabled.plan(Duration::from_millis(99_900), track_duration),
+            None
+        );
+        assert!(!disabled.should_start(Duration::from_secs(100), track_duration));
     }
 
     #[test]

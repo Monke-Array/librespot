@@ -3,6 +3,14 @@ use std::{mem, path::PathBuf, str::FromStr, time::Duration};
 pub use crate::dither::{DithererBuilder, TriangularDitherer, mk_ditherer};
 use crate::{convert::i24, player::duration_to_coefficient};
 
+pub const DEFAULT_NORMAL_CROSSFADE_DURATION: Duration = Duration::from_secs(5);
+pub const MAX_NORMAL_CROSSFADE_DURATION: Duration = Duration::from_secs(12);
+
+pub fn normal_crossfade_duration_from_secs(seconds: u64) -> Option<Duration> {
+    let duration = Duration::from_secs(seconds);
+    (duration <= MAX_NORMAL_CROSSFADE_DURATION).then_some(duration)
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialOrd, Ord, PartialEq, Eq, Default)]
 pub enum Bitrate {
     Bitrate96,
@@ -106,6 +114,7 @@ pub struct PlayerConfig {
     pub bitrate: Bitrate,
     pub gapless: bool,
     pub passthrough: bool,
+    pub normal_crossfade_duration: Duration,
 
     pub normalisation: bool,
     pub normalisation_type: NormalisationType,
@@ -131,6 +140,7 @@ impl Default for PlayerConfig {
         Self {
             bitrate: Bitrate::default(),
             gapless: true,
+            normal_crossfade_duration: DEFAULT_NORMAL_CROSSFADE_DURATION,
             normalisation: false,
             normalisation_type: NormalisationType::default(),
             normalisation_method: NormalisationMethod::default(),
@@ -144,6 +154,29 @@ impl Default for PlayerConfig {
             position_update_interval: None,
             local_file_directories: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_normal_crossfade_duration_is_five_seconds() {
+        assert_eq!(
+            PlayerConfig::default().normal_crossfade_duration,
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn normal_crossfade_duration_range_is_zero_to_twelve_seconds() {
+        assert_eq!(normal_crossfade_duration_from_secs(0), Some(Duration::ZERO));
+        assert_eq!(
+            normal_crossfade_duration_from_secs(12),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(normal_crossfade_duration_from_secs(13), None);
     }
 }
 

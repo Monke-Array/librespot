@@ -136,7 +136,25 @@ fn mixer_auto_edge_is_eligible(
     has_backend_auto_transition: bool,
     context_is_mixer: bool,
 ) -> bool {
-    has_transition_plan || has_transition_uri || has_backend_auto_transition || context_is_mixer
+    context_is_mixer
+        && (has_transition_plan
+            || has_transition_uri
+            || has_backend_auto_transition
+            || context_is_mixer)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransitionPreloadRoute {
+    NormalCrossfade,
+    Mixer,
+}
+
+fn transition_preload_route(context_is_mixer: bool) -> TransitionPreloadRoute {
+    if context_is_mixer {
+        TransitionPreloadRoute::Mixer
+    } else {
+        TransitionPreloadRoute::NormalCrossfade
+    }
 }
 
 impl From<SpircError> for Error {
@@ -1991,6 +2009,24 @@ impl SpircTask {
             let outgoing = self
                 .connect_state
                 .current_track(|track| track.as_ref().cloned());
+            let context_is_mixer = self.connect_state.is_mixer_context();
+            if transition_preload_route(context_is_mixer) == TransitionPreloadRoute::NormalCrossfade
+            {
+                self.cancel_local_auto();
+                if let Some(outgoing) = outgoing.as_ref() {
+                    debug!(
+                        "[transition] context classified non-Mixer edge={}->{}; local Auto inactive",
+                        outgoing.uri, incoming.uri
+                    );
+                } else {
+                    debug!(
+                        "[transition] context classified non-Mixer incoming={}; local Auto inactive",
+                        incoming.uri
+                    );
+                }
+                self.player.preload_with_normal_crossfade(track_id.clone());
+                return;
+            }
             let Some(outgoing) = outgoing else {
                 self.cancel_local_auto();
                 debug!("[spotify-mix] hydration unavailable; using fallback");
@@ -2007,7 +2043,7 @@ impl SpircTask {
                 outgoing
                     .metadata
                     .contains_key(crate::spotify_mix::BACKEND_RECIPE_ATTRIBUTE),
-                self.connect_state.is_mixer_context(),
+                context_is_mixer,
             );
             if mixer_edge_known {
                 self.prepare_local_auto_pair(&outgoing, &incoming);
@@ -2866,6 +2902,24 @@ mod tests {
     fn mixer_context_without_per_edge_metadata_is_local_auto_eligible() {
         assert!(mixer_auto_edge_is_eligible(false, false, false, true));
         assert!(!mixer_auto_edge_is_eligible(false, false, false, false));
+    }
+
+    #[test]
+    fn non_mixer_edge_metadata_does_not_enable_mixer_auto() {
+        assert!(!mixer_auto_edge_is_eligible(true, true, true, false));
+        assert!(mixer_auto_edge_is_eligible(false, false, false, true));
+    }
+
+    #[test]
+    fn non_mixer_context_selects_normal_crossfade_preload() {
+        assert_eq!(
+            transition_preload_route(false),
+            TransitionPreloadRoute::NormalCrossfade
+        );
+        assert_eq!(
+            transition_preload_route(true),
+            TransitionPreloadRoute::Mixer
+        );
     }
 
     #[test]

@@ -23,7 +23,7 @@ pub(crate) const SECONDARY_PCM_CHUNK_FRAMES: usize = 1024;
 pub(crate) const SECONDARY_PCM_CHANNEL_CAPACITY: usize = 8;
 
 const SECONDARY_PCM_CHUNK_SAMPLES: usize = SECONDARY_PCM_CHUNK_FRAMES * NUM_CHANNELS as usize;
-pub(crate) const SECONDARY_PCM_ASSEMBLER_SAMPLES: usize = SECONDARY_PCM_CHUNK_SAMPLES * 2;
+const SECONDARY_PCM_INITIAL_BUFFER_SAMPLES: usize = SECONDARY_PCM_CHUNK_SAMPLES * 2;
 
 pub(crate) type Decoder = Box<dyn AudioDecoder + Send>;
 
@@ -70,6 +70,7 @@ impl SourceDecoder {
         track_label: String,
         speed_automation: Option<SpeedAutomation>,
         source_position_ms: u32,
+        pcm_channel_capacity: usize,
     ) -> Result<bool, DecoderError> {
         match self {
             Self::Worker(_) => return Ok(false),
@@ -87,6 +88,7 @@ impl SourceDecoder {
             track_label,
             speed_automation,
             source_position_ms,
+            pcm_channel_capacity,
         )?);
         Ok(true)
     }
@@ -110,6 +112,7 @@ impl SourceDecoder {
             cancelled,
             None,
             0,
+            SECONDARY_PCM_CHANNEL_CAPACITY,
         )?);
         Ok(())
     }
@@ -122,10 +125,6 @@ impl SourceDecoder {
     }
 
     pub(crate) fn secondary_pcm_readiness(&mut self, samples: usize) -> SecondaryPcmReadiness {
-        if samples > SECONDARY_PCM_ASSEMBLER_SAMPLES {
-            return SecondaryPcmReadiness::Pending;
-        }
-
         match self {
             Self::Worker(worker) => worker.has_pcm(samples),
             Self::Direct(_) => SecondaryPcmReadiness::Pending,
@@ -208,6 +207,7 @@ pub(crate) struct SecondaryDecodeWorker {
     pcm_consumed_frames: u64,
     pcm_generation: Option<u64>,
     pending_terminal: Option<SecondaryDecodeMessage>,
+    max_pcm_samples: usize,
     time_stretch: Option<PitchPreservingTimeStretch>,
     time_stretch_flushed: bool,
 }
@@ -220,6 +220,7 @@ impl SecondaryDecodeWorker {
         track_label: String,
         speed_automation: Option<SpeedAutomation>,
         source_position_ms: u32,
+        pcm_channel_capacity: usize,
     ) -> Result<Self, DecoderError> {
         let cancelled = Arc::new(AtomicBool::new(false));
         Self::spawn_with_cancellation(
@@ -230,6 +231,7 @@ impl SecondaryDecodeWorker {
             cancelled,
             speed_automation,
             source_position_ms,
+            pcm_channel_capacity,
         )
     }
 
@@ -241,8 +243,11 @@ impl SecondaryDecodeWorker {
         cancelled: Arc<AtomicBool>,
         speed_automation: Option<SpeedAutomation>,
         source_position_ms: u32,
+        pcm_channel_capacity: usize,
     ) -> Result<Self, DecoderError> {
-        let (sender, receiver) = sync_channel(SECONDARY_PCM_CHANNEL_CAPACITY);
+        let pcm_channel_capacity = pcm_channel_capacity.max(1);
+        let max_pcm_samples = pcm_channel_capacity.saturating_mul(SECONDARY_PCM_CHUNK_SAMPLES);
+        let (sender, receiver) = sync_channel(pcm_channel_capacity);
         let finished = Arc::new(AtomicBool::new(false));
         let worker_cancelled = cancelled.clone();
         let worker_finished = finished.clone();
@@ -279,11 +284,14 @@ impl SecondaryDecodeWorker {
             stream_loader_controller,
             thread: Some(thread),
             track_label,
-            pcm_buffer: Vec::with_capacity(SECONDARY_PCM_ASSEMBLER_SAMPLES),
+            pcm_buffer: Vec::with_capacity(
+                SECONDARY_PCM_INITIAL_BUFFER_SAMPLES.min(max_pcm_samples),
+            ),
             pcm_origin: None,
             pcm_consumed_frames: 0,
             pcm_generation: None,
             pending_terminal: None,
+            max_pcm_samples,
             time_stretch,
             time_stretch_flushed: false,
         })
@@ -353,6 +361,9 @@ impl SecondaryDecodeWorker {
 
     fn has_pcm(&mut self, samples: usize) -> SecondaryPcmReadiness {
         Self::assert_readiness_request(samples);
+        if samples > self.max_pcm_samples {
+            return SecondaryPcmReadiness::Pending;
+        }
 
         if self.time_stretch.is_some() {
             return self.has_stretched_pcm(samples);
@@ -408,10 +419,6 @@ impl SecondaryDecodeWorker {
 
     fn assert_readiness_request(samples: usize) {
         Self::assert_sample_alignment(samples);
-        assert!(
-            samples <= SECONDARY_PCM_ASSEMBLER_SAMPLES,
-            "secondary PCM readiness exceeds the bounded assembler capacity"
-        );
     }
 
     fn assert_sample_alignment(samples: usize) {
@@ -689,7 +696,7 @@ impl SecondaryDecodeWorker {
 
     fn push_pcm(&mut self, generation: u64, position: AudioPacketPosition, mut packet: Vec<f64>) {
         assert!(packet.len() <= SECONDARY_PCM_CHUNK_SAMPLES);
-        assert!(self.pcm_buffer.len() + packet.len() <= SECONDARY_PCM_ASSEMBLER_SAMPLES);
+        assert!(self.pcm_buffer.len() + packet.len() <= self.max_pcm_samples);
         if self.pcm_origin.is_none() {
             self.pcm_origin = Some(position);
             self.pcm_consumed_frames = 0;

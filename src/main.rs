@@ -1822,6 +1822,7 @@ async fn get_setup() -> Setup {
             bitrate,
             gapless,
             passthrough,
+            normal_crossfade_duration: player_default_config.normal_crossfade_duration,
             normalisation,
             normalisation_type,
             normalisation_method,
