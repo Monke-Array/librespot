@@ -8,3 +8,6 @@ spotify_appkey.key
 .cache
 *.save
 *.*~
+
+# Temporary Codex reasoning; durable verified state lives in docs/CODEX_STATE.md
+/.codex/WORKING_MEMORY.md
