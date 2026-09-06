@@ -753,39 +753,53 @@ fn run_decode_worker(
 ) {
     debug!("Secondary decode started for <{track_label}>");
     let mut reported_ready = false;
+    let mut pending_samples = Vec::with_capacity(SECONDARY_PCM_CHUNK_SAMPLES);
+    let mut pending_position = None;
 
     while !cancelled.load(Ordering::Acquire) {
         match decoder.next_packet() {
             Ok(Some((position, AudioPacket::Samples(samples)))) => {
-                for (chunk_index, chunk) in samples.chunks(SECONDARY_PCM_CHUNK_SAMPLES).enumerate()
-                {
+                let mut offset = 0;
+                while offset < samples.len() {
                     if cancelled.load(Ordering::Acquire) {
                         finished.store(true, Ordering::Release);
                         return;
                     }
 
-                    let frame_offset = chunk_index * SECONDARY_PCM_CHUNK_FRAMES;
-                    let position_offset_ms =
-                        (frame_offset as u64 * 1000 / u64::from(SAMPLE_RATE)) as u32;
-                    let chunk_position = AudioPacketPosition {
-                        position_ms: position.position_ms.saturating_add(position_offset_ms),
-                        skipped: position.skipped && chunk_index == 0,
-                    };
-                    let message = SecondaryDecodeMessage {
-                        generation,
-                        event: SecondaryDecodeEvent::Packet(
-                            chunk_position,
-                            AudioPacket::Samples(chunk.to_vec()),
-                        ),
-                    };
-
-                    if sender.send(message).is_err() {
-                        finished.store(true, Ordering::Release);
-                        return;
+                    if pending_samples.is_empty() {
+                        let frame_offset = offset / NUM_CHANNELS as usize;
+                        let position_offset_ms =
+                            (frame_offset as u64 * 1000 / u64::from(SAMPLE_RATE)) as u32;
+                        pending_position = Some(AudioPacketPosition {
+                            position_ms: position.position_ms.saturating_add(position_offset_ms),
+                            skipped: position.skipped && offset == 0,
+                        });
                     }
-                    if !reported_ready {
-                        debug!("Secondary PCM ready for transition for <{track_label}>");
-                        reported_ready = true;
+
+                    let take = (SECONDARY_PCM_CHUNK_SAMPLES - pending_samples.len())
+                        .min(samples.len() - offset);
+                    pending_samples.extend_from_slice(&samples[offset..offset + take]);
+                    offset += take;
+
+                    if pending_samples.len() == SECONDARY_PCM_CHUNK_SAMPLES {
+                        let message = SecondaryDecodeMessage {
+                            generation,
+                            event: SecondaryDecodeEvent::Packet(
+                                pending_position
+                                    .take()
+                                    .expect("buffered secondary PCM must retain its position"),
+                                AudioPacket::Samples(mem::take(&mut pending_samples)),
+                            ),
+                        };
+                        if sender.send(message).is_err() {
+                            finished.store(true, Ordering::Release);
+                            return;
+                        }
+                        pending_samples = Vec::with_capacity(SECONDARY_PCM_CHUNK_SAMPLES);
+                        if !reported_ready {
+                            debug!("Secondary PCM ready for transition for <{track_label}>");
+                            reported_ready = true;
+                        }
                     }
                 }
             }
@@ -802,6 +816,21 @@ fn run_decode_worker(
             }
             Ok(None) => {
                 debug!("Secondary EOF for <{track_label}>");
+                if !pending_samples.is_empty()
+                    && sender
+                        .send(SecondaryDecodeMessage {
+                            generation,
+                            event: SecondaryDecodeEvent::Packet(
+                                pending_position
+                                    .take()
+                                    .expect("buffered secondary PCM must retain its position"),
+                                AudioPacket::Samples(mem::take(&mut pending_samples)),
+                            ),
+                        })
+                        .is_err()
+                {
+                    break;
+                }
                 let _ = sender.send(SecondaryDecodeMessage {
                     generation,
                     event: SecondaryDecodeEvent::Eof,
@@ -810,6 +839,21 @@ fn run_decode_worker(
             }
             Err(error) => {
                 debug!("Secondary decode failed for <{track_label}>: {error}");
+                if !pending_samples.is_empty()
+                    && sender
+                        .send(SecondaryDecodeMessage {
+                            generation,
+                            event: SecondaryDecodeEvent::Packet(
+                                pending_position
+                                    .take()
+                                    .expect("buffered secondary PCM must retain its position"),
+                                AudioPacket::Samples(mem::take(&mut pending_samples)),
+                            ),
+                        })
+                        .is_err()
+                {
+                    break;
+                }
                 let _ = sender.send(SecondaryDecodeMessage {
                     generation,
                     event: SecondaryDecodeEvent::Failed(error),

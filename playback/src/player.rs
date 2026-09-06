@@ -4776,6 +4776,32 @@ mod tests {
         }
     }
 
+    struct UndersizedPacketDecoder {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl AudioDecoder for UndersizedPacketDecoder {
+        fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError> {
+            Ok(position_ms)
+        }
+
+        fn next_packet(
+            &mut self,
+        ) -> Result<Option<(AudioPacketPosition, AudioPacket)>, DecoderError> {
+            let call = self.calls.fetch_add(1, Ordering::AcqRel);
+            let frames = SECONDARY_PCM_CHUNK_FRAMES / 4;
+            let frame_position = call.saturating_mul(frames);
+            let position_ms = (frame_position as u64 * 1000 / u64::from(SAMPLE_RATE)) as u32;
+            Ok(Some((
+                AudioPacketPosition {
+                    position_ms,
+                    skipped: false,
+                },
+                AudioPacket::Samples(vec![0.25; frames * NUM_CHANNELS as usize]),
+            )))
+        }
+    }
+
     struct FixedVolume(f64);
 
     impl VolumeGetter for FixedVolume {
@@ -5913,6 +5939,44 @@ mod tests {
                 .iter()
                 .all(|sample| *sample == 724.0)
         );
+    }
+
+    #[test]
+    fn secondary_channel_capacity_tracks_pcm_duration_for_undersized_decoder_packets() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        set_ready_secondary(
+            &mut player,
+            next_track_uri(),
+            scripted_source(
+                next_track_uri(),
+                0,
+                Box::new(UndersizedPacketDecoder {
+                    calls: decode_calls.clone(),
+                }),
+            ),
+        );
+        player
+            .start_secondary_decode()
+            .expect("secondary worker should start");
+
+        wait_until(
+            "secondary channel filled by packet count before holding its promised PCM duration",
+            || decode_calls.load(Ordering::Acquire) >= SECONDARY_PCM_CHANNEL_CAPACITY * 4 + 1,
+        );
+        let required_samples =
+            SECONDARY_PCM_CHANNEL_CAPACITY * SECONDARY_PCM_CHUNK_FRAMES * NUM_CHANNELS as usize;
+        let PlayerPreload::Ready { source, .. } = &mut player.preload else {
+            panic!("test requires a ready secondary source");
+        };
+        assert_eq!(
+            source.decoder.secondary_pcm_readiness(required_samples),
+            SecondaryPcmReadiness::Ready
+        );
+        player.cancel_secondary_source("test cleanup");
     }
 
     #[test]
