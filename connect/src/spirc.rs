@@ -92,6 +92,14 @@ struct LocalAutoPairState {
     selected_local_auto: bool,
 }
 
+impl LocalAutoPairState {
+    fn retain_after_session_replacement(&mut self) {
+        if !self.selected_local_auto && self.prepared_transition.is_none() {
+            self.attempted = false;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HigherPriorityTransitionState {
     SavedSelected,
@@ -155,6 +163,30 @@ fn transition_preload_route(context_is_mixer: bool) -> TransitionPreloadRoute {
     } else {
         TransitionPreloadRoute::NormalCrossfade
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MixerPreloadPlanSource {
+    Official,
+    SelectedLocalAuto,
+    SafetyFallback,
+}
+
+fn mixer_preload_plan_source(
+    has_official_plan: bool,
+    has_selected_local_auto_plan_for_edge: bool,
+) -> MixerPreloadPlanSource {
+    if has_official_plan {
+        MixerPreloadPlanSource::Official
+    } else if has_selected_local_auto_plan_for_edge {
+        MixerPreloadPlanSource::SelectedLocalAuto
+    } else {
+        MixerPreloadPlanSource::SafetyFallback
+    }
+}
+
+fn should_eagerly_preload_mixer_edge(context_is_mixer: bool, has_upcoming_track: bool) -> bool {
+    context_is_mixer && has_upcoming_track
 }
 
 impl From<SpircError> for Error {
@@ -680,7 +712,12 @@ impl SpircTask {
 
         self.player.set_session(session.clone());
         self.context_resolver.set_session(session.clone());
-        self.cancel_transition_hydrations();
+        self.transition_hydrations.abort_all();
+        self.transition_hydration_cache.clear();
+        self.local_auto_tasks.abort_all();
+        if let Some(state) = self.local_auto_pair.as_mut() {
+            state.retain_after_session_replacement();
+        }
         self.connection_id_update = bindings.connection_id_update;
         self.connect_state_update = bindings.connect_state_update;
         self.connect_state_volume_update = bindings.connect_state_volume_update;
@@ -692,6 +729,7 @@ impl SpircTask {
         self.user_attributes_mutation = bindings.user_attributes_mutation;
         self.session = session;
         self.connect_established = false;
+        self.maybe_start_local_auto();
 
         debug!("Spirc session replaced in place; retained Connect state and player recovery state");
         Ok(())
@@ -1070,8 +1108,9 @@ impl SpircTask {
                 self.local_auto_current_identity = None;
                 debug!("[spotify-auto] current track had an invalid canonical URI");
             }
-            self.maybe_start_local_auto();
             self.connect_state.update_duration(audio_item.duration_ms);
+            self.maybe_start_local_auto();
+            self.eagerly_preload_mixer_edge_if_known("track changed");
             self.update_state = true;
             return Ok(());
         }
@@ -1492,10 +1531,12 @@ impl SpircTask {
             AddToQueue(add_to_queue) => {
                 self.cancel_transition_hydrations();
                 self.connect_state.add_to_queue(add_to_queue.track, true);
+                self.eagerly_preload_mixer_edge_if_known("queue changed");
             }
             SetQueue(set_queue) => {
                 self.cancel_transition_hydrations();
                 self.connect_state.handle_set_queue(set_queue);
+                self.eagerly_preload_mixer_edge_if_known("queue changed");
             }
             SetOptions(set_options) => {
                 if let Some(repeat_context) = set_options.repeating_context {
@@ -1967,6 +2008,7 @@ impl SpircTask {
                 ..
             } => *nominal_start_time = now - position_ms as i64,
         };
+        self.eagerly_preload_mixer_edge_if_known("seek completed");
     }
 
     fn handle_shuffle(&mut self, shuffle: bool) -> Result<(), Error> {
@@ -2037,6 +2079,11 @@ impl SpircTask {
             let transition_plan =
                 crate::spotify_mix::transition_plan_for_pair(&outgoing, &incoming);
             let transition_uri = transition_uri(&outgoing).map(str::to_owned);
+            let active_local_auto_key = LocalAutoPairKey::from_edge(
+                self.connect_state.context_uri().clone(),
+                &outgoing,
+                &incoming,
+            );
             let mixer_edge_known = mixer_auto_edge_is_eligible(
                 transition_plan.is_some(),
                 transition_uri.is_some(),
@@ -2050,8 +2097,29 @@ impl SpircTask {
             } else {
                 self.cancel_local_auto();
             }
+            let selected_local_auto_plan = self
+                .local_auto_pair
+                .as_ref()
+                .filter(|state| state.key == active_local_auto_key && state.selected_local_auto)
+                .and_then(|state| state.prepared_transition.as_ref())
+                .map(|prepared| prepared.plan.clone())
+                .filter(|plan| self.transition_plan_can_still_apply(plan));
+            let preload_plan = match mixer_preload_plan_source(
+                transition_plan.is_some(),
+                selected_local_auto_plan.is_some(),
+            ) {
+                MixerPreloadPlanSource::Official => transition_plan.clone(),
+                MixerPreloadPlanSource::SelectedLocalAuto => {
+                    debug!(
+                        "[spotify-auto] reusing selected local Auto plan for repeated preload edge={}->{}",
+                        outgoing.uri, incoming.uri
+                    );
+                    selected_local_auto_plan
+                }
+                MixerPreloadPlanSource::SafetyFallback => None,
+            };
             self.player
-                .preload_with_transition(track_id.clone(), transition_plan.clone());
+                .preload_with_transition(track_id.clone(), preload_plan);
 
             // Retain support for contexts that already carry the recipe inline.
             if transition_plan.is_some() {
@@ -2134,6 +2202,18 @@ impl SpircTask {
                 }
             }
         }
+    }
+
+    fn eagerly_preload_mixer_edge_if_known(&mut self, reason: &str) {
+        if !should_eagerly_preload_mixer_edge(
+            self.connect_state.is_mixer_context(),
+            self.connect_state.preview_next_track().is_some(),
+        ) {
+            return;
+        }
+
+        debug!("[spotify-auto] eager Mixer preload triggered: {reason}");
+        self.handle_preload_next_track();
     }
 
     fn handle_transition_hydration(&mut self, hydration: HydrationResult) {
@@ -2923,6 +3003,33 @@ mod tests {
     }
 
     #[test]
+    fn repeated_mixer_preload_reuses_the_selected_local_auto_plan() {
+        assert_eq!(
+            mixer_preload_plan_source(false, true),
+            MixerPreloadPlanSource::SelectedLocalAuto
+        );
+        assert_eq!(
+            mixer_preload_plan_source(false, false),
+            MixerPreloadPlanSource::SafetyFallback
+        );
+    }
+
+    #[test]
+    fn official_plan_still_precedes_a_selected_local_auto_plan() {
+        assert_eq!(
+            mixer_preload_plan_source(true, true),
+            MixerPreloadPlanSource::Official
+        );
+    }
+
+    #[test]
+    fn mixer_edges_preload_eagerly_when_an_upcoming_track_is_known() {
+        assert!(should_eagerly_preload_mixer_edge(true, true));
+        assert!(!should_eagerly_preload_mixer_edge(false, true));
+        assert!(!should_eagerly_preload_mixer_edge(true, false));
+    }
+
+    #[test]
     fn replace_session_api_delivers_replacement_to_retained_task() {
         let runtime = tokio::runtime::Runtime::new().expect("test runtime");
         runtime.block_on(async {
@@ -2956,6 +3063,43 @@ mod tests {
         preserve_session_identity(&current, &replacement);
 
         assert_eq!(current.session_id(), replacement.session_id());
+    }
+
+    #[test]
+    fn session_replacement_preserves_selected_edge_and_retries_only_unprepared_work() {
+        let key = local_auto_key(
+            "spotify:playlist:mixer",
+            CURRENT_URI,
+            NEXT_URI,
+            "current-row",
+            "next-row",
+        );
+        let mut selected = LocalAutoPairState {
+            key: key.clone(),
+            higher_priority: HigherPriorityTransitionState::Exhausted,
+            attempted: true,
+            incoming_identity: None,
+            prepared_transition: None,
+            selected_local_auto: true,
+        };
+        selected.retain_after_session_replacement();
+
+        assert_eq!(selected.key, key);
+        assert!(selected.selected_local_auto);
+        assert!(selected.attempted);
+
+        let mut unfinished = LocalAutoPairState {
+            key,
+            higher_priority: HigherPriorityTransitionState::Exhausted,
+            attempted: true,
+            incoming_identity: None,
+            prepared_transition: None,
+            selected_local_auto: false,
+        };
+        unfinished.retain_after_session_replacement();
+
+        assert!(!unfinished.attempted);
+        assert!(!unfinished.selected_local_auto);
     }
 
     fn uri(value: &str) -> SpotifyUri {
