@@ -644,6 +644,19 @@ fn preserve_session_identity(current: &Session, replacement: &Session) {
     replacement.set_session_id(&current.session_id());
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplacedSessionRetirement {
+    shutdown_ap: bool,
+    close_dealer: bool,
+}
+
+fn replaced_session_retirement(ap_is_invalid: bool) -> ReplacedSessionRetirement {
+    ReplacedSessionRetirement {
+        shutdown_ap: !ap_is_invalid,
+        close_dealer: true,
+    }
+}
+
 impl SpircTask {
     async fn connect_session(
         session: &Session,
@@ -706,8 +719,12 @@ impl SpircTask {
             return Err(why);
         }
 
-        if !self.session.is_invalid() {
+        let retirement = replaced_session_retirement(self.session.is_invalid());
+        if retirement.shutdown_ap {
             self.session.shutdown();
+        }
+        if retirement.close_dealer {
+            self.session.dealer().close().await;
         }
 
         self.player.set_session(session.clone());
@@ -3063,6 +3080,17 @@ mod tests {
         preserve_session_identity(&current, &replacement);
 
         assert_eq!(current.session_id(), replacement.session_id());
+    }
+
+    #[test]
+    fn replacement_retirement_always_closes_dealer_even_when_ap_is_invalid() {
+        let valid = replaced_session_retirement(false);
+        assert!(valid.shutdown_ap);
+        assert!(valid.close_dealer);
+
+        let invalid = replaced_session_retirement(true);
+        assert!(!invalid.shutdown_ap);
+        assert!(invalid.close_dealer);
     }
 
     #[test]
