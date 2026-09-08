@@ -12,6 +12,8 @@ improve and pass another held-out blind pilot before runtime integration.
   transition pilot findings`).
 - Operator research/design-preparation commit: `74dd3a0` (`docs: prepare
   transition operator architecture`).
+- Approved formal operator specification: `25da884` (`docs: specify offline
+  transition operator architecture`).
 - Networking implementation: `cbc3d21` (`fix(connect): retire dealer on session
   replacement`), based on runtime-validated `948a5d8`.
 - ML research remains isolated on S-01 branch `codex/pilot-v1`:
@@ -82,8 +84,12 @@ improve and pass another held-out blind pilot before runtime integration.
   handoff anchor; fixes schemas, hashes, operator equations/order, template
   recipes, generation/caps, offline rendering/QC, Pilot V2 artifacts, and
   current/future lowering boundaries. The critic only ranks valid IDs.
-- Formal spec awaiting human approval:
+- Formal spec approved on 2026-09-08 at commit `25da884`:
   `docs/superpowers/specs/2026-09-08-transition-operator-design.md`.
+- Documentation-only implementation plan awaiting human approval:
+  `docs/superpowers/plans/2026-09-08-offline-transition-operator-implementation.md`.
+  It sequences seven independently verified milestones from canonical IR through
+  repeat-aware Pilot V2 analysis; implementation has not begun.
 
 # Audio/runtime state
 
@@ -155,6 +161,6 @@ improve and pass another held-out blind pilot before runtime integration.
 # NEXT ACTION
 
 Human-review and approve or revise
-`docs/superpowers/specs/2026-09-08-transition-operator-design.md`. Only after
-explicit approval may the Superpowers implementation-plan workflow begin; no
-implementation is authorized yet.
+`docs/superpowers/plans/2026-09-08-offline-transition-operator-implementation.md`.
+Only explicit approval of that plan authorizes implementation; no implementation
+is authorized yet.
