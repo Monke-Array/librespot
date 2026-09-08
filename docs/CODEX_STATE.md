@@ -8,6 +8,8 @@ improve and pass another held-out blind pilot before runtime integration.
 # Branch / commits
 
 - Branch: `codex/m3a-live-auto-metadata`.
+- Blind Pilot V1 analysis/state commit: `98dcd31` (`docs: record blind
+  transition pilot findings`).
 - Networking implementation: `cbc3d21` (`fix(connect): retire dealer on session
   replacement`), based on runtime-validated `948a5d8`.
 - ML research remains isolated on S-01 branch `codex/pilot-v1`:
@@ -41,37 +43,18 @@ improve and pass another held-out blind pilot before runtime integration.
   `0e1c7f4bf27ec0241af115ca55bc16541a3c86b423c866baa61189b2a923688c`.
 - Frozen read-only artifact:
   `C:\Users\janni\Desktop\spotify-transition-pilot-v1-20260907\analysis\frozen\ratings-completed.sha256-0e1c7f4bf27ec0241af115ca55bc16541a3c86b423c866baa61189b2a923688c.json`.
-- Frozen source manifest SHA-256:
-  `6370f69a00b10bf2359aedae42b5ed1ae319f239350e7d7ffe5209922b3909dd`;
-  sanitized evaluator manifest:
-  `489fb0022a3c6972fdc5018075e85e5374164e38b737e8e840b6bf293e09d2b0`;
-  ratings template:
-  `41d0f47ff50b4e0bf460cd5e785a3ad598e01e7c0a283452a96351591750eae6`.
 - Condition mapping was decoded only after freezing, from the exact seeded
   generator procedure, then cross-checked because every mapped MLP sample is
   the unique audio hash. Full mapping is in the analysis report.
 
 # Human-evaluation findings
 
-- Identical Auto/linear controls occur in 24/24 pairs. Agreement was 19/24
-  category, 16/24 smoothness, 14/24 intent, and only 6/24 exact rank/ranking
-  group. Mean absolute differences were 0.375 smoothness, 0.667 intent, and
-  0.833 rank; rank must be treated as imprecise.
-- Control disagreement was not low-confidence-driven: any core disagreement
-  occurred in 1/3 confidence-1–3 pairs versus 18/21 confidence-4–5 pairs.
-- Validation MLP vs Auto: rank 1W/4L/0T, rating 1W/1L/3T,
-  smoothness +0.60, intent +0.60. MLP vs linear: rank 3W/2L/0T,
-  rating 2W/1L/2T, smoothness +0.60, intent +1.00. The contradictory ranks are
-  confounded by 0/5 control-rank agreement in validation.
-- Test MLP vs both baselines: rank 1W/4L/0T. Versus Auto it was -1.80
-  smoothness/+0.40 intent; versus linear -1.40/0.00. Test preference improvement
-  is not demonstrated, and the smoothness loss exceeds the control noise floor.
-- On the three confidence-4–5 test pairs, MLP ranked last 3/3 against both
-  baselines and had no rating or score wins. The two confidence-3 test pairs
-  split one preference win/loss while showing +1.5 intent and -2.0 smoothness.
-- Across all 24, MLP intent outcomes were 13W/6L/5T vs Auto and 14W/6L/4T vs
-  linear, while smoothness was 5W/12L/7T and 6W/12L/6T. MLP had 14 flagged
-  samples/24 flag instances; each baseline had 9/12.
+- Identical Auto/linear controls had only 6/24 exact rank/ranking-group
+  agreement; rank is noisy and must be interpreted against repeat controls.
+- Held-out test MLP preference was 1W/4L against both baselines; smoothness lost
+  while intent showed isolated gains. Runtime integration is not justified.
+- Across all pairs, MLP more often improved intent than smoothness, but it also
+  produced more flags than either baseline.
 - Comments repeatedly describe baselines as safe/boring crossfades, while MLP
   exposes interesting cues but frequent beat mismatch, simultaneous overlap,
   and old material dragging too far into the new track. Some MLP choices are
@@ -81,17 +64,23 @@ improve and pass another held-out blind pilot before runtime integration.
 - Full analysis:
   `docs/MTG_JAMENDO_PILOT_V1_BLIND_ANALYSIS.md`.
 
-# Proposed offline follow-up
+# Approved direction / design-preparation result
 
-- Add deterministic EQ/spectral and bass handoffs, filter sweeps, beat/bar
-  envelopes, rhythmic cuts, reverb/echo tails, ducking, energy ramps,
-  appropriate noise/riser masking, feasible stem-aware handoff, and constrained
-  combinations; do not implement these inside playback ownership logic.
-- A later private U-01 pilot should use 30 pairs/60 of the 66 owned MP3s with an
-  18/6/6 track-disjoint split, 15 compatible and 15 awkward pairs, three core
-  conditions, and 12 seeded exact repeats (102 samples). Audio remains local,
-  private, hash-addressed, gitignored, and fully QC-probed; tie UX must use
-  explicit ordered groups.
+- Architecture A is approved in principle: semantic musical templates compile
+  into a flat, explicit, versioned `OperatorPlan`; Phase 1 is offline-only and a
+  possible RPI renderer is a separate later lowering target.
+- Proposed initial templates are safe crossfade, shaped handoff, beat cut, bass
+  handoff, spectral handoff, resolved ducked overlap, feed-forward echo tail,
+  energy ramp, and short rhythmic handoff. Reverb, noise/riser, stems, and
+  arbitrary hybrids are deferred pending evidence.
+- Proposed generation retains fallback plus at most six optional families,
+  normally at most 48 candidates and never more than 64. Templates emit zipped
+  named recipes rather than Cartesian parameter grids.
+- The canonical plan uses fixed processing stages, typed bounded operations,
+  integer units, strict validation/canonicalization, and no backend strings or
+  arbitrary graph. The critic ranks only already-valid candidate IDs.
+- Detailed approval draft:
+  `docs/TRANSITION_OPERATOR_DESIGN_PREPARATION.md`.
 
 # Audio/runtime state
 
@@ -109,6 +98,15 @@ improve and pass another held-out blind pilot before runtime integration.
 
 # Latest verification
 
+- 2026-09-08 private inventory: 66/66 MP3s probed and decoded successfully;
+  66 unique canonical decoded-PCM hashes; no duplicates or short/unsuitable
+  files. All are stereo 44.1 kHz. One bitrate warning; 57/66 measure at or above
+  0 dBTP, motivating mandatory shared headroom and true-peak QC.
+- 2026-09-08 disposable DSP spike covered 15 programs and all requested
+  operator classes. Three representative combinations were each rendered three
+  times with matching container and decoded-PCM hashes. Median throughput was
+  about 1,140x real time; the worst stretch/filter/limiter program was about 60x
+  real time; maximum resident set was about 38.1 MiB.
 - 2026-09-08 U-01 evaluator: 37/37 Node tests passed with global Web Crypto;
   all 72 FLAC hashes and frozen manifest/template hashes matched.
 - 2026-09-08 direct ratings validation: zero errors, 24 complete pairs, 72
@@ -126,6 +124,12 @@ improve and pass another held-out blind pilot before runtime integration.
 
 - Self-contained public pilot:
   `C:\Users\janni\Desktop\spotify-transition-pilot-v1-20260907`.
+- Private inventory (outside Git), SHA-256
+  `30f8d5bef4bee0e2e53018b59e367a2a0295caeaf9ba41cafdad56442a38706a`:
+  `C:\Users\janni\Desktop\spotify-transition-private-v2\private-music-inventory-v1.json`.
+- Private feasibility record (outside Git), SHA-256
+  `fd2c789edabba8ba7e850170921a8bcb30f1b604111f4c09dee4c641c6ef2317`:
+  `C:\Users\janni\Desktop\spotify-transition-private-v2\offline-dsp-feasibility-v1.json`.
 - S-01 public manifest:
   `/home/profdrhuso/Projects/spotify-transition-ml-pilot-v1/evaluations/blind/mtg-jamendo-pilot-v1/manifest.json`.
 - S-01 private report:
@@ -138,11 +142,16 @@ improve and pass another held-out blind pilot before runtime integration.
   noise floor; another controlled pilot is required.
 - Candidate intent and renderer/operator quality changed together, so the pilot
   cannot fully attribute poor output to selection versus realization.
+- The exact S-01 Pilot V1 offline feature schema is not in the local Git object
+  store. Audit it when S-01 is next available; it was not woken for design work.
+- The private MP3s have no embedded identity tags; private artist/album/style
+  annotation is required before Pilot V2 pairing and leakage controls are frozen.
 - Genuine Spotify Lossless still needs a supported resolver/manifest path that
   this client does not currently implement or receive.
 
 # NEXT ACTION
 
-Design and implement the richer deterministic offline transition-operator
-vocabulary, then freeze a new track-disjoint blind pilot before reconsidering
-runtime integration.
+Human-review `docs/TRANSITION_OPERATOR_DESIGN_PREPARATION.md` and approve or
+revise the detailed IR, nine-template vocabulary, safety/candidate budgets, and
+Pilot V2 protocol before the formal design specification or implementation plan
+is written.
