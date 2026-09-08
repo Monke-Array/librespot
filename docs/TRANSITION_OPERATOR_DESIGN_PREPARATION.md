@@ -1,7 +1,7 @@
 # Transition Operator Architecture: Research and Design Preparation
 
 Date: 2026-09-08
-Status: **approval draft, not an implementation specification**
+Status: **detailed direction approved; superseded normatively by the formal specification**
 
 This report prepares the detailed design for an offline-only transition operator
 subsystem. It records repository findings, private-library technical results,
@@ -17,9 +17,10 @@ Architecture A has been selected in principle:
 > renderer. A future RPI-01 renderer, if justified by human evidence, is a
 > separate lowering target.
 
-The next required human decision is approval or revision of the detailed design
-in this report. The formal design specification and implementation plan remain
-behind that approval gate.
+The detailed direction in this report was approved on 2026-09-08. Normative
+decisions now live in
+`docs/superpowers/specs/2026-09-08-transition-operator-design.md`. An
+implementation plan remains behind approval of that formal specification.
 
 ## 1. Scope and conservative assumptions
 
@@ -975,28 +976,16 @@ This is sequencing guidance, not the implementation plan:
 Rollback for Phase 1 is deletion or disablement of an isolated offline tool and
 its private artifacts. Current runtime behavior is unaffected.
 
-## 16. Unresolved questions requiring human approval
+## 16. Detailed-direction approval recorded
 
-The following decisions should be made together at the detailed-design gate:
+On 2026-09-08 the owner approved the nine-template vocabulary, fixed-stage
+integer-valued IR, validation and candidate bounds, 48/64 caps, shared headroom
+and -1 dBTP safety policy, private Pilot V2 direction, separate measurable
+`energy_ramp/v1`, fixed five-second `safe_crossfade/v1`, and deferral of reverb,
+noise/riser, stems, arbitrary hybrids, and arbitrary graphs.
 
-1. Approve the nine-template initial vocabulary and the explicit deferral of
-   reverb, noise/riser, and stems.
-2. Approve the flat fixed-stage `OperatorPlan` model, integer canonical units,
-   v1 limits, and “no arbitrary graph” rule.
-3. Approve the 48 soft / 64 hard candidate caps and per-template quotas.
-4. Approve the non-boosting shared-gain, -1 dBTP safety, and limiter-rejection
-   policy for blinded renders.
-5. Approve the 60-track, 10/10/10 compatibility strata, 18/6/6 split, three
-   conditions, and 12 duplicate controls for Pilot V2 planning.
-6. Decide whether `energy_ramp/v1` is sufficiently distinct for the initial
-   pilot or should be treated as a shaped-handoff recipe.
-7. Decide whether the exact ordinary fallback should reproduce Pilot V1’s
-   baseline duration or use one new fixed five-second baseline for Pilot V2.
-
-Recommended decision: approve the architecture with `energy_ramp/v1` retained
-as a separately reported family for ablation, and define one fixed five-second
-`safe_crossfade/v1` as the Pilot V2 control. This yields a useful test of
-vocabulary breadth while keeping every candidate bounded and explainable.
+The next gate is approval of the formal specification. This report is evidence
+and rationale, not the schema contract.
 
 ## 17. References
 

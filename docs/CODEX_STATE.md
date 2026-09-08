@@ -10,6 +10,8 @@ improve and pass another held-out blind pilot before runtime integration.
 - Branch: `codex/m3a-live-auto-metadata`.
 - Blind Pilot V1 analysis/state commit: `98dcd31` (`docs: record blind
   transition pilot findings`).
+- Operator research/design-preparation commit: `74dd3a0` (`docs: prepare
+  transition operator architecture`).
 - Networking implementation: `cbc3d21` (`fix(connect): retire dealer on session
   replacement`), based on runtime-validated `948a5d8`.
 - ML research remains isolated on S-01 branch `codex/pilot-v1`:
@@ -64,23 +66,24 @@ improve and pass another held-out blind pilot before runtime integration.
 - Full analysis:
   `docs/MTG_JAMENDO_PILOT_V1_BLIND_ANALYSIS.md`.
 
-# Approved direction / design-preparation result
+# Approved direction / formal specification
 
-- Architecture A is approved in principle: semantic musical templates compile
-  into a flat, explicit, versioned `OperatorPlan`; Phase 1 is offline-only and a
-  possible RPI renderer is a separate later lowering target.
-- Proposed initial templates are safe crossfade, shaped handoff, beat cut, bass
+- Architecture A and its detailed direction are approved: semantic musical
+  templates compile into a flat, explicit, versioned `OperatorPlan`; Phase 1 is
+  offline-only and a possible RPI renderer is a separate later lowering target.
+- Approved initial templates are safe crossfade, shaped handoff, beat cut, bass
   handoff, spectral handoff, resolved ducked overlap, feed-forward echo tail,
   energy ramp, and short rhythmic handoff. Reverb, noise/riser, stems, and
-  arbitrary hybrids are deferred pending evidence.
-- Proposed generation retains fallback plus at most six optional families,
+  arbitrary hybrids/graphs are deferred pending evidence.
+- Generation retains fallback plus at most six optional families,
   normally at most 48 candidates and never more than 64. Templates emit zipped
   named recipes rather than Cartesian parameter grids.
-- The canonical plan uses fixed processing stages, typed bounded operations,
-  integer units, strict validation/canonicalization, and no backend strings or
-  arbitrary graph. The critic ranks only already-valid candidate IDs.
-- Detailed approval draft:
-  `docs/TRANSITION_OPERATOR_DESIGN_PREPARATION.md`.
+- The formal specification resolves timing to signed 44.1 kHz frames around a
+  handoff anchor; fixes schemas, hashes, operator equations/order, template
+  recipes, generation/caps, offline rendering/QC, Pilot V2 artifacts, and
+  current/future lowering boundaries. The critic only ranks valid IDs.
+- Formal spec awaiting human approval:
+  `docs/superpowers/specs/2026-09-08-transition-operator-design.md`.
 
 # Audio/runtime state
 
@@ -151,7 +154,7 @@ improve and pass another held-out blind pilot before runtime integration.
 
 # NEXT ACTION
 
-Human-review `docs/TRANSITION_OPERATOR_DESIGN_PREPARATION.md` and approve or
-revise the detailed IR, nine-template vocabulary, safety/candidate budgets, and
-Pilot V2 protocol before the formal design specification or implementation plan
-is written.
+Human-review and approve or revise
+`docs/superpowers/specs/2026-09-08-transition-operator-design.md`. Only after
+explicit approval may the Superpowers implementation-plan workflow begin; no
+implementation is authorized yet.
