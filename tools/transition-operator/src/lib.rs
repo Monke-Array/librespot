@@ -1,11 +1,17 @@
 mod canonical;
+mod capability;
+mod compatibility;
 mod error;
+mod identity;
 mod model;
 mod scalar;
 mod validation;
 
 pub use canonical::{canonical_json, require_canonical_json};
+pub use capability::*;
+pub use compatibility::*;
 pub use error::{Error, Result};
+pub use identity::*;
 pub use model::*;
 pub use scalar::{JSON_SAFE_INTEGER_MAX, div_round_nearest_away};
 pub use validation::*;

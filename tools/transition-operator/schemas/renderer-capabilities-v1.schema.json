@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "renderer-capabilities/1",
+  "title": "RendererCapabilities/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "supported_plan_versions", "supported_requirements",
+    "max_envelope_points", "max_bands", "max_taps", "max_state_span_frames",
+    "max_abs_rate_delta_ppm", "max_lookahead_frames", "simplifications"
+  ],
+  "properties": {
+    "schema_version": { "const": "renderer-capabilities/1" },
+    "supported_plan_versions": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "supported_requirements": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "max_envelope_points": { "type": "integer", "minimum": 0 },
+    "max_bands": { "type": "integer", "minimum": 0 },
+    "max_taps": { "type": "integer", "minimum": 0 },
+    "max_state_span_frames": { "type": "integer", "minimum": 0 },
+    "max_abs_rate_delta_ppm": { "type": "integer", "minimum": 0 },
+    "max_lookahead_frames": { "type": "integer", "minimum": 0 },
+    "simplifications": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["unsupported_requirement", "transform_id"],
+        "properties": {
+          "unsupported_requirement": { "type": "string" },
+          "transform_id": { "type": "string" }
+        }
+      }
+    }
+  }
+}

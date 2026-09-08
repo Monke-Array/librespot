@@ -5,6 +5,7 @@ mod template;
 use crate::canonical::canonical_json;
 use crate::error::{Error, Result};
 use crate::model::{OperatorPlan, OperatorPlanBody, SourceRef};
+use crate::{ValidatedPlan, finalize_plan, require_canonical_json, verify_plan_id};
 
 pub use contextual::{ExpectedSource, TemplateFeatureView, ValidationContext};
 
@@ -94,6 +95,28 @@ impl PlanValidator {
         let validated = Self::validate_body(plan.body(), context)?;
         let (_, report) = validated.into_parts();
         Ok(StructurallyValidatedPlan { plan, report })
+    }
+
+    pub fn validate_bytes(bytes: &[u8], context: &ValidationContext<'_>) -> Result<ValidatedPlan> {
+        if bytes.len() > 65_536 {
+            return Err(Error::new(
+                "PLAN_TOO_LARGE",
+                "canonical plan exceeds 65536 bytes",
+            ));
+        }
+        let plan: OperatorPlan = require_canonical_json(bytes)?;
+        let structurally_validated = Self::validate_structure(plan, context)?;
+        let (plan, _) = structurally_validated.into_parts();
+        let validated_body = Self::validate_body(plan.body(), context)?;
+        let finalized = finalize_plan(validated_body)?;
+        verify_plan_id(&plan, finalized.plan_hash())?;
+        if finalized.canonical_bytes() != bytes {
+            return Err(Error::new(
+                "PLAN_ID_MISMATCH",
+                "accepted bytes differ after identity finalization",
+            ));
+        }
+        Ok(finalized)
     }
 }
 
