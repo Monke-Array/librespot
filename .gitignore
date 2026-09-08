@@ -11,3 +11,8 @@ spotify_appkey.key
 
 # Temporary Codex reasoning; durable verified state lives in docs/CODEX_STATE.md
 /.codex/WORKING_MEMORY.md
+
+# Offline transition-operator local outputs
+/tools/transition-operator/target/
+/tools/transition-operator/.private/
+/tools/transition-operator/artifacts/
