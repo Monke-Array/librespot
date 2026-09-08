@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "transition-operator-plan/1",
+  "title": "OperatorPlan/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "plan_id", "template", "format", "sources", "timeline", "operations", "output_safety", "feature_snapshot", "provenance"],
+  "properties": {
+    "schema_version": { "const": "transition-operator-plan/1" },
+    "plan_id": { "type": "string" },
+    "template": { "$ref": "#/$defs/template" },
+    "format": { "$ref": "#/$defs/format" },
+    "sources": { "$ref": "#/$defs/sources" },
+    "timeline": { "$ref": "#/$defs/timeline" },
+    "operations": { "type": "array", "items": { "$ref": "#/$defs/operation" }, "maxItems": 12 },
+    "output_safety": { "$ref": "#/$defs/outputSafety" },
+    "feature_snapshot": { "$ref": "#/$defs/featureSnapshot" },
+    "provenance": { "$ref": "#/$defs/provenance" }
+  },
+  "$defs": {
+    "template": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "version", "recipe_id"],
+      "properties": { "id": { "type": "string" }, "version": { "type": "integer" }, "recipe_id": { "type": "string" } }
+    },
+    "format": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sample_rate_hz", "channels", "channel_order"],
+      "properties": { "sample_rate_hz": { "const": 44100 }, "channels": { "const": 2 }, "channel_order": { "const": "stereo_lr" } }
+    },
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["track_id", "pcm_profile", "pcm_sha256", "pcm_frame_count", "cue_id", "cue_source_frame"],
+      "properties": {
+        "track_id": { "type": "string" }, "pcm_profile": { "const": "pcm_s16le_stereo_44100_v1" },
+        "pcm_sha256": { "type": "string" }, "pcm_frame_count": { "type": "integer" },
+        "cue_id": { "type": "string" }, "cue_source_frame": { "type": "integer" }
+      }
+    },
+    "sources": {
+      "type": "object", "additionalProperties": false, "required": ["outgoing", "incoming"],
+      "properties": { "outgoing": { "$ref": "#/$defs/source" }, "incoming": { "$ref": "#/$defs/source" } }
+    },
+    "timeline": {
+      "type": "object", "additionalProperties": false,
+      "required": ["dry_start_frame", "dry_handoff_frame", "effect_end_frame"],
+      "properties": { "dry_start_frame": { "type": "integer" }, "dry_handoff_frame": { "type": "integer" }, "effect_end_frame": { "type": "integer" } }
+    },
+    "target": { "enum": ["outgoing", "incoming"] },
+    "interpolation": { "enum": ["hold", "linear", "smoothstep", "quarter_sine", "quarter_cosine"] },
+    "point": {
+      "type": "object", "additionalProperties": false, "required": ["frame", "value_ppm"],
+      "properties": { "frame": { "type": "integer" }, "value_ppm": { "type": "integer" } }
+    },
+    "cutoffPoint": {
+      "type": "object", "additionalProperties": false, "required": ["frame", "cutoff_millihz"],
+      "properties": { "frame": { "type": "integer" }, "cutoff_millihz": { "type": "integer" } }
+    },
+    "baseOperation": {
+      "type": "object", "required": ["kind", "op_id", "target"],
+      "properties": { "kind": { "type": "string" }, "op_id": { "type": "string" }, "target": { "$ref": "#/$defs/target" } }
+    },
+    "operation": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "op_id", "target", "source_rate_ppm", "profile"],
+          "properties": { "kind": { "const": "time_map" }, "op_id": { "type": "string" }, "target": { "$ref": "#/$defs/target" }, "source_rate_ppm": { "type": "integer" }, "profile": { "const": "pitch_preserving_balanced_transients_v1" } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "op_id", "target", "points", "interpolations"],
+          "properties": { "kind": { "const": "gain_envelope" }, "op_id": { "type": "string" }, "target": { "$ref": "#/$defs/target" }, "points": { "type": "array", "items": { "$ref": "#/$defs/point" } }, "interpolations": { "type": "array", "items": { "$ref": "#/$defs/interpolation" } } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "op_id", "target", "filter_kind", "cutoff_points", "cutoff_interpolations", "q_milli", "wet_points", "wet_interpolations", "control_interval_frames"],
+          "properties": { "kind": { "const": "filter_envelope" }, "op_id": { "type": "string" }, "target": { "$ref": "#/$defs/target" }, "filter_kind": { "enum": ["lowpass_biquad_v1", "highpass_biquad_v1"] }, "cutoff_points": { "type": "array", "items": { "$ref": "#/$defs/cutoffPoint" } }, "cutoff_interpolations": { "type": "array", "items": { "$ref": "#/$defs/interpolation" } }, "q_milli": { "type": "integer" }, "wet_points": { "type": "array", "items": { "$ref": "#/$defs/point" } }, "wet_interpolations": { "type": "array", "items": { "$ref": "#/$defs/interpolation" } }, "control_interval_frames": { "type": "integer" } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "op_id", "target", "profile", "crossover_millihz", "bands", "band_gain_envelopes", "wet_points", "wet_interpolations", "control_interval_frames"],
+          "properties": { "kind": { "const": "crossover_band_gain" }, "op_id": { "type": "string" }, "target": { "$ref": "#/$defs/target" }, "profile": { "const": "linkwitz_riley_4_v1" }, "crossover_millihz": { "type": "array", "items": { "type": "integer" } }, "bands": { "type": "array", "items": { "enum": ["low", "mid", "high"] } }, "band_gain_envelopes": { "type": "array", "items": { "$ref": "#/$defs/bandGain" } }, "wet_points": { "type": "array", "items": { "$ref": "#/$defs/point" } }, "wet_interpolations": { "type": "array", "items": { "$ref": "#/$defs/interpolation" } }, "control_interval_frames": { "type": "integer" } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "op_id", "target", "reason", "points", "interpolations"],
+          "properties": { "kind": { "const": "duck_envelope" }, "op_id": { "type": "string" }, "target": { "$ref": "#/$defs/target" }, "reason": { "enum": ["vocal_collision", "transient_collision"] }, "points": { "type": "array", "items": { "$ref": "#/$defs/point" } }, "interpolations": { "type": "array", "items": { "$ref": "#/$defs/interpolation" } } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "op_id", "target", "capture_start_frame", "capture_end_frame", "taps"],
+          "properties": { "kind": { "const": "feedforward_delay_tail" }, "op_id": { "type": "string" }, "target": { "$ref": "#/$defs/target" }, "capture_start_frame": { "type": "integer" }, "capture_end_frame": { "type": "integer" }, "taps": { "type": "array", "items": { "$ref": "#/$defs/tap" } } }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "op_id", "target", "points", "interpolations"],
+          "properties": { "kind": { "const": "rhythmic_gate" }, "op_id": { "type": "string" }, "target": { "$ref": "#/$defs/target" }, "points": { "type": "array", "items": { "$ref": "#/$defs/point" } }, "interpolations": { "type": "array", "items": { "$ref": "#/$defs/interpolation" } } }
+        }
+      ]
+    },
+    "bandGain": {
+      "type": "object", "additionalProperties": false, "required": ["band", "points", "interpolations"],
+      "properties": { "band": { "enum": ["low", "mid", "high"] }, "points": { "type": "array", "items": { "$ref": "#/$defs/point" } }, "interpolations": { "type": "array", "items": { "$ref": "#/$defs/interpolation" } } }
+    },
+    "tap": {
+      "type": "object", "additionalProperties": false, "required": ["delay_frames", "gain_ppm"],
+      "properties": { "delay_frames": { "type": "integer" }, "gain_ppm": { "type": "integer" } }
+    },
+    "outputSafety": {
+      "type": "object", "additionalProperties": false,
+      "required": ["profile", "pair_output_gain_mdb", "sample_peak_ceiling_mdbfs", "true_peak_target_mdbtp", "limiter_profile", "lookahead_frames", "release_frames", "maximum_gain_reduction_mdb", "maximum_active_fraction_ppm", "activity_threshold_mdb", "true_peak_measurement_profile"],
+      "properties": {
+        "profile": { "const": "transition_output_safety_v1" }, "pair_output_gain_mdb": { "type": "integer" },
+        "sample_peak_ceiling_mdbfs": { "const": -1200 }, "true_peak_target_mdbtp": { "const": -1000 },
+        "limiter_profile": { "const": "lookahead_peak_limiter_v1" }, "lookahead_frames": { "const": 221 },
+        "release_frames": { "const": 4410 }, "maximum_gain_reduction_mdb": { "const": 3000 },
+        "maximum_active_fraction_ppm": { "const": 50000 }, "activity_threshold_mdb": { "const": 100 },
+        "true_peak_measurement_profile": { "const": "bs1770_4x_v1" }
+      }
+    },
+    "featureSnapshot": {
+      "type": "object", "additionalProperties": false, "required": ["schema_version", "sha256"],
+      "properties": { "schema_version": { "const": "transition-feature-snapshot/2" }, "sha256": { "type": "string" } }
+    },
+    "provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["generator_id", "generator_version", "generator_config_sha256", "seed_hex_u64", "geometry_id"],
+      "properties": { "generator_id": { "type": "string" }, "generator_version": { "type": "string" }, "generator_config_sha256": { "type": "string" }, "seed_hex_u64": { "type": "string" }, "geometry_id": { "type": "string" } }
+    }
+  }
+}
