@@ -1,7 +1,10 @@
 use transition_operator::{
-    AnalysisIdentity, CueFeature, CueKind, FeatureSnapshotBodyV2, FeatureSnapshotV2, FeatureWindow,
-    PairFeatures, RhythmFeatures, SourceFeatures, TemplateFeatureView, WindowKind,
-    finalize_feature_snapshot, snapshot_sha256, validate_feature_snapshot,
+    AnalysisIdentity, CanonicalSource, CueFeature, CueKind, DurationMode, FeatureSnapshotBodyV2,
+    FeatureSnapshotV2, FeatureWindow, GenerationConfig, GenerationRequest, PairFeatures, PcmBuffer,
+    RhythmFeatures, SourceFeatures, SourceRef, TemplateFeatureView, TemplateId, WindowKind,
+    build_feature_snapshot, extract_signal_features, feature_algorithm_sha256,
+    finalize_feature_snapshot, generate_candidates, propose_geometries, snapshot_sha256,
+    validate_feature_snapshot,
 };
 
 fn hash(byte: char) -> String {
@@ -202,4 +205,167 @@ fn pilot_v1_import_does_not_promote_recompute_or_omitted_values() {
     assert!(imported.rhythm.is_none());
     assert!(imported.vocal_activity_ppm.is_none());
     assert!(imported.whole_source_true_peak_mdbtp.is_none());
+}
+
+fn pulse_source(tempo_bpm: i64, phase_frames: usize, bass_hz: f64) -> CanonicalSource {
+    let frame_count = 44_100 * 40;
+    let beat_frames = (60 * 44_100 / tempo_bpm) as usize;
+    let mut frames = Vec::with_capacity(frame_count);
+    for frame in 0..frame_count {
+        let beat_offset = frame.saturating_sub(phase_frames) % beat_frames;
+        let beat_index = frame.saturating_sub(phase_frames) / beat_frames;
+        let pulse = if frame >= phase_frames && beat_offset < 220 {
+            if beat_index % 4 == 0 { 0.75 } else { 0.35 }
+        } else {
+            0.0
+        };
+        let tone = 0.08 * (2.0 * std::f64::consts::PI * bass_hz * frame as f64 / 44_100.0).sin();
+        frames.push([pulse + tone, pulse + tone]);
+    }
+    CanonicalSource::from_pcm(PcmBuffer::from_frames(frames).unwrap()).unwrap()
+}
+
+#[test]
+fn extract_signal_features_detects_real_periodicity_without_synthetic_fallback() {
+    let fixture: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/pcm/feature-signals.json")).unwrap();
+    assert_eq!(
+        feature_algorithm_sha256(),
+        fixture["algorithm_sha256"].as_str().unwrap()
+    );
+    let source = pulse_source(120, 4_410, 80.0);
+    let features = extract_signal_features(&source).unwrap();
+    let rhythm = features
+        .rhythm
+        .as_ref()
+        .expect("pulse train has a measured rhythm");
+    assert!((119_000..=121_000).contains(&rhythm.tempo_millibpm));
+    assert!(rhythm.beat_confidence_ppm >= 750_000);
+    assert!(rhythm.downbeat_confidence_ppm >= 700_000);
+    assert_eq!(rhythm.meter_beats, Some(4));
+    assert!(rhythm.beat_frames.windows(2).all(|pair| pair[0] < pair[1]));
+
+    let silence =
+        CanonicalSource::from_pcm(PcmBuffer::from_frames(vec![[0.0, 0.0]; 44_100 * 20]).unwrap())
+            .unwrap();
+    assert!(extract_signal_features(&silence).unwrap().rhythm.is_none());
+}
+
+#[test]
+fn extract_rejects_pcm_that_would_require_source_clamping() {
+    assert_eq!(
+        CanonicalSource::from_pcm(PcmBuffer::from_frames(vec![[1.0, 0.0]]).unwrap())
+            .unwrap_err()
+            .code(),
+        "NON_CANONICAL_PCM"
+    );
+}
+
+#[test]
+fn extract_signal_features_distinguishes_bass_and_treble_windows() {
+    let bass = extract_signal_features(&pulse_source(120, 0, 80.0)).unwrap();
+    let treble = extract_signal_features(&pulse_source(120, 0, 6_000.0)).unwrap();
+    let bass_window = bass.measure_window(44_100 * 8, 44_100 * 24).unwrap();
+    let treble_window = treble.measure_window(44_100 * 8, 44_100 * 24).unwrap();
+    assert!(bass_window.bass_occupancy_ppm > treble_window.bass_occupancy_ppm);
+    assert!(bass_window.low_occupancy_ppm > treble_window.low_occupancy_ppm);
+    assert!(treble_window.high_occupancy_ppm > bass_window.high_occupancy_ppm);
+    assert_eq!(
+        bass_window.low_occupancy_ppm
+            + bass_window.mid_occupancy_ppm
+            + bass_window.high_occupancy_ppm,
+        1_000_000
+    );
+}
+
+#[test]
+fn extract_pair_snapshot_and_geometry_are_deterministic_and_bounds_safe() {
+    let outgoing = extract_signal_features(&pulse_source(120, 4_410, 80.0)).unwrap();
+    let incoming = extract_signal_features(&pulse_source(121, 8_820, 100.0)).unwrap();
+    let first = build_feature_snapshot(&outgoing, &incoming).unwrap();
+    let second = build_feature_snapshot(&outgoing, &incoming).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.outgoing.windows[0].vocal_activity_ppm, None);
+    assert_eq!(first.incoming.windows[0].vocal_activity_ppm, None);
+
+    let geometries = propose_geometries(&first).unwrap();
+    assert_eq!(geometries.fallback_geometry.requested_dry_frames, 220_500);
+    assert!(
+        geometries
+            .geometries
+            .iter()
+            .any(|value| value.duration_mode == DurationMode::Seconds)
+    );
+    assert!(
+        geometries
+            .geometries
+            .iter()
+            .any(|value| value.duration_mode == DurationMode::Bars)
+    );
+    assert!(geometries.geometries.iter().all(|value| {
+        value.feature_snapshot_sha256 == first.snapshot_sha256
+            && value.outgoing_cue_source_frame >= value.requested_dry_frames
+            && value.incoming_cue_source_frame >= value.requested_dry_frames
+    }));
+}
+
+#[test]
+fn extract_snapshot_drives_real_m2_rich_generation() {
+    let outgoing = extract_signal_features(&pulse_source(120, 4_410, 80.0)).unwrap();
+    let incoming = extract_signal_features(&pulse_source(121, 8_820, 100.0)).unwrap();
+    let snapshot = build_feature_snapshot(&outgoing, &incoming).unwrap();
+    let geometries = propose_geometries(&snapshot).unwrap();
+    let outgoing_cue = snapshot
+        .outgoing
+        .cues
+        .iter()
+        .find(|cue| cue.cue_id == snapshot.pair.outgoing_cue_id)
+        .unwrap();
+    let incoming_cue = snapshot
+        .incoming
+        .cues
+        .iter()
+        .find(|cue| cue.cue_id == snapshot.pair.incoming_cue_id)
+        .unwrap();
+    let result = generate_candidates(GenerationRequest {
+        outgoing: SourceRef {
+            track_id: "synthetic-outgoing".into(),
+            pcm_profile: "pcm_s16le_stereo_44100_v1".into(),
+            pcm_sha256: snapshot.outgoing.source_pcm_sha256.clone(),
+            pcm_frame_count: snapshot.outgoing.source_frames,
+            cue_id: outgoing_cue.cue_id.clone(),
+            cue_source_frame: outgoing_cue.source_frame,
+        },
+        incoming: SourceRef {
+            track_id: "synthetic-incoming".into(),
+            pcm_profile: "pcm_s16le_stereo_44100_v1".into(),
+            pcm_sha256: snapshot.incoming.source_pcm_sha256.clone(),
+            pcm_frame_count: snapshot.incoming.source_frames,
+            cue_id: incoming_cue.cue_id.clone(),
+            cue_source_frame: incoming_cue.source_frame,
+        },
+        feature_snapshot: snapshot.feature_ref(),
+        fallback_geometry: geometries.fallback_geometry,
+        geometries: geometries.geometries,
+        features: snapshot.template_inputs().unwrap(),
+        outgoing_true_peak_mdbtp: Some(snapshot.outgoing.true_peak_mdbtp),
+        incoming_true_peak_mdbtp: Some(snapshot.incoming.true_peak_mdbtp),
+        config: GenerationConfig {
+            generator_id: "transition-candidate-generator".into(),
+            generator_version: "1.0.0".into(),
+            generator_config_sha256: hash('f'),
+            seed_hex_u64: "0000000000000000".into(),
+        },
+    })
+    .unwrap();
+    let families: std::collections::BTreeSet<_> = result
+        .candidate_set
+        .candidates
+        .iter()
+        .map(|candidate| candidate.template_id)
+        .collect();
+    assert!(families.contains(&TemplateId::SafeCrossfade));
+    assert!(families.contains(&TemplateId::ShapedHandoff));
+    assert!(families.contains(&TemplateId::BassHandoff));
+    assert!(families.contains(&TemplateId::SpectralHandoff));
 }

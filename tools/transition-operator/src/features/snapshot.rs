@@ -1,7 +1,8 @@
 use crate::canonical::canonical_json;
 use crate::error::{Error, Result};
 use crate::geometry::{CueIdentityCore, FeatureWindowIdentityCore, cue_id, feature_window_id};
-use crate::model::{FeatureSnapshotRef, OperatorPlanBody};
+use crate::model::{FeatureSnapshotRef, Operation, OperatorPlanBody};
+use crate::scalar::div_round_nearest_away;
 use crate::templates::{TemplateId, TemplateInputs, template_registry};
 use crate::validation::TemplateFeatureView;
 use serde::{Deserialize, Serialize};
@@ -468,12 +469,32 @@ impl TemplateFeatureView for FeatureSnapshotV2 {
                     <= body.sources.outgoing.cue_source_frame + body.timeline.dry_start_frame
                 && window.end_frame >= body.sources.outgoing.cue_source_frame
         });
+        let incoming_rate = body
+            .operations
+            .iter()
+            .find_map(|operation| match operation {
+                Operation::TimeMap(value) => Some(value.source_rate_ppm),
+                _ => None,
+            })
+            .unwrap_or(1_000_000);
+        let incoming_start = body
+            .timeline
+            .dry_start_frame
+            .checked_mul(incoming_rate)
+            .and_then(|value| div_round_nearest_away(value, 1_000_000).ok());
+        let incoming_end = body
+            .timeline
+            .effect_end_frame
+            .checked_mul(incoming_rate)
+            .and_then(|value| div_round_nearest_away(value, 1_000_000).ok());
         let incoming = self.incoming.windows.iter().any(|window| {
             window.window_id == self.pair.incoming_window_id
-                && window.start_frame
-                    <= body.sources.incoming.cue_source_frame + body.timeline.dry_start_frame
-                && window.end_frame
-                    >= body.sources.incoming.cue_source_frame + body.timeline.effect_end_frame
+                && incoming_start.is_some_and(|offset| {
+                    window.start_frame <= body.sources.incoming.cue_source_frame + offset
+                })
+                && incoming_end.is_some_and(|offset| {
+                    window.end_frame >= body.sources.incoming.cue_source_frame + offset
+                })
         });
         outgoing && incoming
     }
@@ -614,7 +635,7 @@ fn validate_source(value: &SourceFeatures, analysis: &AnalysisIdentity) -> Resul
                 "feature window ID does not match its content",
             ));
         }
-        for optional in [
+        for value in [
             window.vocal_activity_ppm,
             window.transient_activity_ppm,
             window.transient_density_ppm,
@@ -623,10 +644,11 @@ fn validate_source(value: &SourceFeatures, analysis: &AnalysisIdentity) -> Resul
             window.low_occupancy_ppm,
             window.mid_occupancy_ppm,
             window.high_occupancy_ppm,
-        ] {
-            if let Some(value) = optional {
-                probability(value)?;
-            }
+        ]
+        .into_iter()
+        .flatten()
+        {
+            probability(value)?;
         }
         if window
             .short_term_loudness_mlu
@@ -693,16 +715,17 @@ fn validate_pair(body: &FeatureSnapshotBodyV2) -> Result<()> {
             "pair references unknown cue or feature window",
         ));
     }
-    for optional in [
+    for value in [
         pair.vocal_collision_ppm,
         pair.transient_collision_ppm,
         pair.bass_collision_ppm,
         pair.spectral_overlap_ppm,
         pair.alignment_error_ppm_of_beat,
-    ] {
-        if let Some(value) = optional {
-            probability(value)?;
-        }
+    ]
+    .into_iter()
+    .flatten()
+    {
+        probability(value)?;
     }
     if pair
         .energy_delta_mdb

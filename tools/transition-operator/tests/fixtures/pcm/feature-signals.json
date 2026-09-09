@@ -1,0 +1,13 @@
+{
+  "schema_version": "transition-feature-signals/1",
+  "algorithm_sha256": "4ccf543654286cd19b0d5f06dc19bccbdab867596443af00379e614424ea12cd",
+  "sample_rate_hz": 44100,
+  "signals": {
+    "silence": {"rhythm": "absent"},
+    "accented_120_bpm": {"tempo_millibpm_min": 119000, "tempo_millibpm_max": 121000},
+    "bass_tone_hz": 80,
+    "treble_tone_hz": 6000,
+    "shifted_grid_frames": [4410, 8820],
+    "clipped_sample": {"canonical_source": "rejected"}
+  }
+}
