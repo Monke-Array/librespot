@@ -1,0 +1,5 @@
+{
+  "processing_warm_up_frames": 4096,
+  "repeat_count": 3,
+  "valid_plan_variants": ["filter", "crossover", "duck", "tail", "gate"]
+}

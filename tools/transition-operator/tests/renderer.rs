@@ -5,13 +5,48 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use transition_operator::{
-    ArtifactFormat, CanonicalPcmBackend, ExpectedSource, FfmpegBackend, OperatorPlan, PcmBuffer,
-    PlanValidator, PrivateManifestLocator, RenderRequest, RendererEnvironment, SourceLocator,
-    TemplateFeatureView, ValidationContext, candidate_id, canonical_json, render_identity,
-    resolve_render_sources, validate_render_request, validate_render_request_bytes,
+    ArtifactBackend, ArtifactFormat, CanonicalPcmBackend, ExpectedSource, FfmpegBackend,
+    GeneratedCandidate, OperatorPlan, PairRenderStatus, PcmBuffer, PlanValidator,
+    PrivateManifestLocator, ReferenceRenderer, RenderRequest, RendererEnvironment,
+    RubberBandTimeStretch, SourceLocator, TemplateFeatureView, TemplateId, TimeStretchBackend,
+    TimeStretchCue, ValidationContext, candidate_id, canonical_json,
+    render_candidates_with_fallback, render_identity, resolve_render_sources,
+    validate_render_request, validate_render_request_bytes,
 };
 
 const SAFE_RAW: &[u8] = include_bytes!("fixtures/plans/safe-crossfade.json");
+const ALL_OPERATIONS_RAW: &[u8] = include_bytes!("fixtures/plans/all-operations.json");
+
+#[derive(serde::Deserialize)]
+struct RenderSuite {
+    processing_warm_up_frames: i64,
+    repeat_count: usize,
+    valid_plan_variants: Vec<String>,
+}
+
+fn render_suite() -> RenderSuite {
+    serde_json::from_slice(include_bytes!("fixtures/plans/render-suite.json")).unwrap()
+}
+
+fn stage_rank(stage: &str) -> usize {
+    [
+        "time_map",
+        "spectral",
+        "dynamics",
+        "tail_capture",
+        "primary_gain",
+        "sum",
+        "pair_gain",
+        "limiter",
+        "measurement",
+        "quantization",
+        "encode",
+        "decode_verify",
+    ]
+    .iter()
+    .position(|prefix| stage == *prefix || stage.starts_with(&format!("{prefix}:")))
+    .unwrap()
+}
 
 struct Features(String);
 
@@ -220,6 +255,410 @@ struct CountingBackend {
     bytes: Vec<u8>,
 }
 
+impl ArtifactBackend for CountingBackend {
+    fn encode_pcm24_flac_bytes(&self, pcm24: &[u8]) -> transition_operator::Result<Vec<u8>> {
+        let mut encoded = b"mock-flac\0".to_vec();
+        encoded.extend_from_slice(pcm24);
+        Ok(encoded)
+    }
+
+    fn decode_flac_pcm24_bytes(&self, encoded: &[u8]) -> transition_operator::Result<Vec<u8>> {
+        Ok(encoded.strip_prefix(b"mock-flac\0").unwrap().to_vec())
+    }
+}
+
+struct DeterministicStretch;
+
+impl TimeStretchBackend for DeterministicStretch {
+    fn process(
+        &self,
+        input: &PcmBuffer,
+        rate_ppm: i64,
+        output_frames: usize,
+        cue: TimeStretchCue,
+    ) -> transition_operator::Result<PcmBuffer> {
+        assert!(cue.logical_error_frames(rate_ppm) <= 1);
+        let frames = (0..output_frames)
+            .map(|index| {
+                let source = (index as u128 * rate_ppm as u128 + 500_000) / 1_000_000;
+                input.frame(source as usize)
+            })
+            .collect();
+        PcmBuffer::from_frames(frames)
+    }
+}
+
+struct CorruptingBackend {
+    source_bytes: Vec<u8>,
+}
+
+impl CanonicalPcmBackend for CorruptingBackend {
+    fn decode_s16le_stereo_44100(&self, _: &Path) -> transition_operator::Result<Vec<u8>> {
+        Ok(self.source_bytes.clone())
+    }
+}
+
+impl ArtifactBackend for CorruptingBackend {
+    fn encode_pcm24_flac_bytes(&self, pcm24: &[u8]) -> transition_operator::Result<Vec<u8>> {
+        Ok(pcm24.to_vec())
+    }
+
+    fn decode_flac_pcm24_bytes(&self, encoded: &[u8]) -> transition_operator::Result<Vec<u8>> {
+        let mut decoded = encoded.to_vec();
+        decoded[0] ^= 1;
+        Ok(decoded)
+    }
+}
+
+#[test]
+fn reference_renderer_runs_the_fixed_pipeline_and_verifies_encoded_pcm() {
+    let frame_count = 230_000usize;
+    let source_bytes = [1_000_i16.to_le_bytes(), (-1_000_i16).to_le_bytes()]
+        .concat()
+        .repeat(frame_count);
+    let source_hash = hex(&Sha256::digest(&source_bytes));
+    let mut body = fixture();
+    for source in [&mut body.sources.outgoing, &mut body.sources.incoming] {
+        source.pcm_sha256 = source_hash.clone();
+        source.pcm_frame_count = frame_count as i64;
+        source.cue_source_frame = 224_596;
+    }
+    let plan = finalized_body(&body);
+    let mut render_request = request(&plan);
+    render_request.output_end_frame = 100;
+    let render_request = validate_render_request(render_request, &plan).unwrap();
+    let locator = PrivateManifestLocator::new(
+        "a".repeat(64),
+        BTreeMap::from([
+            (
+                body.sources.outgoing.track_id.clone(),
+                PathBuf::from("outgoing"),
+            ),
+            (
+                body.sources.incoming.track_id.clone(),
+                PathBuf::from("incoming"),
+            ),
+        ]),
+    )
+    .unwrap();
+    let renderer = ReferenceRenderer::new(
+        CountingBackend {
+            calls: Cell::new(0),
+            bytes: source_bytes,
+        },
+        DeterministicStretch,
+        environment(),
+    )
+    .unwrap();
+
+    let record = renderer.render(&plan, &render_request, &locator).unwrap();
+    assert_eq!(record.artifact.frame_count, 220_600);
+    assert_eq!(
+        record.artifact.decoded_pcm_sha256,
+        record.artifact.pre_encode_pcm_sha256
+    );
+    assert_eq!(
+        record.private_provenance.stage_trace,
+        [
+            "primary_gain:outgoing",
+            "primary_gain:incoming",
+            "sum",
+            "pair_gain",
+            "limiter",
+            "measurement",
+            "quantization",
+            "encode",
+            "decode_verify",
+        ]
+    );
+}
+
+#[test]
+fn reference_renderer_rejects_encode_decode_pcm_mismatch() {
+    let frame_count = 230_000usize;
+    let source_bytes = [1_000_i16.to_le_bytes(), (-1_000_i16).to_le_bytes()]
+        .concat()
+        .repeat(frame_count);
+    let source_hash = hex(&Sha256::digest(&source_bytes));
+    let mut body = fixture();
+    for source in [&mut body.sources.outgoing, &mut body.sources.incoming] {
+        source.pcm_sha256 = source_hash.clone();
+        source.pcm_frame_count = frame_count as i64;
+        source.cue_source_frame = 224_596;
+    }
+    let plan = finalized_body(&body);
+    let mut render_request = request(&plan);
+    render_request.output_end_frame = 100;
+    let render_request = validate_render_request(render_request, &plan).unwrap();
+    let locator = PrivateManifestLocator::new(
+        "a".repeat(64),
+        BTreeMap::from([
+            (
+                body.sources.outgoing.track_id.clone(),
+                PathBuf::from("outgoing"),
+            ),
+            (
+                body.sources.incoming.track_id.clone(),
+                PathBuf::from("incoming"),
+            ),
+        ]),
+    )
+    .unwrap();
+    let renderer = ReferenceRenderer::new(
+        CorruptingBackend { source_bytes },
+        DeterministicStretch,
+        environment(),
+    )
+    .unwrap();
+    assert_eq!(
+        renderer
+            .render(&plan, &render_request, &locator)
+            .unwrap_err()
+            .code(),
+        "ENCODE_DECODE_PCM_MISMATCH"
+    );
+}
+
+#[test]
+fn reference_renderer_rejects_true_peak_instead_of_clamping_or_repairing() {
+    let frame_count = 230_000usize;
+    let source_bytes = [i16::MAX.to_le_bytes(), i16::MIN.to_le_bytes()]
+        .concat()
+        .repeat(frame_count);
+    let source_hash = hex(&Sha256::digest(&source_bytes));
+    let mut body = fixture();
+    body.output_safety.pair_output_gain_mdb = 0;
+    for source in [&mut body.sources.outgoing, &mut body.sources.incoming] {
+        source.pcm_sha256 = source_hash.clone();
+        source.pcm_frame_count = frame_count as i64;
+        source.cue_source_frame = 224_596;
+    }
+    let plan = finalized_body(&body);
+    let mut request_body = request(&plan);
+    request_body.output_end_frame = 100;
+    let request = validate_render_request(request_body, &plan).unwrap();
+    let locator = PrivateManifestLocator::new(
+        "a".repeat(64),
+        BTreeMap::from([
+            (
+                body.sources.outgoing.track_id.clone(),
+                PathBuf::from("outgoing"),
+            ),
+            (
+                body.sources.incoming.track_id.clone(),
+                PathBuf::from("incoming"),
+            ),
+        ]),
+    )
+    .unwrap();
+    let renderer = ReferenceRenderer::new(
+        CountingBackend {
+            calls: Cell::new(0),
+            bytes: source_bytes,
+        },
+        DeterministicStretch,
+        environment(),
+    )
+    .unwrap();
+    assert_eq!(
+        renderer
+            .render(&plan, &request, &locator)
+            .unwrap_err()
+            .code(),
+        "TRUE_PEAK_LIMIT_EXCEEDED"
+    );
+}
+
+#[test]
+fn approved_operation_subsets_render_in_normative_order_with_frozen_warm_up_and_repeatability() {
+    let suite = render_suite();
+    let frame_count = 400_000usize;
+    let source_bytes = [100_i16.to_le_bytes(), (-100_i16).to_le_bytes()]
+        .concat()
+        .repeat(frame_count);
+    let source_hash = hex(&Sha256::digest(&source_bytes));
+    let mut body: OperatorPlan =
+        transition_operator::require_canonical_json(ALL_OPERATIONS_RAW).unwrap();
+    for source in [&mut body.sources.outgoing, &mut body.sources.incoming] {
+        source.pcm_sha256 = source_hash.clone();
+        source.pcm_frame_count = frame_count as i64;
+        source.cue_source_frame = 230_000;
+    }
+    let locator = PrivateManifestLocator::new(
+        "a".repeat(64),
+        BTreeMap::from([
+            (
+                body.sources.outgoing.track_id.clone(),
+                PathBuf::from("outgoing"),
+            ),
+            (
+                body.sources.incoming.track_id.clone(),
+                PathBuf::from("incoming"),
+            ),
+        ]),
+    )
+    .unwrap();
+    let renderer = ReferenceRenderer::new(
+        CountingBackend {
+            calls: Cell::new(0),
+            bytes: source_bytes,
+        },
+        DeterministicStretch,
+        environment(),
+    )
+    .unwrap();
+
+    for variant in &suite.valid_plan_variants {
+        let mut variant_body = body.clone();
+        variant_body.timeline.effect_end_frame = 0;
+        variant_body.template.recipe_id = format!("renderer_{variant}");
+        variant_body.operations.retain(|operation| {
+            matches!(
+                operation,
+                transition_operator::Operation::TimeMap(_)
+                    | transition_operator::Operation::GainEnvelope(_)
+            ) || matches!(
+                (variant.as_str(), operation),
+                ("filter", transition_operator::Operation::FilterEnvelope(_))
+                    | (
+                        "crossover",
+                        transition_operator::Operation::CrossoverBandGain(_)
+                    )
+                    | ("duck", transition_operator::Operation::DuckEnvelope(_))
+                    | (
+                        "tail",
+                        transition_operator::Operation::FeedforwardDelayTail(_)
+                    )
+                    | ("gate", transition_operator::Operation::RhythmicGate(_))
+            )
+        });
+        match variant.as_str() {
+            "filter" => variant_body.template.id = "spectral_handoff".into(),
+            "crossover" => {
+                variant_body.template.id = "bass_handoff".into();
+                let incoming = variant_body
+                    .operations
+                    .iter()
+                    .find_map(|operation| match operation {
+                        transition_operator::Operation::CrossoverBandGain(value) => {
+                            Some(value.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                let mut outgoing = incoming;
+                outgoing.target = transition_operator::Target::Outgoing;
+                outgoing.op_id = "outgoing.crossover".into();
+                for point in &mut outgoing.band_gain_envelopes[0].points {
+                    point.value_ppm = 1_000_000 - point.value_ppm;
+                }
+                variant_body.operations.insert(
+                    1,
+                    transition_operator::Operation::CrossoverBandGain(outgoing),
+                );
+            }
+            "duck" => {
+                variant_body.template.id = "ducked_overlap".into();
+                let duck = variant_body
+                    .operations
+                    .iter_mut()
+                    .find_map(|operation| match operation {
+                        transition_operator::Operation::DuckEnvelope(value) => Some(value),
+                        _ => None,
+                    })
+                    .unwrap();
+                duck.points[0].frame = -60_882;
+                duck.points[1].frame = -60_000;
+                duck.points[2].frame = -59_118;
+            }
+            "tail" => {
+                variant_body.template.id = "echo_tail_handoff".into();
+                variant_body.timeline.effect_end_frame = 17_640;
+            }
+            "gate" => {
+                variant_body.template.id = "rhythmic_handoff".into();
+                let gate = variant_body
+                    .operations
+                    .iter_mut()
+                    .find_map(|operation| match operation {
+                        transition_operator::Operation::RhythmicGate(value) => Some(value),
+                        _ => None,
+                    })
+                    .unwrap();
+                gate.target = transition_operator::Target::Outgoing;
+                gate.op_id = "outgoing.gate".into();
+            }
+            _ => unreachable!(),
+        }
+        let plan = finalized_body(&variant_body);
+        let mut variant_request = request(&plan);
+        variant_request.output_start_frame = -88_200;
+        let render_request = validate_render_request(variant_request, &plan).unwrap();
+        assert_eq!(
+            render_request.request().processing_warm_up_frames,
+            suite.processing_warm_up_frames
+        );
+        let records: Vec<_> = (0..suite.repeat_count)
+            .map(|_| renderer.render(&plan, &render_request, &locator).unwrap())
+            .collect();
+        assert!(records.windows(2).all(|pair| {
+            pair[0].artifact.pre_encode_pcm_sha256 == pair[1].artifact.pre_encode_pcm_sha256
+                && pair[0].artifact.container_sha256 == pair[1].artifact.container_sha256
+                && pair[0].measurements.post_limiter.sample_peak
+                    == pair[1].measurements.post_limiter.sample_peak
+        }));
+        let trace = &records[0].private_provenance.stage_trace;
+        assert!(
+            trace
+                .windows(2)
+                .all(|pair| stage_rank(&pair[0]) <= stage_rank(&pair[1]))
+        );
+    }
+}
+
+#[test]
+fn pair_rendering_renders_fallback_first_and_isolates_rich_failures() {
+    let plan = validated_plan();
+    let fallback = GeneratedCandidate {
+        candidate_id: candidate_id(plan.plan_hash()),
+        template_id: TemplateId::SafeCrossfade,
+        recipe_id: "fallback".into(),
+        plan: plan.clone(),
+    };
+    let rich = GeneratedCandidate {
+        candidate_id: candidate_id(plan.plan_hash()),
+        template_id: TemplateId::BeatCut,
+        recipe_id: "rich".into(),
+        plan,
+    };
+    let mut calls = Vec::new();
+    let rendered =
+        render_candidates_with_fallback(&[rich.clone(), fallback.clone()], |candidate| {
+            calls.push(candidate.template_id);
+            if candidate.template_id == TemplateId::BeatCut {
+                PcmBuffer::from_frames(vec![[f64::NAN, 0.0]]).map(|_| "never".to_owned())
+            } else {
+                Ok("fallback-render".to_owned())
+            }
+        });
+    assert_eq!(calls, [TemplateId::SafeCrossfade, TemplateId::BeatCut]);
+    assert_eq!(rendered.status, PairRenderStatus::Accepted);
+    assert_eq!(rendered.fallback.as_deref(), Some("fallback-render"));
+    assert!(rendered.rich.is_empty());
+    assert_eq!(rendered.rejections[0].code, "NON_FINITE_PCM");
+
+    calls.clear();
+    let failed = render_candidates_with_fallback(&[rich, fallback], |candidate| {
+        calls.push(candidate.template_id);
+        transition_operator::measure_loudness(&PcmBuffer::from_frames(Vec::new()).unwrap())
+            .map(|_| "never".to_owned())
+    });
+    assert_eq!(calls, [TemplateId::SafeCrossfade]);
+    assert_eq!(failed.status, PairRenderStatus::FallbackRenderFailed);
+    assert!(failed.fallback.is_none());
+    assert_eq!(failed.rejections[0].code, "FALLBACK_RENDER_FAILED");
+}
+
 impl CanonicalPcmBackend for CountingBackend {
     fn decode_s16le_stereo_44100(&self, _: &Path) -> transition_operator::Result<Vec<u8>> {
         self.calls.set(self.calls.get() + 1);
@@ -246,6 +685,13 @@ fn invalid_plan_bytes_cannot_resolve_sources_or_invoke_a_backend() {
         bytes: Vec::new(),
     };
     assert!(resolve_render_sources(b"{}", b"{}", &context, &locator, &backend).is_err());
+    assert_eq!(locator.calls.get(), 0);
+    assert_eq!(backend.calls.get(), 0);
+
+    let mut permuted: serde_json::Value = serde_json::from_slice(ALL_OPERATIONS_RAW).unwrap();
+    permuted["operations"].as_array_mut().unwrap().swap(0, 1);
+    let permuted = canonical_json(&permuted).unwrap();
+    assert!(resolve_render_sources(&permuted, b"{}", &context, &locator, &backend).is_err());
     assert_eq!(locator.calls.get(), 0);
     assert_eq!(backend.calls.get(), 0);
 }
@@ -394,6 +840,97 @@ fn source_ffmpeg_encodes_complete_synthetic_pcm24_frames_to_flac() {
         .encode_pcm24_flac(&pcm24, &output)
         .unwrap();
     assert!(fs::metadata(output).unwrap().len() > 0);
+}
+
+#[test]
+fn ffmpeg_artifact_roundtrip_preserves_exact_canonical_pcm24() {
+    let pcm24 = [0, 0, 0, 1, 0, 0, 0xff, 0xff, 0x7f, 1, 0, 0x80].repeat(4_096);
+    let backend = FfmpegBackend::new("ffmpeg");
+    let encoded = backend.encode_pcm24_flac_bytes(&pcm24).unwrap();
+    assert!(!encoded.is_empty());
+    assert_eq!(backend.decode_flac_pcm24_bytes(&encoded).unwrap(), pcm24);
+}
+
+#[test]
+fn pinned_ffmpeg_reference_render_is_pcm_and_container_repeatable() {
+    let frame_count = 230_000usize;
+    let source_bytes = [1_000_i16.to_le_bytes(), (-1_000_i16).to_le_bytes()]
+        .concat()
+        .repeat(frame_count);
+    let source_hash = hex(&Sha256::digest(&source_bytes));
+    let mut body = fixture();
+    for source in [&mut body.sources.outgoing, &mut body.sources.incoming] {
+        source.pcm_sha256 = source_hash.clone();
+        source.pcm_frame_count = frame_count as i64;
+        source.cue_source_frame = 224_596;
+    }
+    let plan = finalized_body(&body);
+    let mut request_body = request(&plan);
+    request_body.output_end_frame = 100;
+    let request = validate_render_request(request_body, &plan).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("synthetic.wav");
+    fs::write(&source_path, pcm16_wav(&source_bytes)).unwrap();
+    let locator = PrivateManifestLocator::new(
+        "a".repeat(64),
+        BTreeMap::from([
+            (body.sources.outgoing.track_id.clone(), source_path.clone()),
+            (body.sources.incoming.track_id.clone(), source_path),
+        ]),
+    )
+    .unwrap();
+    let renderer = ReferenceRenderer::new(
+        FfmpegBackend::new("ffmpeg"),
+        RubberBandTimeStretch::new("ffmpeg"),
+        environment(),
+    )
+    .unwrap();
+    let records: Vec<_> = (0..3)
+        .map(|_| renderer.render(&plan, &request, &locator).unwrap())
+        .collect();
+    assert!(
+        records
+            .iter()
+            .all(|record| record.artifact.bytes.starts_with(b"fLaC"))
+    );
+    assert!(records.windows(2).all(|pair| {
+        pair[0].artifact.pre_encode_pcm_sha256 == pair[1].artifact.pre_encode_pcm_sha256
+            && pair[0].artifact.container_sha256 == pair[1].artifact.container_sha256
+            && pair[0].measurements.post_limiter.true_peak
+                == pair[1].measurements.post_limiter.true_peak
+    }));
+    assert!(
+        records[0]
+            .private_provenance
+            .backend_programs
+            .iter()
+            .all(|program| !program.contains(directory.path().to_string_lossy().as_ref()))
+    );
+
+    let alternate_path = directory.path().join("different-name.wav");
+    fs::write(&alternate_path, pcm16_wav(&source_bytes)).unwrap();
+    let alternate_locator = PrivateManifestLocator::new(
+        "a".repeat(64),
+        BTreeMap::from([
+            (
+                body.sources.outgoing.track_id.clone(),
+                alternate_path.clone(),
+            ),
+            (body.sources.incoming.track_id.clone(), alternate_path),
+        ]),
+    )
+    .unwrap();
+    let alternate = renderer
+        .render(&plan, &request, &alternate_locator)
+        .unwrap();
+    assert_eq!(
+        alternate.render_program_sha256,
+        records[0].render_program_sha256
+    );
+    assert_eq!(
+        alternate.artifact.container_sha256,
+        records[0].artifact.container_sha256
+    );
 }
 
 fn pcm16_wav(pcm: &[u8]) -> Vec<u8> {

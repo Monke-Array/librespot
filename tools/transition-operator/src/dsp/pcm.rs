@@ -44,6 +44,37 @@ impl PcmBuffer {
         })
     }
 
+    pub fn from_s24le_stereo_44100(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() % 6 != 0 {
+            return Err(Error::new(
+                "INVALID_PCM24_BYTE_LENGTH",
+                "canonical stereo s24le PCM must contain complete frames",
+            ));
+        }
+        let frames = bytes
+            .chunks_exact(6)
+            .map(|frame| {
+                let left = i32::from_le_bytes([
+                    frame[0],
+                    frame[1],
+                    frame[2],
+                    if frame[2] & 0x80 == 0 { 0 } else { 0xff },
+                ]);
+                let right = i32::from_le_bytes([
+                    frame[3],
+                    frame[4],
+                    frame[5],
+                    if frame[5] & 0x80 == 0 { 0 } else { 0xff },
+                ]);
+                [left as f64 / 8_388_607.0, right as f64 / 8_388_607.0]
+            })
+            .collect();
+        Ok(Self {
+            frames,
+            source_pcm_sha256: None,
+        })
+    }
+
     pub fn frame_count(&self) -> usize {
         self.frames.len()
     }
@@ -62,6 +93,16 @@ impl PcmBuffer {
 
     pub fn source_pcm_sha256(&self) -> Option<&str> {
         self.source_pcm_sha256.as_deref()
+    }
+
+    pub(crate) fn slice(&self, start: usize, end: usize) -> Result<Self> {
+        let frames = self.frames.get(start..end).ok_or_else(|| {
+            Error::new(
+                "DSP_SOURCE_WINDOW_MISSING",
+                "PCM slice is outside the available source window",
+            )
+        })?;
+        Self::from_frames(frames.to_vec())
     }
 }
 

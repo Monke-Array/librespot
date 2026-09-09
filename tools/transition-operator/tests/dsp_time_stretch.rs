@@ -22,7 +22,7 @@ fn rubberband_has_exact_length_pitch_level_and_transient_conformance() {
     let backend = RubberBandTimeStretch::new("ffmpeg");
     for rate in fixture.rates_ppm {
         let required =
-            ((fixture.output_frames as u64 * rate as u64 + 999_999) / 1_000_000) as usize + 8_192;
+            (fixture.output_frames as u64 * rate as u64).div_ceil(1_000_000) as usize + 8_192;
         let cue_input =
             ((fixture.cue_output_frame as u64 * rate as u64 + 500_000) / 1_000_000) as usize;
         let cue = TimeStretchCue {
@@ -176,10 +176,8 @@ fn estimate_frequency(frames: &[[f64; 2]]) -> f64 {
     let crossings: Vec<_> = frames
         .windows(2)
         .enumerate()
-        .filter_map(|(index, pair)| {
-            (pair[0][0] <= 0.0 && pair[1][0] > 0.0)
-                .then(|| index as f64 + (-pair[0][0]) / (pair[1][0] - pair[0][0]))
-        })
+        .filter(|(_, pair)| pair[0][0] <= 0.0 && pair[1][0] > 0.0)
+        .map(|(index, pair)| index as f64 + (-pair[0][0]) / (pair[1][0] - pair[0][0]))
         .collect();
     let periods = crossings.len() - 1;
     44_100.0 * periods as f64 / (crossings[periods] - crossings[0])

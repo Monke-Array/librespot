@@ -1,6 +1,7 @@
 use crate::dsp::PcmBuffer;
 use crate::error::{Error, Result};
 use crate::model::{LimiterProfile, OutputSafety, OutputSafetyProfile, TruePeakProfile};
+use serde::{Deserialize, Serialize};
 
 // ITU-R BS.1770-4 Annex 2 four-phase, 12-tap interpolation coefficients.
 const BS1770_4X: [[f64; 12]; 4] = [
@@ -62,13 +63,28 @@ const BS1770_4X: [[f64; 12]; 4] = [
     ],
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SafetyMeasurements {
     pub sample_peak: f64,
     pub true_peak: f64,
     pub loudness_mdb: i64,
     pub maximum_gain_reduction_mdb: i64,
     pub limiter_active_fraction_ppm: i64,
+}
+
+pub fn measure_sample_peak(buffer: &PcmBuffer) -> Result<f64> {
+    let mut peak = 0.0_f64;
+    for sample in buffer.frames().iter().flatten() {
+        if !sample.is_finite() {
+            return Err(Error::new(
+                "NON_FINITE_PCM",
+                "sample-peak input contains a nonfinite sample",
+            ));
+        }
+        peak = peak.max(sample.abs());
+    }
+    Ok(peak)
 }
 
 pub fn validate_safety_measurements(

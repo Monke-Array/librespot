@@ -44,20 +44,25 @@ impl SourceLocator for PrivateManifestLocator {
 
 pub trait CanonicalPcmBackend {
     fn decode_s16le_stereo_44100(&self, path: &Path) -> Result<Vec<u8>>;
+
+    fn private_decode_program_text(&self, _path: &Path) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct ResolvedSources {
     pub outgoing: PcmBuffer,
     pub incoming: PcmBuffer,
+    pub private_backend_programs: Vec<String>,
 }
 
 pub fn resolve_render_sources(
     plan_bytes: &[u8],
     request_bytes: &[u8],
     context: &ValidationContext<'_>,
-    locator: &impl SourceLocator,
-    backend: &impl CanonicalPcmBackend,
+    locator: &(impl SourceLocator + ?Sized),
+    backend: &(impl CanonicalPcmBackend + ?Sized),
 ) -> Result<ResolvedSources> {
     // Validation is deliberately first: malformed bytes have no filesystem or
     // process side effects.
@@ -69,19 +74,48 @@ pub fn resolve_render_sources(
             "request and source locator manifest identities differ",
         ));
     }
-    let outgoing = resolve_one(&plan.plan().sources.outgoing, locator, backend)?;
-    let incoming = resolve_one(&plan.plan().sources.incoming, locator, backend)?;
-    Ok(ResolvedSources { outgoing, incoming })
+    let (outgoing, outgoing_program) =
+        resolve_one(&plan.plan().sources.outgoing, locator, backend)?;
+    let (incoming, incoming_program) =
+        resolve_one(&plan.plan().sources.incoming, locator, backend)?;
+    Ok(ResolvedSources {
+        outgoing,
+        incoming,
+        private_backend_programs: [outgoing_program, incoming_program]
+            .into_iter()
+            .flatten()
+            .collect(),
+    })
+}
+
+pub fn resolve_validated_sources(
+    plan: &crate::identity::ValidatedPlan,
+    locator: &(impl SourceLocator + ?Sized),
+    backend: &(impl CanonicalPcmBackend + ?Sized),
+) -> Result<ResolvedSources> {
+    let (outgoing, outgoing_program) =
+        resolve_one(&plan.plan().sources.outgoing, locator, backend)?;
+    let (incoming, incoming_program) =
+        resolve_one(&plan.plan().sources.incoming, locator, backend)?;
+    Ok(ResolvedSources {
+        outgoing,
+        incoming,
+        private_backend_programs: [outgoing_program, incoming_program]
+            .into_iter()
+            .flatten()
+            .collect(),
+    })
 }
 
 fn resolve_one(
     source: &SourceRef,
-    locator: &impl SourceLocator,
-    backend: &impl CanonicalPcmBackend,
-) -> Result<PcmBuffer> {
+    locator: &(impl SourceLocator + ?Sized),
+    backend: &(impl CanonicalPcmBackend + ?Sized),
+) -> Result<(PcmBuffer, Option<String>)> {
     let path = locator
         .resolve(source)
         .ok_or_else(|| Error::new("MISSING_SOURCE", "source is absent from private locator"))?;
+    let program = backend.private_decode_program_text(&path)?;
     let bytes = backend.decode_s16le_stereo_44100(&path)?;
     let pcm = PcmBuffer::from_s16le_stereo_44100(&bytes)?;
     if pcm.source_pcm_sha256() != Some(source.pcm_sha256.as_str()) {
@@ -96,7 +130,7 @@ fn resolve_one(
             "decoded source PCM frame count does not match declared identity",
         ));
     }
-    Ok(pcm)
+    Ok((pcm, program))
 }
 
 fn is_hash(value: &str) -> bool {

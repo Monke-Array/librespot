@@ -1,8 +1,61 @@
+use crate::canonical::canonical_json;
 use crate::error::{Error, Result};
+use crate::render::artifact::ArtifactBackend;
 use crate::render::source::CanonicalPcmBackend;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+const ARTIFACT_ENCODE_ARGUMENTS: &[&str] = &[
+    "-nostdin",
+    "-v",
+    "error",
+    "-threads",
+    "1",
+    "-f",
+    "s24le",
+    "-ac",
+    "2",
+    "-ar",
+    "44100",
+    "-i",
+    "pipe:0",
+    "-map_metadata",
+    "-1",
+    "-c:a",
+    "flac",
+    "-sample_fmt",
+    "s32",
+    "-bits_per_raw_sample",
+    "24",
+    "-f",
+    "flac",
+    "pipe:1",
+];
+
+const ARTIFACT_DECODE_ARGUMENTS: &[&str] = &[
+    "-nostdin",
+    "-v",
+    "error",
+    "-threads",
+    "1",
+    "-i",
+    "pipe:0",
+    "-map_metadata",
+    "-1",
+    "-vn",
+    "-sn",
+    "-dn",
+    "-ac",
+    "2",
+    "-ar",
+    "44100",
+    "-c:a",
+    "pcm_s24le",
+    "-f",
+    "s24le",
+    "pipe:1",
+];
 
 #[derive(Clone, Debug)]
 pub struct FfmpegBackend {
@@ -199,4 +252,92 @@ impl CanonicalPcmBackend for FfmpegBackend {
         }
         Ok(output.stdout)
     }
+
+    fn private_decode_program_text(&self, path: &Path) -> Result<Option<String>> {
+        let mut arguments = self.decode_arguments(path);
+        arguments[6] = "${SOURCE_PATH}".to_owned();
+        Ok(Some(String::from_utf8(canonical_json(&arguments)?).expect(
+            "canonical JSON produced from FFmpeg arguments is UTF-8",
+        )))
+    }
+}
+
+impl ArtifactBackend for FfmpegBackend {
+    fn encode_pcm24_flac_bytes(&self, pcm24: &[u8]) -> Result<Vec<u8>> {
+        if pcm24.len() % 6 != 0 {
+            return Err(Error::new(
+                "INVALID_PCM24_BYTE_LENGTH",
+                "stereo PCM24 must contain complete frames",
+            ));
+        }
+        pipe_bytes(
+            &self.executable,
+            ARTIFACT_ENCODE_ARGUMENTS,
+            pcm24,
+            "FFMPEG_ENCODE_FAILED",
+        )
+    }
+
+    fn decode_flac_pcm24_bytes(&self, encoded: &[u8]) -> Result<Vec<u8>> {
+        pipe_bytes(
+            &self.executable,
+            ARTIFACT_DECODE_ARGUMENTS,
+            encoded,
+            "FFMPEG_DECODE_FAILED",
+        )
+    }
+
+    fn private_encode_program_text(&self) -> Result<Option<String>> {
+        Ok(Some(program_text(ARTIFACT_ENCODE_ARGUMENTS)?))
+    }
+
+    fn private_artifact_decode_program_text(&self) -> Result<Option<String>> {
+        Ok(Some(program_text(ARTIFACT_DECODE_ARGUMENTS)?))
+    }
+}
+
+fn program_text(arguments: &[&str]) -> Result<String> {
+    Ok(String::from_utf8(canonical_json(&arguments)?)
+        .expect("canonical JSON produced from ASCII FFmpeg arguments is UTF-8"))
+}
+
+fn pipe_bytes(
+    executable: &Path,
+    arguments: &[&str],
+    input: &[u8],
+    failure_code: &'static str,
+) -> Result<Vec<u8>> {
+    let mut child = Command::new(executable)
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| Error::new("FFMPEG_SPAWN_FAILED", "unable to start artifact backend"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| {
+            Error::new(
+                "FFMPEG_STDIN_FAILED",
+                "artifact backend stdin is unavailable",
+            )
+        })?
+        .write_all(input)
+        .map_err(|_| {
+            Error::new(
+                "FFMPEG_STDIN_FAILED",
+                "unable to write artifact backend input",
+            )
+        })?;
+    let output = child
+        .wait_with_output()
+        .map_err(|_| Error::new("FFMPEG_WAIT_FAILED", "unable to wait for artifact backend"))?;
+    if !output.status.success() {
+        return Err(Error::new(
+            failure_code,
+            "artifact backend returned failure",
+        ));
+    }
+    Ok(output.stdout)
 }

@@ -29,6 +29,14 @@ pub trait TimeStretchBackend {
         output_frames: usize,
         cue: TimeStretchCue,
     ) -> Result<PcmBuffer>;
+
+    fn private_program_text(
+        &self,
+        _rate_ppm: i64,
+        _output_frames: usize,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +138,13 @@ impl TimeStretchBackend for RubberBandTimeStretch {
             ));
         }
         PcmBuffer::from_frames(frames)
+    }
+
+    fn private_program_text(&self, rate_ppm: i64, output_frames: usize) -> Result<Option<String>> {
+        let arguments = FfmpegBackend::rubberband_arguments(rate_ppm, output_frames);
+        Ok(Some(String::from_utf8(canonical_json(&arguments)?).expect(
+            "canonical JSON produced from ASCII FFmpeg arguments is UTF-8",
+        )))
     }
 }
 

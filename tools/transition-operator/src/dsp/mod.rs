@@ -17,8 +17,8 @@ pub use filter::{
 };
 pub use limiter::{LimiterMeasurements, LookaheadPeakLimiter, apply_pair_gain};
 pub use meter::{
-    SafetyMeasurements, measure_loudness, measure_true_peak_bs1770_4x, quantize_pcm24,
-    validate_safety_measurements,
+    SafetyMeasurements, measure_loudness, measure_sample_peak, measure_true_peak_bs1770_4x,
+    quantize_pcm24, validate_safety_measurements,
 };
 pub use pcm::PcmBuffer;
 pub use time_stretch::{RubberBandTimeStretch, TimeStretchBackend, TimeStretchCue};

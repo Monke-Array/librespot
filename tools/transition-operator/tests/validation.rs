@@ -151,7 +151,8 @@ fn valid_safe_body_obtains_only_a_validated_body_token() {
 
 #[test]
 fn schema_ascii_hash_seed_and_source_identity_fail_closed() {
-    let mutations: &[(fn(&mut OperatorPlan), &str)] = &[
+    type Mutation = (fn(&mut OperatorPlan), &'static str);
+    let mutations: &[Mutation] = &[
         (
             |p| p.schema_version = "transition-operator-plan/2".into(),
             "UNSUPPORTED_SCHEMA_VERSION",
@@ -250,7 +251,8 @@ fn envelope_and_operation_resource_bounds_reject_one_outside() {
 
 #[test]
 fn output_safety_is_exact_and_nonboosting() {
-    let mutations: &[(fn(&mut OperatorPlan), &str)] = &[
+    type Mutation = (fn(&mut OperatorPlan), &'static str);
+    let mutations: &[Mutation] = &[
         (
             |p| p.output_safety.pair_output_gain_mdb = 1,
             "INVALID_PAIR_OUTPUT_GAIN",
