@@ -1,0 +1,7 @@
+{
+  "linear_midpoint": 0.5,
+  "smoothstep_midpoint": 0.5,
+  "quarter_sine_midpoint": 0.7071067811865475,
+  "quarter_cosine_midpoint": 0.2928932188134524,
+  "equal_power_squared_sum": 1.0
+}

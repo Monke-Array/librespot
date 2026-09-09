@@ -4,10 +4,25 @@ use sha2::{Digest, Sha256};
 #[derive(Clone, Debug)]
 pub struct PcmBuffer {
     frames: Vec<[f64; 2]>,
-    pcm_sha256: String,
+    source_pcm_sha256: Option<String>,
 }
 
 impl PcmBuffer {
+    pub fn from_frames(frames: Vec<[f64; 2]>) -> Result<Self> {
+        if frames.iter().flatten().any(|sample| !sample.is_finite()) {
+            return Err(Error::new(
+                "NON_FINITE_PCM",
+                "PCM buffers may contain only finite binary64 samples",
+            ));
+        }
+        Ok(Self {
+            frames,
+            // Internal DSP buffers are not canonical source identities. Only
+            // s16le ingestion populates this field.
+            source_pcm_sha256: None,
+        })
+    }
+
     pub fn from_s16le_stereo_44100(bytes: &[u8]) -> Result<Self> {
         if bytes.len() % 4 != 0 {
             return Err(Error::new(
@@ -25,7 +40,7 @@ impl PcmBuffer {
             .collect();
         Ok(Self {
             frames,
-            pcm_sha256: hex(&Sha256::digest(bytes)),
+            source_pcm_sha256: Some(hex(&Sha256::digest(bytes))),
         })
     }
 
@@ -41,8 +56,12 @@ impl PcmBuffer {
         &self.frames
     }
 
-    pub fn pcm_sha256(&self) -> &str {
-        &self.pcm_sha256
+    pub(crate) fn frames_mut(&mut self) -> &mut [[f64; 2]] {
+        &mut self.frames
+    }
+
+    pub fn source_pcm_sha256(&self) -> Option<&str> {
+        self.source_pcm_sha256.as_deref()
     }
 }
 

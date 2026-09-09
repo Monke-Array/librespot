@@ -104,7 +104,8 @@ fn source_pcm_ingestion_is_exact_s16le_stereo_and_hashes_complete_bytes() {
     assert_eq!(pcm.frame_count(), 2);
     assert_eq!(pcm.frame(0), [-1.0, 32_767.0 / 32_768.0]);
     assert_eq!(pcm.frame(1), [0.5, -0.5]);
-    assert_eq!(pcm.pcm_sha256(), hex(&Sha256::digest(bytes)));
+    let expected_hash = hex(&Sha256::digest(bytes));
+    assert_eq!(pcm.source_pcm_sha256(), Some(expected_hash.as_str()));
     assert_eq!(
         PcmBuffer::from_s16le_stereo_44100(&bytes[..7])
             .unwrap_err()

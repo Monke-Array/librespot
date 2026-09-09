@@ -84,7 +84,7 @@ fn resolve_one(
         .ok_or_else(|| Error::new("MISSING_SOURCE", "source is absent from private locator"))?;
     let bytes = backend.decode_s16le_stereo_44100(&path)?;
     let pcm = PcmBuffer::from_s16le_stereo_44100(&bytes)?;
-    if pcm.pcm_sha256() != source.pcm_sha256 {
+    if pcm.source_pcm_sha256() != Some(source.pcm_sha256.as_str()) {
         return Err(Error::new(
             "SOURCE_PCM_HASH_MISMATCH",
             "decoded source PCM does not match declared identity",
