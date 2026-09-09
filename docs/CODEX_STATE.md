@@ -1,230 +1,155 @@
 # Current objective
 
-Execute the approved offline transition-operator plan sequentially through M3.
-M1 and M2 are complete; M3 offline reference rendering is the current gate.
-Live playback remains unchanged.
+Execute the approved offline transition-operator implementation through M3.
+M1-M3 are complete and committed. Live playback remains unchanged. M4 may
+resume only with local work that does not depend on the missing S-01 Pilot V1
+feature-schema audit.
 
-# Branch / commits
+# Branch / normative baselines
 
 - Branch: `codex/m3a-live-auto-metadata`.
-- Blind Pilot V1 analysis/state commit: `98dcd31` (`docs: record blind
-  transition pilot findings`).
-- Operator research/design-preparation commit: `74dd3a0` (`docs: prepare
-  transition operator architecture`).
-- Approved formal operator specification: `25da884` (`docs: specify offline
-  transition operator architecture`).
-- Approved implementation-plan baseline: full commit
-  `01818f0145da91ca00b96e76c61001d3e195c262` (`docs: plan offline transition
-  operator implementation`). The formal-spec baseline remains full commit
-  `25da884a0c2e648d9cf86fc938d3efade827f389`; these are distinct approvals.
-- M1 implementation commits through identity support: `9cd5e81` (standalone
-  tool), `73f1f6f` (canonical integer JSON), `65f1e55` (closed v1 model),
-  `9cad5ce` (validators), and `2aeba66` (identities/capabilities).
-- M1 golden/fixture gate: `6a78080`. M2 geometry and template commits:
-  `71b9bcd` (semantic geometry), `8f35b2c` (sealed registry), and `1b2ff8f`
-  (rich template emitters). Candidate-set assembly and the M2 gate are
-  `d8416f7`.
-- Networking implementation: `cbc3d21` (`fix(connect): retire dealer on session
-  replacement`), based on runtime-validated `948a5d8`.
-- ML research remains isolated on S-01 branch `codex/pilot-v1`:
-  implementation `227c7d0`; state/ratings template `2afa90d`.
-- No ML code/model has entered librespot, spotifyd, or RPI-01 runtime.
+- Formal specification: `25da884a0c2e648d9cf86fc938d3efade827f389`.
+- Approved implementation plan: `01818f0145da91ca00b96e76c61001d3e195c262`.
+- M1 commits: `9cd5e81`, `73f1f6f`, `65f1e55`, `9cad5ce`, `2aeba66`,
+  and golden/fixture gate `6a78080`.
+- M2 commits: `71b9bcd`, `8f35b2c`, `1b2ff8f`, `d8416f7`, and state/gate
+  record `c6066ae`.
+- M3 commits: `09193f5` (render boundary), `f4b8332` (gain/dynamics/tails),
+  `5c5dc1f` (filters/crossovers), `addb582` (time stretch), `82c3848`
+  (output safety), and `1d0e02b` (assembled renderer/QC).
+- Earlier runtime/network fix remains separate at `cbc3d21`; it was not changed
+  by the offline operator work.
 
-# Architecture / invariants
+# Architecture and invariants
 
-- Mixer and ordinary-playlist routes remain distinct.
-- Queue/context -> edge -> preload -> secondary decoder -> PCM readiness ->
-  transition -> promotion -> queue ownership is runtime-validated.
-- Deterministic fallback is mandatory. ML may only rank candidates that already
-  satisfy deterministic legality, buffer, alignment, duration, and clipping
-  constraints.
-- S-01/S-02 are never runtime playback dependencies.
-- Spotify-session replacement preserves recovery state and always closes the
-  replaced dealer task.
-
-# Blind pilot V1 / verified analysis
-
-- Cohort: 48 legal, auditable MTG-Jamendo tracks; 24 track-disjoint pairs with
-  frozen 14/5/5 train/validation/test splits (28/10/10 tracks).
-- Each pair has 64 hard-valid candidates. The set contains 72 36-second stereo
-  44.1 kHz PCM24 FLAC previews, shared non-boosting gain, and -1 dBFS ceiling.
-- Linear selected the same candidate/audio as local Auto in all 24 pairs; MLP
-  selected a different candidate/audio in all 24.
-- Completed ratings passed the `transition-pilot-ratings/v2` validator with
-  24/24 complete pairs, 72/72 samples, zero schema errors, correct order, and
-  exact manifest/sample bindings before unblinding.
-- Exact completed/frozen ratings SHA-256:
-  `0e1c7f4bf27ec0241af115ca55bc16541a3c86b423c866baa61189b2a923688c`.
-- Frozen read-only artifact:
-  `C:\Users\janni\Desktop\spotify-transition-pilot-v1-20260907\analysis\frozen\ratings-completed.sha256-0e1c7f4bf27ec0241af115ca55bc16541a3c86b423c866baa61189b2a923688c.json`.
-- Condition mapping was decoded only after freezing, from the exact seeded
-  generator procedure, then cross-checked because every mapped MLP sample is
-  the unique audio hash. Full mapping is in the analysis report.
-
-# Human-evaluation findings
-
-- Identical Auto/linear controls had only 6/24 exact rank/ranking-group
-  agreement; rank is noisy and must be interpreted against repeat controls.
-- Held-out test MLP preference was 1W/4L against both baselines; smoothness lost
-  while intent showed isolated gains. Runtime integration is not justified.
-- Across all pairs, MLP more often improved intent than smoothness, but it also
-  produced more flags than either baseline.
-- Comments repeatedly describe baselines as safe/boring crossfades, while MLP
-  exposes interesting cues but frequent beat mismatch, simultaneous overlap,
-  and old material dragging too far into the new track. Some MLP choices are
-  plainly poor; other ideas appear limited by the primitive operator vocabulary.
-- Gate decision: **B**. Improve deterministic operators/candidate vocabulary
-  and run another blind pilot before any runtime integration.
-- Full analysis:
-  `docs/MTG_JAMENDO_PILOT_V1_BLIND_ANALYSIS.md`.
-
-# Approved direction / formal specification
-
-- Architecture A and its detailed direction are approved: semantic musical
-  templates compile into a flat, explicit, versioned `OperatorPlan`; Phase 1 is
-  offline-only and a possible RPI renderer is a separate later lowering target.
-- Approved initial templates are safe crossfade, shaped handoff, beat cut, bass
-  handoff, spectral handoff, resolved ducked overlap, feed-forward echo tail,
-  energy ramp, and short rhythmic handoff. Reverb, noise/riser, stems, and
-  arbitrary hybrids/graphs are deferred pending evidence.
-- Generation retains fallback plus at most six optional families,
-  normally at most 48 candidates and never more than 64. Templates emit zipped
-  named recipes rather than Cartesian parameter grids.
-- The formal specification resolves timing to signed 44.1 kHz frames around a
-  handoff anchor; fixes schemas, hashes, operator equations/order, template
-  recipes, generation/caps, offline rendering/QC, Pilot V2 artifacts, and
-  current/future lowering boundaries. The critic only ranks valid IDs.
-- Formal spec approved on 2026-09-08 at commit `25da884`:
-  `docs/superpowers/specs/2026-09-08-transition-operator-design.md`.
-- Approved implementation plan:
-  `docs/superpowers/plans/2026-09-08-offline-transition-operator-implementation.md`.
-  It sequences seven independently verified milestones from canonical IR through
-  repeat-aware Pilot V2 analysis. M1-M3 are authorized for the current offline
-  implementation session.
+- `tools/transition-operator` is a standalone Rust workspace with no root
+  workspace, librespot playback, or connect dependency.
+- The data path is feature snapshot -> cue/geometry proposals -> deterministic
+  named templates -> validated `OperatorPlan/v1` candidates -> hard validation
+  -> offline renderer/QC -> future critic. The critic has no DSP-graph or
+  playback-state authority.
+- `safe_crossfade/v1` is an independent guaranteed fallback and experimental
+  control, not the target musical behavior.
+- Runtime Mixer/Auto and ordinary-playlist crossfade routes remain distinct.
+- S-01/S-02 are never runtime dependencies. No RPI renderer or runtime lowering
+  was introduced.
 
 # M1 canonical foundation
 
-- `tools/transition-operator` is an isolated Rust workspace with no root-workspace
-  or librespot playback/connect dependency.
-- `OperatorPlan/v1` represents exactly seven approved operation kinds and uses
-  signed integer frames/fixed units with closed serde objects/enums.
-- Canonical JSON rejects BOMs, floats/exponents, null, unknown/duplicate members,
-  unsafe integers, noncanonical bytes, and non-ASCII plan strings. Operations are
-  rejected, never reordered, when their fixed-stage order is noncanonical.
-- Structural and contextual validation are separate. Source/feature context and
-  exact template applicability/recipe equality enter through a typed feature
-  view; validated tokens have private fields.
-- Plan/audio-semantics hashes, `op1-` IDs, raw-byte-domain-separated `cand1-`
-  IDs, derived/sorted capabilities, and current-runtime compatibility labels are
-  implemented. No current `TransitionPlan` converter exists.
-- Golden safe/all-operation fixtures cover negative frames, the maximum safe
-  integer, all seven operation kinds, exact capabilities, and cross-language
-  hash agreement. The safe fixture is a self-consistent finalized plan.
-- M1 contains no renderer, generator, critic, audio, private manifest, RPI code,
-  or playback-state change.
+- Closed `OperatorPlan/v1` models exactly seven approved operation kinds using
+  signed 44.1 kHz frames and fixed integer units.
+- Canonical JSON fails closed on floats/exponents, null, duplicate/unknown
+  members, unsafe integers, noncanonical bytes, and non-ASCII plan strings.
+- Operation order is validated, never silently reordered. Structural and
+  contextual validation are separate and validated tokens have private fields.
+- Plan/audio-semantics/candidate hashes are domain-separated and avoid
+  self-reference. Paths, timestamps, and list positions do not enter semantic
+  identity. Capabilities are derived from plan contents.
+- Golden safe plan hash:
+  `73a89d840145c1404737b89c932b1c90e1f351cad6815a57f7f63fb775dc381f`.
+  Golden audio-semantics hash:
+  `f95ec69c0b5944a45964fabe29dcc3d766e8c29ba25224f35f9269bff11f8594`.
+  Golden candidate ID:
+  `cand1-1d40381d56d6a176560ebb6780221b30a4c760945dd52cfb1d18438de54a41f3`.
 
 # M2 deterministic candidate generation
 
-- Semantic cue/window/geometry identities, canonical geometry shortlisting,
-  exact fallback geometry, sealed predicates/need ordering, fixed recipes, and
-  one-geometry-per-recipe binding are implemented.
-- All nine approved families are represented. Rich generation retains at most
-  six applicable families; fixed quotas total 51 and the six-family mathematical
-  maximum is 43 candidates including fallback. Defense-in-depth attempt/accept
-  hard caps and deterministic 48-candidate family-round soft pruning are present.
-- Drafts are validated before the shared pair margin is selected. One analytic
-  non-boosting gain is then injected byte-identically into fallback and all rich
-  plans before canonical hashes; semantic audio duplicates are rejected.
-- Pair-wide beat grids are sorted/deduplicated and each rhythmic recipe selects
-  its exact geometry window, so collection order and unrelated earlier beats do
-  not rename or suppress an equivalent candidate.
-- The representative all-feature fixture produces 37 candidates spanning six
-  rich musical families plus `safe_crossfade/v1`. Frozen candidate-set hash:
+- Semantic cue/window/geometry IDs, canonical input sorting, sealed predicates,
+  fixed need/tie ordering, named recipes, one-geometry-per-recipe binding,
+  deterministic quotas, semantic deduplication, diagnostics, and caps are
+  implemented.
+- All nine approved families are represented. At most six rich families are
+  retained; the mathematical six-family maximum is 43 candidates including
+  fallback. Soft cap is 48 and hard cap is 64 with nonrecursive fallback-only
+  behavior.
+- One analytic, nonboosting pair gain is injected byte-identically into every
+  survivor before hashing. Render results never trigger candidate-local repair.
+- The representative all-feature fixture yields 37 candidates across six rich
+  families plus fallback. Frozen candidate-set hash:
   `afd1ea6b570cf67c4021496a942361e381231be445c908cfccc8573c127f8ee6`.
 
-# Audio/runtime state
+# M3 offline renderer and DSP
 
-- spotifyd requests Ogg/Vorbis 320; this librespot path does not expose Spotify
-  Lossless despite protocol FLAC enums.
-- Librespot mixes stereo 44.1 kHz float and dithers to S16. RPI-01 uses direct
-  `hw:0,0`, avoiding the former 48 kHz ALSA resample. Config rollback:
-  `/home/amogus/.config/spotifyd/spotifyd.conf.before-direct-44100-20260907`.
-- `cbc3d21` closed the leaked replaced-session dealer in a controlled staged
-  test: recovery remained about two seconds and ping traffic returned from four
-  to two pings/minute. The staged candidate was not installed.
-- Installed RPI binary SHA-256 remains
-  `b064c33ee2c8eaef0971c12a57d88e7eecef153dfe6e0259345e3044d2430679`;
-  rollback remains `21e24592bf67d81f92ae79f9f6130c7e1398071b10f9a38cf491e82e56d7f3bd`.
+- Canonical s16le stereo 44.1 kHz source ingestion checks complete PCM hashes
+  and frame counts through a private locator. Absolute paths are excluded from
+  render and backend-program identities.
+- The renderer processes one continuous window beginning exactly 4,096 frames
+  before requested output. Its fixed order is time map, spectral stages,
+  dynamics, tail capture, primary gains, sum, shared pair gain, limiter,
+  measurement, PCM24 quantization, FLAC encode, and decode/hash verification.
+- Working operators: linear/smoothstep/equal-power/asymmetric gains; canonical
+  hard/soft cuts; resolved ducking; rhythmic gate/handoff; feed-forward delay
+  tails; energy-ramp plans; RBJ LP/HP automation on the signed 64-frame grid;
+  LR4 two/three-band crossover and spectral handoff; constant incoming
+  pitch-preserving time stretch; shared pre-gain; and linked lookahead limiting.
+- The limiter uses inclusive 221-frame lookahead, immediate attack, fixed
+  4,410-frame release, whole-render maximum reduction, and transition-window
+  activity. True peak uses explicit BS.1770-4 Annex 2 four-phase/12-tap math;
+  backend meters do not define IR semantics.
+- Canonical PCM24 uses ties-away quantization and rejects any required clamp.
+  Metadata-stripped FLAC is decoded again and must reproduce the exact PCM hash.
+- QC rejects nonfinite/clipping/true-peak/limiter/length/source/backend/hash
+  failures without normalization or rerender. Rich failures are isolated;
+  fallback failure is terminal and never synthesizes silence or a hard cut.
+- Artifact, measurement, render, QC, and private backend-provenance records are
+  hash-linked. Backend command text remains renderer-private.
+- Descriptive loudness is deterministic ungated full-buffer stereo RMS because
+  the formal spec names a loudness field without defining a loudness profile;
+  it is not used for QC, normalization, generation, or selection.
 
-# Latest verification
+# TDD and verification evidence
 
-- 2026-09-09 M1 focused gate: standalone Rust suite passed 39 tests (1 boundary,
-  7 canonical, 7 identity, 24 validation; plus library/binary/doc targets) and
-  the independent Node canonical/hash golden passed 1/1.
-- M1 golden safe-crossfade hashes: plan
-  `73a89d840145c1404737b89c932b1c90e1f351cad6815a57f7f63fb775dc381f`,
-  audio semantics
-  `f95ec69c0b5944a45964fabe29dcc3d766e8c29ba25224f35f9269bff11f8594`,
-  candidate
-  `cand1-1d40381d56d6a176560ebb6780221b30a4c760945dd52cfb1d18438de54a41f3`.
-- 2026-09-09 M2 gate: standalone suite passed 75 tests (including 13 generator,
-  14 template, 26 validation, and the soft-cap unit test); independent Node
-  canonical/hash golden passed 1/1. `cargo check --workspace` passed; playback
-  passed 83/83; connect passed 113 unit + 5 integration + 1 doctest.
-- `cargo fmt --check` for the standalone crate and `git diff --check` passed.
+- Tasks 14-19 followed the approved RED -> GREEN sequence: focused tests first
+  exposed missing APIs/unsupported renderer stages, then passed after the
+  minimum implementation; each task was committed at its coherent boundary.
+- 2026-09-09 standalone full gate: 109 Rust tests passed (including 16 renderer,
+  8 safety, 6 envelope/tail, 6 filter/crossover, 4 time-stretch, 13 generator,
+  14 template, 26 validation); one performance characterization is ignored by
+  default. Rust doc tests passed.
+- Independent Node canonical/hash golden: 1/1 passed.
+- Standalone `cargo fmt --check` and all-target Clippy with `-D warnings` passed.
+  Root `cargo fmt --check`, `cargo check --workspace`, and `git diff --check`
+  passed.
+- Root regressions: `librespot-playback` 83/83; `librespot-connect` 113/113
+  unit, 5/5 integration, and 1/1 doctest.
+- Installed-FFmpeg tests decode synthetic WAV, round-trip exact PCM24 through
+  FLAC, and render the same request three times with identical container,
+  decoded-PCM, and measurement results.
+- Ignored 64-candidate/36-second performance characterization passed:
+  39.598 s total, 0.01719 render/audio ratio, 258,019,328-byte peak RSS,
+  9,525,600-byte maximum artifact, and one live candidate artifact. Bounds are
+  300 s, 0.131, 512 MiB, 512 MiB, and one respectively. Report is disposable
+  under `tools/transition-operator/target/performance/` and is not tracked.
 
-- 2026-09-08 private inventory: 66/66 MP3s probed and decoded successfully;
-  66 unique canonical decoded-PCM hashes; no duplicates or short/unsuitable
-  files. All are stereo 44.1 kHz. One bitrate warning; 57/66 measure at or above
-  0 dBTP, motivating mandatory shared headroom and true-peak QC.
-- 2026-09-08 disposable DSP spike covered 15 programs and all requested
-  operator classes. Three representative combinations were each rendered three
-  times with matching container and decoded-PCM hashes. Median throughput was
-  about 1,140x real time; the worst stretch/filter/limiter program was about 60x
-  real time; maximum resident set was about 38.1 MiB.
-- 2026-09-08 U-01 evaluator: 37/37 Node tests passed with global Web Crypto;
-  all 72 FLAC hashes and frozen manifest/template hashes matched.
-- 2026-09-08 direct ratings validation: zero errors, 24 complete pairs, 72
-  complete samples; frozen-copy size/hash and read-only attribute verified.
-- Analysis metrics were recomputed from the hash-checked frozen artifact and
-  cross-checked against the report before the disposable local script was
-  removed.
-- Previous U-01 Rust gate: `cargo fmt --check`, `cargo check --workspace`, and
-  `git diff --check` passed; connect passed 113 unit, 5 integration, 1 doctest;
-  playback passed 83 tests.
-- S-01 worker `job-20260907T100800-321c5317`: 85 ML tests passed. Full pilot
-  worker `job-20260907T094622-f847c929` completed with zero warnings.
+# Adversarial review / boundary audit
 
-# Artifacts / external state
+- Valid approved operation subsets, rather than an unapproved arbitrary hybrid,
+  exercise every v1 DSP stage three times.
+- Malformed or permuted plans fail before locator/backend calls. Negative
+  timeline/filter-grid behavior uses signed arithmetic and mathematical modulo.
+- DSP/filter/delay/limiter state is per render; no state crosses requests.
+- Source windows, frame-zero cuts, tail half-open bounds, exact output length,
+  cue alignment, encode/decode identity, and path-independent render identity
+  have direct tests.
+- No backend auto-normalization, candidate-specific loudness repair, feedback
+  delay, detector ducking, reverb, synthetic noise/riser, stems, arbitrary
+  graphs, or new template was added.
+- No runtime/playback files, audio, private filenames/manifests, credentials, or
+  temporary DSP artifacts are tracked by M1-M3.
 
-- Self-contained public pilot:
-  `C:\Users\janni\Desktop\spotify-transition-pilot-v1-20260907`.
-- Private inventory (outside Git), SHA-256
-  `30f8d5bef4bee0e2e53018b59e367a2a0295caeaf9ba41cafdad56442a38706a`:
-  `C:\Users\janni\Desktop\spotify-transition-private-v2\private-music-inventory-v1.json`.
-- Private feasibility record (outside Git), SHA-256
-  `fd2c789edabba8ba7e850170921a8bcb30f1b604111f4c09dee4c641c6ef2317`:
-  `C:\Users\janni\Desktop\spotify-transition-private-v2\offline-dsp-feasibility-v1.json`.
-- S-01 public manifest:
-  `/home/profdrhuso/Projects/spotify-transition-ml-pilot-v1/evaluations/blind/mtg-jamendo-pilot-v1/manifest.json`.
-- S-01 private report:
-  `/home/profdrhuso/Projects/spotify-transition-ml-pilot-v1/datasets/cache/mtg-jamendo-pilot-v1/private-pilot-report.json`.
-- S-01 was offline during analysis and was not woken; no worker job was started.
+# External state / unresolved issues
 
-# Known unresolved issues
-
-- Pilot V1 has one rater, small held-out splits, and a large repeat-derived rank
-  noise floor; another controlled pilot is required.
-- Candidate intent and renderer/operator quality changed together, so the pilot
-  cannot fully attribute poor output to selection versus realization.
-- The exact S-01 Pilot V1 offline feature schema is not in the local Git object
-  store. Audit it when S-01 is next available; it was not woken for design work.
-- The private MP3s have no embedded identity tags; private artist/album/style
-  annotation is required before Pilot V2 pairing and leakage controls are frozen.
-- Genuine Spotify Lossless still needs a supported resolver/manifest path that
-  this client does not currently implement or receive.
+- Pilot V1 remains a small single-rater result with a large repeat-control noise
+  floor. Its gate decision remains B: improve operators and run another blind
+  pilot before runtime integration.
+- The exact S-01 Pilot V1 feature schema is absent from the local Git object
+  store. S-01 was not woken. M4 must stop before correctness depends on that
+  audit.
+- Private Pilot V2 pairing/corpus freezing, final evaluator datasets, critic,
+  and runtime integration remain explicitly out of scope.
 
 # NEXT ACTION
 
-Implement M3 Task 14 canonical PCM and offline render boundary using RED ->
-GREEN tests, then continue through DSP/QC only after each planned task gate.
+Begin M4 Task 20 only when the S-01 Pilot V1 feature-schema audit is authorized
+and available. Until then, the safe local resume point is to inspect Task 21 for
+work provably independent of that schema; do not infer or freeze feature fields.
