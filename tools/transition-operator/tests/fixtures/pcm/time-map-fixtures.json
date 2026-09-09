@@ -1,0 +1,9 @@
+{
+  "rates_ppm": [920000, 1000000, 1080000],
+  "output_frames": 44100,
+  "cue_output_frame": 22050,
+  "maximum_cue_error_frames": 1,
+  "maximum_transient_error_frames": 221,
+  "maximum_pitch_error_cents": 1.0,
+  "maximum_level_error_mdb": 100
+}

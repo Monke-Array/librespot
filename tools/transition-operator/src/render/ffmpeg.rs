@@ -97,6 +97,90 @@ impl FfmpegBackend {
         }
         Ok(())
     }
+
+    pub(crate) fn rubberband_f64_stereo_44100(
+        &self,
+        input: &[u8],
+        rate_ppm: i64,
+        output_frames: usize,
+    ) -> Result<Vec<u8>> {
+        let arguments = Self::rubberband_arguments(rate_ppm, output_frames);
+        let mut child = Command::new(&self.executable)
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|_| {
+                Error::new(
+                    "FFMPEG_SPAWN_FAILED",
+                    "unable to start time-stretch backend",
+                )
+            })?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::new("FFMPEG_STDIN_FAILED", "time-stretch stdin is unavailable"))?
+            .write_all(input)
+            .map_err(|_| Error::new("FFMPEG_STDIN_FAILED", "unable to write time-stretch input"))?;
+        let output = child.wait_with_output().map_err(|_| {
+            Error::new(
+                "FFMPEG_WAIT_FAILED",
+                "unable to wait for time-stretch backend",
+            )
+        })?;
+        if !output.status.success() {
+            return Err(Error::new(
+                "TIME_STRETCH_BACKEND_FAILED",
+                "time-stretch backend returned failure",
+            ));
+        }
+        Ok(output.stdout)
+    }
+
+    pub(crate) fn rubberband_arguments(rate_ppm: i64, output_frames: usize) -> Vec<String> {
+        let rate = format!("{}.{:06}", rate_ppm / 1_000_000, rate_ppm % 1_000_000);
+        let filter = format!(
+            "rubberband=tempo={rate}:pitch=1.000000:transients=mixed:detector=compound:phase=laminar:window=standard:smoothing=off:formant=shifted:pitchq=quality:channels=together,atrim=start_sample=0:end_sample={output_frames},asetpts=N/SR/TB"
+        );
+        [
+            "-nostdin",
+            "-v",
+            "error",
+            "-threads",
+            "1",
+            "-filter_threads",
+            "1",
+            "-f",
+            "f64le",
+            "-ac",
+            "2",
+            "-ar",
+            "44100",
+            "-i",
+            "pipe:0",
+            "-af",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(std::iter::once(filter))
+        .chain(
+            [
+                "-map_metadata",
+                "-1",
+                "-ac",
+                "2",
+                "-ar",
+                "44100",
+                "-f",
+                "f64le",
+                "pipe:1",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .collect()
+    }
 }
 
 impl CanonicalPcmBackend for FfmpegBackend {
