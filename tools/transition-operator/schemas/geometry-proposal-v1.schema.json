@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "transition-geometry-proposal/1",
+  "title": "GeometryProposal/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "geometry_id", "outgoing_pcm_sha256", "incoming_pcm_sha256",
+    "feature_snapshot_sha256", "outgoing_pcm_frame_count", "incoming_pcm_frame_count",
+    "outgoing_cue_id", "outgoing_cue_source_frame", "incoming_cue_id",
+    "incoming_cue_source_frame", "duration_mode", "requested_dry_frames",
+    "resolved_bar_count", "incoming_source_rate_ppm", "cue_confidence_ppm",
+    "beat_confidence_ppm", "downbeat_confidence_ppm",
+    "alignment_error_ppm_of_beat", "geometry_quality_ppm", "feature_window_ids"
+  ],
+  "properties": {
+    "geometry_id": { "type": "string", "pattern": "^geom1-[0-9a-f]{64}$" },
+    "outgoing_pcm_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "incoming_pcm_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "feature_snapshot_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "outgoing_pcm_frame_count": { "type": "integer", "minimum": 1 },
+    "incoming_pcm_frame_count": { "type": "integer", "minimum": 1 },
+    "outgoing_cue_id": { "type": "string" },
+    "outgoing_cue_source_frame": { "type": "integer", "minimum": 0 },
+    "incoming_cue_id": { "type": "string" },
+    "incoming_cue_source_frame": { "type": "integer", "minimum": 0 },
+    "duration_mode": { "enum": ["cut", "seconds", "bars"] },
+    "requested_dry_frames": { "type": "integer", "minimum": 1, "maximum": 705600 },
+    "resolved_bar_count": { "enum": [0, 1, 2, 4] },
+    "incoming_source_rate_ppm": { "type": "integer", "minimum": 920000, "maximum": 1080000 },
+    "cue_confidence_ppm": { "$ref": "#/$defs/probability" },
+    "beat_confidence_ppm": { "$ref": "#/$defs/probability" },
+    "downbeat_confidence_ppm": { "$ref": "#/$defs/probability" },
+    "alignment_error_ppm_of_beat": { "$ref": "#/$defs/probability" },
+    "geometry_quality_ppm": { "$ref": "#/$defs/probability" },
+    "feature_window_ids": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": { "type": "string" }
+    }
+  },
+  "$defs": {
+    "probability": { "type": "integer", "minimum": 0, "maximum": 1000000 }
+  }
+}
