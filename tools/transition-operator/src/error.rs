@@ -18,6 +18,10 @@ impl Error {
     pub fn code(&self) -> &'static str {
         self.code
     }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

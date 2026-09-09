@@ -1,21 +1,27 @@
+mod candidate;
 mod canonical;
 mod capability;
 mod compatibility;
 mod error;
+mod generator;
 mod geometry;
 mod identity;
 mod model;
+mod safety;
 mod scalar;
 mod templates;
 mod validation;
 
+pub use candidate::*;
 pub use canonical::{canonical_json, require_canonical_json};
 pub use capability::*;
 pub use compatibility::*;
 pub use error::{Error, Result};
+pub use generator::*;
 pub use geometry::*;
 pub use identity::*;
 pub use model::*;
+pub use safety::*;
 pub use scalar::{JSON_SAFE_INTEGER_MAX, div_round_nearest_away};
 pub use templates::*;
 pub use validation::*;

@@ -474,6 +474,32 @@ fn rhythmic_gate_resolves_click_safe_cells_and_rejects_cells_shorter_than_two_ra
 }
 
 #[test]
+fn rhythmic_recipe_selects_its_window_from_a_longer_resolved_beat_grid() {
+    let mut inputs = applicable_inputs();
+    inputs.beat_frames = vec![
+        -176_400, -154_350, -132_300, -110_250, -88_200, -66_150, -44_100, -22_050, 0,
+    ];
+    let bars = geometry(DurationMode::Bars, 88_200, 1, 900_000, "rhythm-window");
+    let draft = emit_dynamics_template(
+        TemplateId::RhythmicHandoff,
+        recipe(TemplateId::RhythmicHandoff, "quarter_1bar_even"),
+        &bars,
+        &inputs,
+    )
+    .unwrap();
+    let gate = draft
+        .operations
+        .iter()
+        .find_map(|operation| match operation {
+            Operation::RhythmicGate(value) => Some(value),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(gate.points.first().unwrap().frame, -88_200);
+    assert_eq!(gate.points.last().unwrap().frame, 0);
+}
+
+#[test]
 fn echo_tail_uses_beat_fraction_round_away_capture_and_exact_effect_end() {
     let inputs = applicable_inputs();
     let cut = geometry(DurationMode::Cut, 1, 0, 900_000, "echo-cut");

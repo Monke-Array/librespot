@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "transition-candidate-set/1",
+  "title": "CandidateSet/v1 identity projection",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "generator_id", "generator_version", "generator_config_sha256", "seed_hex_u64",
+    "outgoing_pcm_sha256", "incoming_pcm_sha256", "candidates"
+  ],
+  "properties": {
+    "generator_id": { "type": "string" },
+    "generator_version": { "type": "string" },
+    "generator_config_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "seed_hex_u64": { "const": "0000000000000000" },
+    "outgoing_pcm_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "incoming_pcm_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "candidates": {
+      "type": "array", "minItems": 1, "maxItems": 64,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["candidate_id", "plan_sha256"],
+        "properties": {
+          "candidate_id": { "type": "string", "pattern": "^cand1-[0-9a-f]{64}$" },
+          "plan_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    }
+  }
+}

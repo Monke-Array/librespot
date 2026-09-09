@@ -169,10 +169,16 @@ fn rhythmic(
         .checked_mul(requested_bars)
         .ok_or_else(|| Error::new("INTEGER_OVERFLOW", "rhythmic beat count overflow"))?;
     let start = -geometry.requested_dry_frames;
-    if inputs.beat_frames.len() != needed_beats as usize + 1
-        || inputs.beat_frames.first() != Some(&start)
-        || inputs.beat_frames.last() != Some(&0)
-        || inputs.beat_frames.windows(2).any(|pair| pair[0] >= pair[1])
+    let mut resolved_beats = inputs.beat_frames.clone();
+    resolved_beats.sort_unstable();
+    resolved_beats.dedup();
+    let window_beats: Vec<_> = resolved_beats
+        .into_iter()
+        .filter(|frame| (start..=0).contains(frame))
+        .collect();
+    if window_beats.len() != needed_beats as usize + 1
+        || window_beats.first() != Some(&start)
+        || window_beats.last() != Some(&0)
     {
         return Err(Error::new(
             "RHYTHMIC_GRID_MISMATCH",
@@ -180,7 +186,7 @@ fn rhythmic(
         ));
     }
     let mut cells = Vec::new();
-    for beat in inputs.beat_frames.windows(2) {
+    for beat in window_beats.windows(2) {
         if subdivision == 1 {
             cells.push((beat[0], beat[1]));
         } else {
