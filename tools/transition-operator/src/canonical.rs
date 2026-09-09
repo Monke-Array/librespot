@@ -5,10 +5,10 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 pub fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let value = serde_json::to_value(value).map_err(|error| {
+    let value = serde_json::to_value(value).map_err(|_| {
         Error::new(
             "JSON_SERIALIZATION_FAILED",
-            format!("typed value could not be represented as JSON: {error}"),
+            "typed JSON serialization failed",
         )
     })?;
     let mut bytes = Vec::new();
@@ -17,9 +17,8 @@ pub fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 }
 
 pub fn require_canonical_json<T: DeserializeOwned + Serialize>(bytes: &[u8]) -> Result<T> {
-    let value: T = serde_json::from_slice(bytes).map_err(|error| {
-        Error::new("INVALID_JSON", format!("strict JSON parse failed: {error}"))
-    })?;
+    let value: T = serde_json::from_slice(bytes)
+        .map_err(|_| Error::new("INVALID_JSON", "strict JSON parse failed"))?;
     let canonical = canonical_json(&value)?;
     if canonical != bytes {
         return Err(Error::new(
@@ -42,12 +41,8 @@ fn write_value(value: &Value, output: &mut Vec<u8>) -> Result<()> {
         }
         Value::Number(number) => write_number(number, output),
         Value::String(value) => {
-            let encoded = serde_json::to_string(value).map_err(|error| {
-                Error::new(
-                    "JSON_SERIALIZATION_FAILED",
-                    format!("string encoding failed: {error}"),
-                )
-            })?;
+            let encoded = serde_json::to_string(value)
+                .map_err(|_| Error::new("JSON_SERIALIZATION_FAILED", "string encoding failed"))?;
             output.extend_from_slice(encoded.as_bytes());
             Ok(())
         }
@@ -76,11 +71,8 @@ fn write_value(value: &Value, output: &mut Vec<u8>) -> Result<()> {
                 if index != 0 {
                     output.push(b',');
                 }
-                let encoded = serde_json::to_string(key).map_err(|error| {
-                    Error::new(
-                        "JSON_SERIALIZATION_FAILED",
-                        format!("object key encoding failed: {error}"),
-                    )
+                let encoded = serde_json::to_string(key).map_err(|_| {
+                    Error::new("JSON_SERIALIZATION_FAILED", "object key encoding failed")
                 })?;
                 output.extend_from_slice(encoded.as_bytes());
                 output.push(b':');

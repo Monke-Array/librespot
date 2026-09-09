@@ -18,6 +18,11 @@ impl ValidationReport {
     pub fn stages_completed(&self) -> u8 {
         self.stages_completed
     }
+
+    pub(crate) fn advanced_to(mut self, stages_completed: u8) -> Self {
+        self.stages_completed = stages_completed;
+        self
+    }
 }
 
 #[derive(Clone, Debug)]

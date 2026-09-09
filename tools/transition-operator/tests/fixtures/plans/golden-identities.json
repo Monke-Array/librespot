@@ -1,0 +1,40 @@
+{
+  "schema_version": "transition-operator-golden-identities/1",
+  "max_safe_integer": 9007199254740991,
+  "vectors": [
+    {
+      "fixture": "safe-crossfade.json",
+      "canonical_sha256": "dd051368ab892c22caf220a84379a13363b922cf2ae2c695abd17ad4e0eb38e0",
+      "plan_sha256": "73a89d840145c1404737b89c932b1c90e1f351cad6815a57f7f63fb775dc381f",
+      "audio_semantics_sha256": "f95ec69c0b5944a45964fabe29dcc3d766e8c29ba25224f35f9269bff11f8594",
+      "plan_id": "op1-73a89d840145c1404737b89c932b1c90e1f351cad6815a57f7f63fb775dc381f",
+      "candidate_id": "cand1-1d40381d56d6a176560ebb6780221b30a4c760945dd52cfb1d18438de54a41f3",
+      "capabilities": {
+        "required": ["format:pcm_f64_stereo_44100_v1", "interpolation:linear", "limit:max_abs_rate_delta_ppm:0", "limit:max_bands:0", "limit:max_envelope_points:2", "limit:max_state_span_frames:221", "limit:max_taps:0", "limiter:lookahead_peak_limiter_v1", "lookahead_frames:221", "operation:gain_envelope", "output_safety:transition_output_safety_v1", "plan:transition-operator-plan/1", "source:pcm_s16le_stereo_44100_v1", "true_peak:bs1770_4x_v1"],
+        "max_envelope_points": 2,
+        "max_bands": 0,
+        "max_taps": 0,
+        "max_state_span_frames": 221,
+        "max_abs_rate_delta_ppm": 0,
+        "lookahead_frames": 221
+      }
+    },
+    {
+      "fixture": "all-operations.json",
+      "canonical_sha256": "667cb02beb46049766f497b22bef4edd4effb87210c9084fe3e4851915a25911",
+      "plan_sha256": "c52f55e3b685faf8b3dc7fa56fd248337748d0cc9983fb36ab3e06b4d336c154",
+      "audio_semantics_sha256": "17690474796f10318e249a2958754067ab8d895555e76356e1df881bd325a3e2",
+      "plan_id": "op1-c52f55e3b685faf8b3dc7fa56fd248337748d0cc9983fb36ab3e06b4d336c154",
+      "candidate_id": "cand1-559ecb5f356bb3442e7e3dd278c1a9a9d05c335a943ec1fcbbceb7d17babd9c1",
+      "capabilities": {
+        "required": ["format:pcm_f64_stereo_44100_v1", "interpolation:linear", "limit:max_abs_rate_delta_ppm:20000", "limit:max_bands:2", "limit:max_envelope_points:3", "limit:max_state_span_frames:17640", "limit:max_taps:2", "limiter:lookahead_peak_limiter_v1", "lookahead_frames:221", "operation:crossover_band_gain", "operation:duck_envelope", "operation:feedforward_delay_tail", "operation:filter_envelope", "operation:gain_envelope", "operation:rhythmic_gate", "operation:time_map", "output_safety:transition_output_safety_v1", "plan:transition-operator-plan/1", "profile:linkwitz_riley_4_v1", "profile:lowpass_biquad_v1", "profile:pitch_preserving_balanced_transients_v1", "source:pcm_s16le_stereo_44100_v1", "time_stretch_rate_ppm:1020000", "true_peak:bs1770_4x_v1"],
+        "max_envelope_points": 3,
+        "max_bands": 2,
+        "max_taps": 2,
+        "max_state_span_frames": 17640,
+        "max_abs_rate_delta_ppm": 20000,
+        "lookahead_frames": 221
+      }
+    }
+  ]
+}

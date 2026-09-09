@@ -1,9 +1,8 @@
 # Current objective
 
-Keep the validated Mixer/non-Mixer playback mechanics unchanged while improving
-offline transition quality. Blind pilot V1 reached decision B: learned behavior
-is promising, but the deterministic transition vocabulary/rendering must
-improve and pass another held-out blind pilot before runtime integration.
+Execute the approved offline transition-operator plan sequentially through M3.
+M1 is complete; M2 deterministic candidate generation is the current gate.
+Live playback remains unchanged.
 
 # Branch / commits
 
@@ -14,6 +13,13 @@ improve and pass another held-out blind pilot before runtime integration.
   transition operator architecture`).
 - Approved formal operator specification: `25da884` (`docs: specify offline
   transition operator architecture`).
+- Approved implementation-plan baseline: full commit
+  `01818f0145da91ca00b96e76c61001d3e195c262` (`docs: plan offline transition
+  operator implementation`). The formal-spec baseline remains full commit
+  `25da884a0c2e648d9cf86fc938d3efade827f389`; these are distinct approvals.
+- M1 implementation commits through identity support: `9cd5e81` (standalone
+  tool), `73f1f6f` (canonical integer JSON), `65f1e55` (closed v1 model),
+  `9cad5ce` (validators), and `2aeba66` (identities/capabilities).
 - Networking implementation: `cbc3d21` (`fix(connect): retire dealer on session
   replacement`), based on runtime-validated `948a5d8`.
 - ML research remains isolated on S-01 branch `codex/pilot-v1`:
@@ -86,10 +92,32 @@ improve and pass another held-out blind pilot before runtime integration.
   current/future lowering boundaries. The critic only ranks valid IDs.
 - Formal spec approved on 2026-09-08 at commit `25da884`:
   `docs/superpowers/specs/2026-09-08-transition-operator-design.md`.
-- Documentation-only implementation plan awaiting human approval:
+- Approved implementation plan:
   `docs/superpowers/plans/2026-09-08-offline-transition-operator-implementation.md`.
   It sequences seven independently verified milestones from canonical IR through
-  repeat-aware Pilot V2 analysis; implementation has not begun.
+  repeat-aware Pilot V2 analysis. M1-M3 are authorized for the current offline
+  implementation session.
+
+# M1 canonical foundation
+
+- `tools/transition-operator` is an isolated Rust workspace with no root-workspace
+  or librespot playback/connect dependency.
+- `OperatorPlan/v1` represents exactly seven approved operation kinds and uses
+  signed integer frames/fixed units with closed serde objects/enums.
+- Canonical JSON rejects BOMs, floats/exponents, null, unknown/duplicate members,
+  unsafe integers, noncanonical bytes, and non-ASCII plan strings. Operations are
+  rejected, never reordered, when their fixed-stage order is noncanonical.
+- Structural and contextual validation are separate. Source/feature context and
+  exact template applicability/recipe equality enter through a typed feature
+  view; validated tokens have private fields.
+- Plan/audio-semantics hashes, `op1-` IDs, raw-byte-domain-separated `cand1-`
+  IDs, derived/sorted capabilities, and current-runtime compatibility labels are
+  implemented. No current `TransitionPlan` converter exists.
+- Golden safe/all-operation fixtures cover negative frames, the maximum safe
+  integer, all seven operation kinds, exact capabilities, and cross-language
+  hash agreement. The safe fixture is a self-consistent finalized plan.
+- M1 contains no renderer, generator, critic, audio, private manifest, RPI code,
+  or playback-state change.
 
 # Audio/runtime state
 
@@ -106,6 +134,17 @@ improve and pass another held-out blind pilot before runtime integration.
   rollback remains `21e24592bf67d81f92ae79f9f6130c7e1398071b10f9a38cf491e82e56d7f3bd`.
 
 # Latest verification
+
+- 2026-09-09 M1 focused gate: standalone Rust suite passed 39 tests (1 boundary,
+  7 canonical, 7 identity, 24 validation; plus library/binary/doc targets) and
+  the independent Node canonical/hash golden passed 1/1.
+- M1 golden safe-crossfade hashes: plan
+  `73a89d840145c1404737b89c932b1c90e1f351cad6815a57f7f63fb775dc381f`,
+  audio semantics
+  `f95ec69c0b5944a45964fabe29dcc3d766e8c29ba25224f35f9269bff11f8594`,
+  candidate
+  `cand1-1d40381d56d6a176560ebb6780221b30a4c760945dd52cfb1d18438de54a41f3`.
+- Pre-M1 repository baseline remained green: playback 83/83 and connect 113/113.
 
 - 2026-09-08 private inventory: 66/66 MP3s probed and decoded successfully;
   66 unique canonical decoded-PCM hashes; no duplicates or short/unsuitable
@@ -160,7 +199,5 @@ improve and pass another held-out blind pilot before runtime integration.
 
 # NEXT ACTION
 
-Human-review and approve or revise
-`docs/superpowers/plans/2026-09-08-offline-transition-operator-implementation.md`.
-Only explicit approval of that plan authorizes implementation; no implementation
-is authorized yet.
+Implement M2 deterministic candidate generation, then run its hard automated
+gate before beginning the offline renderer.

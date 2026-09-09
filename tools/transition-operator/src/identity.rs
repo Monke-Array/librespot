@@ -78,6 +78,7 @@ impl ValidatedPlan {
 
 pub fn finalize_plan(validated: ValidatedPlanBody) -> Result<ValidatedPlan> {
     let (body, report) = validated.into_parts();
+    let report = report.advanced_to(9);
     let plan_hash = PlanHash(hash(&canonical_json(&body)?));
     let audio_semantics_hash = audio_semantics_hash(&body)?;
     let plan = OperatorPlan {

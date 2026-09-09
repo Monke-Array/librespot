@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use transition_operator::{canonical_json, div_round_nearest_away, require_canonical_json};
+use transition_operator::{
+    CapabilityRequirements, OperatorPlan, canonical_json, derive_capabilities,
+    div_round_nearest_away, require_canonical_json,
+};
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -126,4 +130,103 @@ fn strict_input_fails_closed_on_malformed_or_unsupported_json() {
             String::from_utf8_lossy(bytes)
         );
     }
+}
+
+#[derive(Deserialize)]
+struct GoldenDocument {
+    schema_version: String,
+    max_safe_integer: i64,
+    vectors: Vec<GoldenVector>,
+}
+
+#[derive(Deserialize)]
+struct GoldenVector {
+    fixture: String,
+    canonical_sha256: String,
+    plan_sha256: String,
+    audio_semantics_sha256: String,
+    plan_id: String,
+    candidate_id: String,
+    capabilities: GoldenCapabilities,
+}
+
+#[derive(Deserialize)]
+struct GoldenCapabilities {
+    required: Vec<String>,
+    max_envelope_points: i64,
+    max_bands: i64,
+    max_taps: i64,
+    max_state_span_frames: i64,
+    max_abs_rate_delta_ppm: i64,
+    lookahead_frames: i64,
+}
+
+#[test]
+fn rust_matches_cross_language_canonical_and_hash_vectors() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plans");
+    let golden: GoldenDocument =
+        serde_json::from_slice(&std::fs::read(root.join("golden-identities.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        golden.schema_version,
+        "transition-operator-golden-identities/1"
+    );
+    assert_eq!(golden.max_safe_integer, 9_007_199_254_740_991);
+
+    for vector in golden.vectors {
+        let raw = std::fs::read(root.join(&vector.fixture)).unwrap();
+        let bytes = raw.strip_suffix(b"\n").unwrap_or(&raw);
+        let plan: OperatorPlan = require_canonical_json(bytes).unwrap();
+        assert_eq!(
+            hex(Sha256::digest(bytes).as_slice()),
+            vector.canonical_sha256
+        );
+
+        let body_bytes = canonical_json(&plan.body()).unwrap();
+        let plan_digest = Sha256::digest(&body_bytes);
+        assert_eq!(hex(plan_digest.as_slice()), vector.plan_sha256);
+        assert_eq!(
+            format!("op1-{}", hex(plan_digest.as_slice())),
+            vector.plan_id
+        );
+
+        let audio = serde_json::json!({
+            "schema_version": &plan.schema_version,
+            "format": &plan.format,
+            "sources": &plan.sources,
+            "timeline": &plan.timeline,
+            "operations": &plan.operations,
+            "output_safety": &plan.output_safety,
+        });
+        assert_eq!(
+            hex(Sha256::digest(canonical_json(&audio).unwrap()).as_slice()),
+            vector.audio_semantics_sha256
+        );
+
+        let mut candidate = Sha256::new();
+        candidate.update(b"transition-candidate/1\0");
+        candidate.update(plan_digest);
+        assert_eq!(
+            format!("cand1-{}", hex(candidate.finalize().as_slice())),
+            vector.candidate_id
+        );
+        assert_capabilities(&derive_capabilities(&plan), &vector.capabilities);
+    }
+}
+
+fn assert_capabilities(actual: &CapabilityRequirements, expected: &GoldenCapabilities) {
+    assert_eq!(actual.required, expected.required);
+    assert_eq!(actual.max_envelope_points, expected.max_envelope_points);
+    assert_eq!(actual.max_bands, expected.max_bands);
+    assert_eq!(actual.max_taps, expected.max_taps);
+    assert_eq!(actual.max_state_span_frames, expected.max_state_span_frames);
+    assert_eq!(
+        actual.max_abs_rate_delta_ppm,
+        expected.max_abs_rate_delta_ppm
+    );
+    assert_eq!(actual.lookahead_frames, expected.lookahead_frames);
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

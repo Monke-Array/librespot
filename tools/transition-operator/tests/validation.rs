@@ -550,8 +550,8 @@ fn rhythmic_gate_has_explicit_click_safe_edges_and_terminal_zero() {
     let (points, interpolations) = envelope(&[
         (-10_000, 0),
         (-9_779, 1_000_000),
-        (-9_000, 1_000_000),
-        (-8_779, 0),
+        (-4_000, 1_000_000),
+        (-3_779, 0),
         (0, 0),
     ]);
     plan.operations.insert(
@@ -598,4 +598,128 @@ fn tail_capture_may_start_before_primary_gain_points() {
         }),
     );
     assert_valid(&plan);
+}
+
+#[test]
+fn canonical_hard_cut_is_the_only_unequal_hold_step() {
+    let mut plan = safe_plan();
+    plan.template.id = "beat_cut".into();
+    plan.template.recipe_id = "hard_0ms".into();
+    plan.timeline.dry_start_frame = -1;
+    for operation in &mut plan.operations {
+        let Operation::GainEnvelope(gain) = operation else {
+            unreachable!()
+        };
+        gain.points[0].frame = -1;
+        gain.interpolations[0] = Interpolation::Hold;
+    }
+    assert_valid(&plan);
+
+    plan.template.recipe_id = "soft_10ms".into();
+    assert_eq!(validation_code(&plan), "INVALID_HOLD_STEP");
+}
+
+#[test]
+fn positive_effect_end_requires_a_delay_tail() {
+    let mut plan = safe_plan();
+    plan.template.id = "shaped_handoff".into();
+    plan.template.recipe_id = "test".into();
+    plan.timeline.effect_end_frame = 1;
+    assert_eq!(validation_code(&plan), "INVALID_OPERATION_COMBINATION");
+}
+
+#[test]
+fn safe_crossfade_recipe_has_exactly_two_linear_endpoint_gains() {
+    let mut plan = safe_plan();
+    let Operation::GainEnvelope(outgoing) = &mut plan.operations[0] else {
+        unreachable!()
+    };
+    outgoing.points.insert(
+        1,
+        EnvelopePoint {
+            frame: -110_250,
+            value_ppm: 500_000,
+        },
+    );
+    outgoing.interpolations.push(Interpolation::Linear);
+    assert_eq!(validation_code(&plan), "INVALID_TEMPLATE_SIGNATURE");
+}
+
+#[test]
+fn crossover_wet_curves_are_limited_to_linear_or_smoothstep() {
+    let mut plan = safe_plan();
+    plan.template.id = "bass_handoff".into();
+    plan.template.recipe_id = "test".into();
+    let mut outgoing = crossover(Target::Outgoing, "outgoing.crossover");
+    outgoing.wet_interpolations[0] = Interpolation::QuarterSine;
+    plan.operations = vec![
+        Operation::CrossoverBandGain(outgoing),
+        Operation::CrossoverBandGain(crossover(Target::Incoming, "incoming.crossover")),
+    ];
+    plan.operations.extend(primary_gains(&safe_plan()));
+    assert_eq!(validation_code(&plan), "INVALID_CROSSOVER_INTERPOLATION");
+
+    let mut plan = safe_plan();
+    plan.template.id = "bass_handoff".into();
+    plan.template.recipe_id = "test".into();
+    let mut outgoing = crossover(Target::Outgoing, "outgoing.crossover");
+    outgoing.band_gain_envelopes[0].interpolations[0] = Interpolation::Smoothstep;
+    plan.operations = vec![
+        Operation::CrossoverBandGain(outgoing),
+        Operation::CrossoverBandGain(crossover(Target::Incoming, "incoming.crossover")),
+    ];
+    plan.operations.extend(primary_gains(&safe_plan()));
+    assert_eq!(validation_code(&plan), "INVALID_CROSSOVER_INTERPOLATION");
+}
+
+#[test]
+fn delay_tap_gains_must_strictly_decrease() {
+    let mut plan = safe_plan();
+    plan.template.id = "echo_tail_handoff".into();
+    plan.template.recipe_id = "test".into();
+    plan.timeline.effect_end_frame = 2_000;
+    plan.operations.insert(
+        0,
+        Operation::FeedforwardDelayTail(FeedforwardDelayTail {
+            op_id: "outgoing.tail".into(),
+            target: Target::Outgoing,
+            capture_start_frame: -2_000,
+            capture_end_frame: 0,
+            taps: vec![
+                DelayTap {
+                    delay_frames: 1_000,
+                    gain_ppm: 300_000,
+                },
+                DelayTap {
+                    delay_frames: 2_000,
+                    gain_ppm: 300_000,
+                },
+            ],
+        }),
+    );
+    assert_eq!(validation_code(&plan), "INVALID_DELAY_TAP");
+}
+
+#[test]
+fn rhythmic_gate_transition_starts_are_limited_to_eight_per_second() {
+    let mut plan = safe_plan();
+    plan.template.id = "rhythmic_handoff".into();
+    plan.template.recipe_id = "test".into();
+    let (points, interpolations) = envelope(&[
+        (-12_000, 0),
+        (-11_779, 1_000_000),
+        (-7_000, 1_000_000),
+        (-6_779, 0),
+        (0, 0),
+    ]);
+    plan.operations.insert(
+        0,
+        Operation::RhythmicGate(RhythmicGate {
+            op_id: "outgoing.gate".into(),
+            target: Target::Outgoing,
+            points,
+            interpolations,
+        }),
+    );
+    assert_eq!(validation_code(&plan), "INVALID_RHYTHMIC_GATE");
 }

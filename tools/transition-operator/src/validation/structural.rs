@@ -1,7 +1,7 @@
 use crate::canonical::canonical_json;
 use crate::error::{Error, Result};
 use crate::model::*;
-use crate::scalar::JSON_SAFE_INTEGER_MAX;
+use crate::scalar::{JSON_SAFE_INTEGER_MAX, div_round_nearest_away};
 use std::collections::HashSet;
 
 pub(super) fn validate_schema_and_scalars(body: &OperatorPlanBody) -> Result<()> {
@@ -23,7 +23,7 @@ pub(super) fn validate_schema_and_scalars(body: &OperatorPlanBody) -> Result<()>
         ));
     }
     let value = serde_json::to_value(body)
-        .map_err(|error| Error::new("JSON_SERIALIZATION_FAILED", error.to_string()))?;
+        .map_err(|_| Error::new("JSON_SERIALIZATION_FAILED", "plan serialization failed"))?;
     validate_value_scalars(&value)?;
     for hash in [
         &body.sources.outgoing.pcm_sha256,
@@ -418,6 +418,16 @@ fn validate_crossover(value: &CrossoverBandGain, body: &OperatorPlanBody) -> Res
             body,
             &value.op_id,
         )?;
+        if envelope
+            .interpolations
+            .iter()
+            .any(|interpolation| *interpolation != Interpolation::Linear)
+        {
+            return Err(Error::new(
+                "INVALID_CROSSOVER_INTERPOLATION",
+                "crossover band ownership must use linear interpolation",
+            ));
+        }
         count += envelope.points.len();
     }
     validate_envelope(
@@ -429,6 +439,17 @@ fn validate_crossover(value: &CrossoverBandGain, body: &OperatorPlanBody) -> Res
         body,
         &value.op_id,
     )?;
+    if value.wet_interpolations.iter().any(|interpolation| {
+        !matches!(
+            interpolation,
+            Interpolation::Linear | Interpolation::Smoothstep
+        )
+    }) {
+        return Err(Error::new(
+            "INVALID_CROSSOVER_INTERPOLATION",
+            "crossover wet interpolation must be linear or smoothstep",
+        ));
+    }
     count += value.wet_points.len();
     Ok(count)
 }
@@ -484,7 +505,7 @@ fn validate_delay(value: &FeedforwardDelayTail, body: &OperatorPlanBody) -> Resu
         if !(882..=88_200).contains(&tap.delay_frames)
             || tap.delay_frames <= previous_delay
             || !(1..=500_000).contains(&tap.gain_ppm)
-            || tap.gain_ppm > previous_gain
+            || tap.gain_ppm >= previous_gain
         {
             return Err(Error::new(
                 "INVALID_DELAY_TAP",
@@ -531,6 +552,21 @@ fn validate_gate(value: &RhythmicGate, body: &OperatorPlanBody) -> Result<usize>
             ));
         }
     }
+    let transition_starts: Vec<_> = value
+        .points
+        .windows(2)
+        .filter(|pair| pair[0].value_ppm != pair[1].value_ppm)
+        .map(|pair| pair[0].frame)
+        .collect();
+    if transition_starts
+        .windows(2)
+        .any(|pair| (pair[1] - pair[0]) * 8 < 44_100)
+    {
+        return Err(Error::new(
+            "INVALID_RHYTHMIC_GATE",
+            "gate transitions may occur no faster than eight per second",
+        ));
+    }
     if value.points.last().unwrap().frame - value.points.first().unwrap().frame > 529_200 {
         return Err(Error::new(
             "INVALID_RHYTHMIC_GATE",
@@ -544,8 +580,10 @@ fn validate_combinations(body: &OperatorPlanBody) -> Result<()> {
     let count = |predicate: fn(&Operation) -> bool| {
         body.operations.iter().filter(|op| predicate(op)).count()
     };
+    let tail_count = count(|op| matches!(op, Operation::FeedforwardDelayTail(_)));
     if count(|op| matches!(op, Operation::TimeMap(_))) > 1
-        || count(|op| matches!(op, Operation::FeedforwardDelayTail(_))) > 1
+        || tail_count > 1
+        || (tail_count == 0 && body.timeline.effect_end_frame != 0)
     {
         return Err(Error::new(
             "INVALID_OPERATION_COMBINATION",
@@ -602,6 +640,17 @@ fn validate_complementary_bass(body: &OperatorPlanBody) -> Result<()> {
         .iter()
         .find(|value| value.target == Target::Incoming)
         .ok_or_else(|| Error::new("INVALID_BASS_HANDOFF", "missing incoming crossover"))?;
+    if low_band(outgoing)
+        .interpolations
+        .iter()
+        .chain(&low_band(incoming).interpolations)
+        .any(|value| *value != Interpolation::Linear)
+    {
+        return Err(Error::new(
+            "INVALID_BASS_HANDOFF",
+            "complementary bass transfer must use linear interpolation",
+        ));
+    }
     let mut frames = Vec::new();
     for point in low_band(outgoing)
         .points
@@ -613,11 +662,13 @@ fn validate_complementary_bass(body: &OperatorPlanBody) -> Result<()> {
     frames.sort_unstable();
     frames.dedup();
     for pair in frames.clone().windows(2) {
-        frames.push(pair[0] + (pair[1] - pair[0]) / 2);
+        frames.push(div_round_nearest_away(pair[0] + pair[1], 2)?);
     }
     for frame in frames {
-        if envelope_value(low_band(outgoing), frame) + envelope_value(low_band(incoming), frame)
-            > 1_000_000.000_001
+        let (out_numerator, out_denominator) = linear_envelope_ratio(low_band(outgoing), frame);
+        let (in_numerator, in_denominator) = linear_envelope_ratio(low_band(incoming), frame);
+        if out_numerator * in_denominator + in_numerator * out_denominator
+            > 1_000_000_i128 * out_denominator * in_denominator
         {
             return Err(Error::new(
                 "BASS_OWNERSHIP_OVERLAP",
@@ -636,22 +687,18 @@ fn low_band(value: &CrossoverBandGain) -> &BandGainEnvelope {
         .unwrap()
 }
 
-fn envelope_value(envelope: &BandGainEnvelope, frame: i64) -> f64 {
+fn linear_envelope_ratio(envelope: &BandGainEnvelope, frame: i64) -> (i128, i128) {
     if frame <= envelope.points[0].frame {
-        return envelope.points[0].value_ppm as f64;
+        return (i128::from(envelope.points[0].value_ppm), 1);
     }
-    for (index, pair) in envelope.points.windows(2).enumerate() {
+    for pair in envelope.points.windows(2) {
         if frame < pair[1].frame {
-            let x = (frame - pair[0].frame) as f64 / (pair[1].frame - pair[0].frame) as f64;
-            let p = match envelope.interpolations[index] {
-                Interpolation::Hold => 0.0,
-                Interpolation::Linear => x,
-                Interpolation::Smoothstep => 3.0 * x * x - 2.0 * x * x * x,
-                Interpolation::QuarterSine => (std::f64::consts::FRAC_PI_2 * x).sin(),
-                Interpolation::QuarterCosine => 1.0 - (std::f64::consts::FRAC_PI_2 * x).cos(),
-            };
-            return pair[0].value_ppm as f64 + (pair[1].value_ppm - pair[0].value_ppm) as f64 * p;
+            let denominator = i128::from(pair[1].frame - pair[0].frame);
+            let offset = i128::from(frame - pair[0].frame);
+            let numerator = i128::from(pair[0].value_ppm) * denominator
+                + i128::from(pair[1].value_ppm - pair[0].value_ppm) * offset;
+            return (numerator, denominator);
         }
     }
-    envelope.points.last().unwrap().value_ppm as f64
+    (i128::from(envelope.points.last().unwrap().value_ppm), 1)
 }

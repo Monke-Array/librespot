@@ -42,6 +42,21 @@ fn finalized(plan: &OperatorPlan) -> transition_operator::ValidatedPlan {
     transition_operator::finalize_plan(body).unwrap()
 }
 
+fn supporting(requirements: &transition_operator::CapabilityRequirements) -> RendererCapabilities {
+    RendererCapabilities {
+        schema_version: "renderer-capabilities/1".into(),
+        supported_plan_versions: vec![requirements.plan_schema_version.clone()],
+        supported_requirements: requirements.required.clone(),
+        max_envelope_points: requirements.max_envelope_points,
+        max_bands: requirements.max_bands,
+        max_taps: requirements.max_taps,
+        max_state_span_frames: requirements.max_state_span_frames,
+        max_abs_rate_delta_ppm: requirements.max_abs_rate_delta_ppm,
+        max_lookahead_frames: requirements.lookahead_frames,
+        simplifications: Vec::new(),
+    }
+}
+
 #[test]
 fn plan_and_candidate_ids_are_domain_separated_and_self_consistent() {
     let validated = finalized(&fixture());
@@ -56,6 +71,19 @@ fn plan_and_candidate_ids_are_domain_separated_and_self_consistent() {
         candidate,
         CandidateId::from_plan_hash(validated.plan_hash())
     );
+    assert_eq!(
+        validated.plan_hash().hex(),
+        "73a89d840145c1404737b89c932b1c90e1f351cad6815a57f7f63fb775dc381f"
+    );
+    assert_eq!(
+        validated.audio_semantics_hash().hex(),
+        "f95ec69c0b5944a45964fabe29dcc3d766e8c29ba25224f35f9269bff11f8594"
+    );
+    assert_eq!(
+        candidate.as_str(),
+        "cand1-1d40381d56d6a176560ebb6780221b30a4c760945dd52cfb1d18438de54a41f3"
+    );
+    assert_eq!(validated.validation_report().stages_completed(), 9);
 }
 
 #[test]
@@ -91,21 +119,34 @@ fn audio_semantics_excludes_provenance_but_includes_audio_fields() {
 fn canonical_input_recomputes_and_rejects_wrong_plan_id() {
     let plan = fixture();
     let features = Features(plan.feature_snapshot.sha256.clone());
-    assert_eq!(
-        PlanValidator::validate_bytes(
-            SAFE_RAW.strip_suffix(b"\n").unwrap_or(SAFE_RAW),
-            &context(&plan, &features)
-        )
-        .unwrap_err()
-        .code(),
-        "PLAN_ID_MISMATCH"
-    );
     let valid = finalized(&plan);
     assert_eq!(
-        PlanValidator::validate_bytes(valid.canonical_bytes(), &context(valid.plan(), &features))
+        PlanValidator::validate_bytes(SAFE_RAW, &context(&plan, &features))
             .unwrap()
             .plan_hash(),
         valid.plan_hash()
+    );
+
+    let mut wrong = plan.clone();
+    wrong.plan_id = format!("op1-{}", "0".repeat(64));
+    let wrong_bytes = transition_operator::canonical_json(&wrong).unwrap();
+    assert_eq!(
+        PlanValidator::validate_bytes(&wrong_bytes, &context(&wrong, &features))
+            .unwrap_err()
+            .code(),
+        "PLAN_ID_MISMATCH"
+    );
+}
+
+#[test]
+fn oversized_input_is_rejected_before_json_or_identity_work() {
+    let plan = fixture();
+    let features = Features(plan.feature_snapshot.sha256.clone());
+    assert_eq!(
+        PlanValidator::validate_bytes(&vec![b' '; 65_537], &context(&plan, &features))
+            .unwrap_err()
+            .code(),
+        "PLAN_TOO_LARGE"
     );
 }
 
@@ -118,8 +159,16 @@ fn capabilities_are_derived_and_sorted_from_plan_contents() {
         &[
             "format:pcm_f64_stereo_44100_v1",
             "interpolation:linear",
+            "limit:max_abs_rate_delta_ppm:0",
+            "limit:max_bands:0",
+            "limit:max_envelope_points:2",
+            "limit:max_state_span_frames:221",
+            "limit:max_taps:0",
+            "limiter:lookahead_peak_limiter_v1",
+            "lookahead_frames:221",
             "operation:gain_envelope",
             "output_safety:transition_output_safety_v1",
+            "plan:transition-operator-plan/1",
             "source:pcm_s16le_stereo_44100_v1",
             "true_peak:bs1770_4x_v1",
         ]
@@ -127,12 +176,12 @@ fn capabilities_are_derived_and_sorted_from_plan_contents() {
     assert_eq!(capabilities.max_envelope_points, 2);
     assert_eq!(capabilities.lookahead_frames, 221);
 
-    let supporting = RendererCapabilities::reference_for_tests(&capabilities);
+    let supported_profile = supporting(&capabilities);
     assert_eq!(
-        compare_capabilities(&capabilities, &supporting),
+        compare_capabilities(&capabilities, &supported_profile),
         SupportResult::Supported
     );
-    let mut missing = supporting;
+    let mut missing = supported_profile;
     missing
         .supported_requirements
         .retain(|value| value != "operation:gain_envelope");
@@ -141,7 +190,7 @@ fn capabilities_are_derived_and_sorted_from_plan_contents() {
         SupportResult::Unsupported
     );
 
-    let mut simplifying = RendererCapabilities::reference_for_tests(&capabilities);
+    let mut simplifying = supporting(&capabilities);
     simplifying
         .supported_requirements
         .retain(|value| value != "operation:gain_envelope");
@@ -156,7 +205,7 @@ fn capabilities_are_derived_and_sorted_from_plan_contents() {
         }
     );
 
-    let mut unsorted = RendererCapabilities::reference_for_tests(&capabilities);
+    let mut unsorted = supporting(&capabilities);
     unsorted.supported_requirements.reverse();
     assert_eq!(
         compare_capabilities(&capabilities, &unsorted),

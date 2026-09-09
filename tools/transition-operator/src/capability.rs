@@ -44,23 +44,6 @@ pub struct CapabilitySimplification {
     pub transform_id: String,
 }
 
-impl RendererCapabilities {
-    pub fn reference_for_tests(requirements: &CapabilityRequirements) -> Self {
-        Self {
-            schema_version: "renderer-capabilities/1".into(),
-            supported_plan_versions: vec![requirements.plan_schema_version.clone()],
-            supported_requirements: requirements.required.clone(),
-            max_envelope_points: requirements.max_envelope_points,
-            max_bands: requirements.max_bands,
-            max_taps: requirements.max_taps,
-            max_state_span_frames: requirements.max_state_span_frames,
-            max_abs_rate_delta_ppm: requirements.max_abs_rate_delta_ppm,
-            max_lookahead_frames: requirements.lookahead_frames,
-            simplifications: Vec::new(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SupportResult {
     Supported,
@@ -71,10 +54,12 @@ pub enum SupportResult {
 pub fn derive_capabilities(plan: &OperatorPlan) -> CapabilityRequirements {
     let mut required = BTreeSet::from([
         "format:pcm_f64_stereo_44100_v1".to_string(),
+        "limiter:lookahead_peak_limiter_v1".to_string(),
         "output_safety:transition_output_safety_v1".to_string(),
         "source:pcm_s16le_stereo_44100_v1".to_string(),
         "true_peak:bs1770_4x_v1".to_string(),
     ]);
+    required.insert(format!("plan:{}", plan.schema_version));
     let mut max_envelope_points = 0usize;
     let mut max_bands = 0usize;
     let mut max_taps = 0usize;
@@ -146,6 +131,19 @@ pub fn derive_capabilities(plan: &OperatorPlan) -> CapabilityRequirements {
             ),
         }
     }
+    required.insert(format!(
+        "limit:max_abs_rate_delta_ppm:{max_abs_rate_delta_ppm}"
+    ));
+    required.insert(format!("limit:max_bands:{max_bands}"));
+    required.insert(format!("limit:max_envelope_points:{max_envelope_points}"));
+    required.insert(format!(
+        "limit:max_state_span_frames:{max_state_span_frames}"
+    ));
+    required.insert(format!("limit:max_taps:{max_taps}"));
+    required.insert(format!(
+        "lookahead_frames:{}",
+        plan.output_safety.lookahead_frames
+    ));
     CapabilityRequirements {
         schema_version: "capability-derivation/1".into(),
         plan_schema_version: plan.schema_version.clone(),

@@ -56,10 +56,6 @@
       "type": "object", "additionalProperties": false, "required": ["frame", "cutoff_millihz"],
       "properties": { "frame": { "type": "integer" }, "cutoff_millihz": { "type": "integer" } }
     },
-    "baseOperation": {
-      "type": "object", "required": ["kind", "op_id", "target"],
-      "properties": { "kind": { "type": "string" }, "op_id": { "type": "string" }, "target": { "$ref": "#/$defs/target" } }
-    },
     "operation": {
       "oneOf": [
         {
