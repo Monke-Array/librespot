@@ -1,7 +1,7 @@
 # Current objective
 
 Execute the approved offline transition-operator plan sequentially through M3.
-M1 is complete; M2 deterministic candidate generation is the current gate.
+M1 and M2 are complete; M3 offline reference rendering is the current gate.
 Live playback remains unchanged.
 
 # Branch / commits
@@ -20,6 +20,10 @@ Live playback remains unchanged.
 - M1 implementation commits through identity support: `9cd5e81` (standalone
   tool), `73f1f6f` (canonical integer JSON), `65f1e55` (closed v1 model),
   `9cad5ce` (validators), and `2aeba66` (identities/capabilities).
+- M1 golden/fixture gate: `6a78080`. M2 geometry and template commits:
+  `71b9bcd` (semantic geometry), `8f35b2c` (sealed registry), and `1b2ff8f`
+  (rich template emitters). Candidate-set assembly and the M2 gate are
+  `d8416f7`.
 - Networking implementation: `cbc3d21` (`fix(connect): retire dealer on session
   replacement`), based on runtime-validated `948a5d8`.
 - ML research remains isolated on S-01 branch `codex/pilot-v1`:
@@ -119,6 +123,25 @@ Live playback remains unchanged.
 - M1 contains no renderer, generator, critic, audio, private manifest, RPI code,
   or playback-state change.
 
+# M2 deterministic candidate generation
+
+- Semantic cue/window/geometry identities, canonical geometry shortlisting,
+  exact fallback geometry, sealed predicates/need ordering, fixed recipes, and
+  one-geometry-per-recipe binding are implemented.
+- All nine approved families are represented. Rich generation retains at most
+  six applicable families; fixed quotas total 51 and the six-family mathematical
+  maximum is 43 candidates including fallback. Defense-in-depth attempt/accept
+  hard caps and deterministic 48-candidate family-round soft pruning are present.
+- Drafts are validated before the shared pair margin is selected. One analytic
+  non-boosting gain is then injected byte-identically into fallback and all rich
+  plans before canonical hashes; semantic audio duplicates are rejected.
+- Pair-wide beat grids are sorted/deduplicated and each rhythmic recipe selects
+  its exact geometry window, so collection order and unrelated earlier beats do
+  not rename or suppress an equivalent candidate.
+- The representative all-feature fixture produces 37 candidates spanning six
+  rich musical families plus `safe_crossfade/v1`. Frozen candidate-set hash:
+  `afd1ea6b570cf67c4021496a942361e381231be445c908cfccc8573c127f8ee6`.
+
 # Audio/runtime state
 
 - spotifyd requests Ogg/Vorbis 320; this librespot path does not expose Spotify
@@ -144,7 +167,11 @@ Live playback remains unchanged.
   `f95ec69c0b5944a45964fabe29dcc3d766e8c29ba25224f35f9269bff11f8594`,
   candidate
   `cand1-1d40381d56d6a176560ebb6780221b30a4c760945dd52cfb1d18438de54a41f3`.
-- Pre-M1 repository baseline remained green: playback 83/83 and connect 113/113.
+- 2026-09-09 M2 gate: standalone suite passed 75 tests (including 13 generator,
+  14 template, 26 validation, and the soft-cap unit test); independent Node
+  canonical/hash golden passed 1/1. `cargo check --workspace` passed; playback
+  passed 83/83; connect passed 113 unit + 5 integration + 1 doctest.
+- `cargo fmt --check` for the standalone crate and `git diff --check` passed.
 
 - 2026-09-08 private inventory: 66/66 MP3s probed and decoded successfully;
   66 unique canonical decoded-PCM hashes; no duplicates or short/unsuitable
@@ -199,5 +226,5 @@ Live playback remains unchanged.
 
 # NEXT ACTION
 
-Implement M2 deterministic candidate generation, then run its hard automated
-gate before beginning the offline renderer.
+Implement M3 Task 14 canonical PCM and offline render boundary using RED ->
+GREEN tests, then continue through DSP/QC only after each planned task gate.
