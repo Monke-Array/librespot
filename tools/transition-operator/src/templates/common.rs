@@ -80,6 +80,7 @@ pub struct TemplateInputs {
     pub transient_collision_span_frames: Option<i64>,
     pub two_beats_frames: Option<i64>,
     pub outgoing_transient_activity_ppm: Option<i64>,
+    pub incoming_transient_activity_ppm: Option<i64>,
     pub outgoing_transient_density_ppm: Option<i64>,
     pub outgoing_bass_occupancy_ppm: Option<i64>,
     pub incoming_bass_occupancy_ppm: Option<i64>,
@@ -92,6 +93,10 @@ pub struct TemplateInputs {
     pub energy_delta_mdb: Option<i64>,
     pub outgoing_hard_cut_safe: Option<bool>,
     pub incoming_hard_cut_safe: Option<bool>,
+    pub collision_start_frame: Option<i64>,
+    pub collision_end_frame: Option<i64>,
+    pub beat_frames: Vec<i64>,
+    pub meter_beats: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

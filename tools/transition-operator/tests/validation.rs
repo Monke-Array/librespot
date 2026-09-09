@@ -620,6 +620,23 @@ fn canonical_hard_cut_is_the_only_unequal_hold_step() {
 }
 
 #[test]
+fn energy_ramp_signature_forbids_incoming_time_map() {
+    let mut plan = safe_plan();
+    plan.template.id = "energy_ramp".into();
+    plan.template.recipe_id = "gain_5s".into();
+    plan.operations.insert(
+        0,
+        Operation::TimeMap(TimeMap {
+            op_id: "incoming.time_map".into(),
+            target: Target::Incoming,
+            source_rate_ppm: 1_020_000,
+            profile: TimeMapProfile::PitchPreservingBalancedTransientsV1,
+        }),
+    );
+    assert_eq!(validation_code(&plan), "INVALID_TEMPLATE_SIGNATURE");
+}
+
+#[test]
 fn positive_effect_end_requires_a_delay_tail() {
     let mut plan = safe_plan();
     plan.template.id = "shaped_handoff".into();
@@ -705,11 +722,41 @@ fn rhythmic_gate_transition_starts_are_limited_to_eight_per_second() {
     let mut plan = safe_plan();
     plan.template.id = "rhythmic_handoff".into();
     plan.template.recipe_id = "test".into();
+    let mut values = vec![(-50_000, 0)];
+    for index in 0..10 {
+        let start = -49_000 + index * 4_000;
+        let value = if index % 2 == 0 { 1_000_000 } else { 0 };
+        values.push((start, values.last().unwrap().1));
+        values.push((start + 221, value));
+    }
+    values.push((0, 0));
+    let (points, interpolations) = envelope(&values);
+    plan.operations.insert(
+        0,
+        Operation::RhythmicGate(RhythmicGate {
+            op_id: "outgoing.gate".into(),
+            target: Target::Outgoing,
+            points,
+            interpolations,
+        }),
+    );
+    assert_eq!(validation_code(&plan), "INVALID_RHYTHMIC_GATE");
+}
+
+#[test]
+fn rhythmic_gate_allows_eight_events_per_second_with_integer_frame_spacing() {
+    let mut plan = safe_plan();
+    plan.template.id = "rhythmic_handoff".into();
+    plan.template.recipe_id = "test".into();
     let (points, interpolations) = envelope(&[
-        (-12_000, 0),
-        (-11_779, 1_000_000),
-        (-7_000, 1_000_000),
-        (-6_779, 0),
+        (-22_050, 0),
+        (-21_829, 1_000_000),
+        (-16_759, 1_000_000),
+        (-16_538, 0),
+        (-11_025, 0),
+        (-10_804, 1_000_000),
+        (-5_734, 1_000_000),
+        (-5_513, 0),
         (0, 0),
     ]);
     plan.operations.insert(
@@ -721,5 +768,5 @@ fn rhythmic_gate_transition_starts_are_limited_to_eight_per_second() {
             interpolations,
         }),
     );
-    assert_eq!(validation_code(&plan), "INVALID_RHYTHMIC_GATE");
+    assert_valid(&plan);
 }

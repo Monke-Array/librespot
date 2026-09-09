@@ -559,12 +559,12 @@ fn validate_gate(value: &RhythmicGate, body: &OperatorPlanBody) -> Result<usize>
         .map(|pair| pair[0].frame)
         .collect();
     if transition_starts
-        .windows(2)
-        .any(|pair| (pair[1] - pair[0]) * 8 < 44_100)
+        .windows(9)
+        .any(|events| events[8] - events[0] < 44_100)
     {
         return Err(Error::new(
             "INVALID_RHYTHMIC_GATE",
-            "gate transitions may occur no faster than eight per second",
+            "gate has more than eight transitions in one second",
         ));
     }
     if value.points.last().unwrap().frame - value.points.first().unwrap().frame > 529_200 {

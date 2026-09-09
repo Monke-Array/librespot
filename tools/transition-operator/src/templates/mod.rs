@@ -1,8 +1,16 @@
 mod common;
+mod dynamics;
+mod gain;
 mod safe;
+mod spectral;
+mod tail;
 
 pub use common::*;
+pub use dynamics::emit_dynamics_template;
+pub use gain::emit_gain_template;
 pub use safe::emit_safe_fallback;
+pub use spectral::emit_spectral_template;
+pub use tail::emit_echo_tail_template;
 
 const SAFE: [RecipeSpec; 1] = [RecipeSpec {
     id: "five_second_linear",

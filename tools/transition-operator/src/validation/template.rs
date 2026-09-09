@@ -41,7 +41,7 @@ pub(super) fn validate_signature(body: &OperatorPlanBody) -> Result<()> {
             gains == 2 && time <= 1 && filters + crossovers + ducks + gates == 0 && tails == 1
         }
         "energy_ramp" => {
-            gains == 2 && time <= 1 && crossovers + ducks + tails + gates == 0 && filters <= 1
+            gains == 2 && time == 0 && crossovers + ducks + tails + gates == 0 && filters <= 1
         }
         "rhythmic_handoff" => {
             gains == 2 && time <= 1 && filters + crossovers + ducks + tails == 0 && gates == 1
