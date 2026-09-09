@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "transition-render-request/1",
+  "title": "Transition RenderRequest/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "plan_sha256", "candidate_id", "output_start_frame",
+    "output_end_frame", "source_locator_manifest_sha256",
+    "renderer_capability_profile_sha256", "artifact_format",
+    "processing_warm_up_frames"
+  ],
+  "properties": {
+    "schema_version": { "const": "transition-render-request/1" },
+    "plan_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "candidate_id": { "type": "string", "pattern": "^cand1-[0-9a-f]{64}$" },
+    "output_start_frame": { "type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991 },
+    "output_end_frame": { "type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991 },
+    "source_locator_manifest_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "renderer_capability_profile_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "artifact_format": { "const": "flac_pcm24_stereo_44100_v1" },
+    "processing_warm_up_frames": { "const": 4096 }
+  }
+}
