@@ -1,0 +1,198 @@
+{
+  "schema_version": "transition-feature-audit/1",
+  "pilot_repository": "spotify-transition-ml-pilot-v1",
+  "implementation_revision": "227c7d04c9831a6531d8ac5b552bf0559dc9ffff",
+  "freeze_revision": "2afa90d3c864eca3dbf42bde4c59c688981db5f8",
+  "extractor_version": "pilot-analysis/v1",
+  "reference_environment": {
+    "python": "3.8.20",
+    "numpy": "1.22.4",
+    "librosa": "0.8.0",
+    "pyloudnorm": "0.1.0",
+    "soundfile": "0.10.3"
+  },
+  "categories": [
+    {
+      "category": "source_identity_duration",
+      "pilot_v1_fields": ["track_id", "duration_ms", "source_sha256"],
+      "v2_fields": ["source_pcm_sha256", "source_frames", "analysis_id"],
+      "old_units": "opaque track string, rounded milliseconds, and encoded-file SHA-256 cache key",
+      "new_units": "canonical stereo 44.1 kHz s16le PCM SHA-256, exact interleaved-frame count, semantic analysis ID",
+      "old_definition": "duration_ms is round(mono sample count / analysis sample rate * 1000); source_sha256 is copied into the private cache wrapper and is not part of analyze_track_audio output",
+      "new_definition": "identity and duration are derived from the exact canonical PCM consumed by OperatorPlan/v1; analysis identity covers algorithms, parameters, and versions",
+      "source_window_semantics": "Pilot V1 duration describes the full 22.05 kHz mono analysis signal; v2 source_frames describes the full canonical stereo 44.1 kHz source",
+      "missing_value_semantics": "Pilot track_id and duration are always emitted; cache source_sha256 is required for reuse. All v2 identity fields are required and absence is invalid",
+      "normalization_semantics": "No numeric model normalization applies; the old millisecond duration is rounded and cannot recover exact canonical frames",
+      "disposition": "recompute_v2",
+      "extractor_provenance": {
+        "repository": "spotify-transition-ml-pilot-v1",
+        "revision": "227c7d04c9831a6531d8ac5b552bf0559dc9ffff",
+        "path": "transition_ml/pilot.py; tools/build_pilot_v1.py",
+        "symbols": ["analyze_track_audio", "_load_stereo", "_analyze_sources"]
+      },
+      "evidence": ["transition_ml/pilot.py:20-30,72-75", "tools/build_pilot_v1.py:54-67,70-98"]
+    },
+    {
+      "category": "cue",
+      "pilot_v1_fields": ["cue.position_ms", "cue.position_fraction", "cue.distance_to_beat", "cue.distance_to_downbeat", "cue.distance_to_phrase", "cue.section", "cue.confidence", "cue.bars_available_before", "cue.bars_available_after"],
+      "v2_fields": ["cue_id", "source_frame", "kind", "confidence_ppm"],
+      "old_units": "rounded milliseconds, unit fractions, fixed string labels, and floating confidence",
+      "new_units": "exact canonical source frames, closed cue kind, and integer ppm confidence",
+      "old_definition": "_cue labels caller-selected points, hardcodes all three distance fields to 0.0 and confidence to 0.7; rich points come from downbeat_options or its synthetic regular-grid fallback",
+      "new_definition": "a cue is a semantic, content-derived source-frame proposal whose ID hashes canonical source and analysis identities, kind, and exact position",
+      "source_window_semantics": "Pilot V1 has no measured cue-analysis window; v2 cue evidence must identify the analysis and any referenced feature windows",
+      "missing_value_semantics": "Pilot candidate cue fields are required after construction but can be fabricated by fallback logic; v2 missing cues remain absent and cannot satisfy reliable-cue predicates",
+      "normalization_semantics": "Pilot vectorization scales position and bar availability for the critic only; no Pilot cue value is normalized into v2",
+      "disposition": "recompute_v2",
+      "extractor_provenance": {
+        "repository": "spotify-transition-ml-pilot-v1",
+        "revision": "227c7d04c9831a6531d8ac5b552bf0559dc9ffff",
+        "path": "transition_ml/pilot.py",
+        "symbols": ["_cue", "build_pilot_candidate_set.downbeat_options"]
+      },
+      "evidence": ["transition_ml/pilot.py:112-124,148-214", "features/candidate.schema.json cue definition"]
+    },
+    {
+      "category": "beat_downbeat_meter_tempo",
+      "pilot_v1_fields": ["bpm", "bpm_confidence", "downbeat_times_ms"],
+      "v2_fields": ["beat_frames", "downbeat_frames", "meter_beats", "tempo_millibpm", "beat_confidence_ppm", "downbeat_confidence_ppm"],
+      "old_units": "floating BPM, heuristic fraction, rounded milliseconds; meter is an implicit constant four",
+      "new_units": "exact canonical source frames, integer beats per bar, integer millibpm, integer ppm confidences",
+      "old_definition": "librosa onset strength feeds beat_track; confidence is detected beat count divided by duration/2 and capped at one; downbeats are beat_times[::4]. Invalid tempo and short downbeat sequences are replaced with 120 BPM or regular synthetic grids",
+      "new_definition": "validated beat and downbeat observations retain exact frame positions and independent confidence; no synthetic grid may masquerade as detected evidence",
+      "source_window_semantics": "Pilot V1 analyzes the whole mono 22.05 kHz source. V2 grids describe exact canonical source positions and any proposal references must remain in source bounds",
+      "missing_value_semantics": "Pilot V1 forces finite tempo and a downbeat-like grid; v2 absent or insufficient observations remain absent or low confidence and suppress rhythm predicates",
+      "normalization_semantics": "Pilot critic vectors divide BPM by 200 and use floating values; v2 stores unnormalized integer millibpm and ppm",
+      "disposition": "recompute_v2",
+      "extractor_provenance": {
+        "repository": "spotify-transition-ml-pilot-v1",
+        "revision": "227c7d04c9831a6531d8ac5b552bf0559dc9ffff",
+        "path": "transition_ml/pilot.py",
+        "symbols": ["analyze_track_audio", "build_pilot_candidate_set.downbeat_options"]
+      },
+      "evidence": ["transition_ml/pilot.py:30-43,74-76,89,196-214", "transition_ml/features.py and features/vector-v1.json tempo normalizers"]
+    },
+    {
+      "category": "vocal",
+      "pilot_v1_fields": ["vocal_probability", "provenance.missing_features[vocal_probability]"],
+      "v2_fields": ["vocal_activity_ppm", "vocal_collision_ppm", "vocal_collision_span_frames", "outgoing_vocal_sustained"],
+      "old_units": "optional floating probability in 0..1",
+      "new_units": "integer ppm activity/collision, exact frame span, and boolean sustained classification",
+      "old_definition": "the candidate schema permits vocal_probability but pilot-analysis/v1 never computes it and generated candidates explicitly list it as missing",
+      "new_definition": "window-local vocal activity and pair collision evidence must come from a separately versioned approved extractor/import",
+      "source_window_semantics": "No Pilot V1 vocal window exists; v2 vocal values must reference exact source-frame windows",
+      "missing_value_semantics": "Pilot V1 uses null/absence plus a missing_features marker; v2 omits unavailable fields and dependent predicates fail closed",
+      "normalization_semantics": "Pilot vectorization zero-fills absent probability only with an explicit presence bit; this is critic input behavior, not a measured zero and is not imported",
+      "disposition": "omit_v2",
+      "extractor_provenance": {
+        "repository": "spotify-transition-ml-pilot-v1",
+        "revision": "227c7d04c9831a6531d8ac5b552bf0559dc9ffff",
+        "path": "features/candidate.schema.json; transition_ml/pilot.py; transition_ml/features.py",
+        "symbols": ["track vocal_probability schema", "build_pilot_candidate_set", "vectorize_candidate"]
+      },
+      "evidence": ["transition_ml/pilot.py:187-193", "features/candidate.schema.json vocal_probability", "transition_ml/features.py missing presence handling"]
+    },
+    {
+      "category": "transient",
+      "pilot_v1_fields": ["onset_density_hz", "spectral.flux"],
+      "v2_fields": ["transient_activity_ppm", "transient_density_ppm", "transient_collision_ppm", "boundary_click_safe"],
+      "old_units": "events per second and mean positive STFT-magnitude delta",
+      "new_units": "integer ppm activity/density/collision and boolean click-safety, all window-local",
+      "old_definition": "librosa onset_detect count divided by whole-source duration; flux is an unscaled whole-source mean of positive magnitude differences",
+      "new_definition": "versioned deterministic measurements are computed for exact outgoing/incoming overlap windows and pair alignment",
+      "source_window_semantics": "Pilot values cover the whole 22.05 kHz mono source; v2 values reference exact canonical source-frame windows",
+      "missing_value_semantics": "Pilot analyzer always emits finite values; v2 omits any measurement that cannot be computed and required predicates fail closed",
+      "normalization_semantics": "Pilot critic clips/scales onset density and log-scales flux; those vector transforms are not v2 measurement semantics",
+      "disposition": "recompute_v2",
+      "extractor_provenance": {
+        "repository": "spotify-transition-ml-pilot-v1",
+        "revision": "227c7d04c9831a6531d8ac5b552bf0559dc9ffff",
+        "path": "transition_ml/pilot.py; features/vector-v1.json",
+        "symbols": ["analyze_track_audio", "vector feature definitions"]
+      },
+      "evidence": ["transition_ml/pilot.py:31-34,64-70,80,87", "features/vector-v1.json onset_density and spectral_flux formulas"]
+    },
+    {
+      "category": "bass",
+      "pilot_v1_fields": ["spectral.low_occupancy"],
+      "v2_fields": ["bass_occupancy_ppm", "bass_collision_ppm"],
+      "old_units": "whole-source fractional STFT power below 250 Hz",
+      "new_units": "integer ppm window-local bass occupancy and pair collision",
+      "old_definition": "sum of squared mono STFT magnitudes below 250 Hz divided by total energy in the three Pilot bands",
+      "new_definition": "versioned measurements over exact transition windows, including aligned pair collision",
+      "source_window_semantics": "Pilot value covers the entire mono source; v2 values reference exact outgoing/incoming windows",
+      "missing_value_semantics": "Pilot analyzer always emits a fraction, including zero for silence via tiny denominator; v2 unavailable values are absent, not zero",
+      "normalization_semantics": "Pilot occupancy is already a 0..1 ratio and critic vectorization passes it through; v2 rounds its own measurement to ppm",
+      "disposition": "recompute_v2",
+      "extractor_provenance": {
+        "repository": "spotify-transition-ml-pilot-v1",
+        "revision": "227c7d04c9831a6531d8ac5b552bf0559dc9ffff",
+        "path": "transition_ml/pilot.py",
+        "symbols": ["analyze_track_audio"]
+      },
+      "evidence": ["transition_ml/pilot.py:45-56,81-84", "features/vector-v1.json low_occupancy formula"]
+    },
+    {
+      "category": "spectral",
+      "pilot_v1_fields": ["spectral.low_occupancy", "spectral.mid_occupancy", "spectral.high_occupancy", "spectral.centroid_hz", "spectral.rolloff_hz", "spectral.flux"],
+      "v2_fields": ["low_occupancy_ppm", "mid_occupancy_ppm", "high_occupancy_ppm", "spectral_stability_ppm", "spectral_overlap_ppm"],
+      "old_units": "whole-source fractions, Hz means, and mean positive STFT-magnitude delta",
+      "new_units": "integer ppm window-local occupancies, stability, and aligned pair overlap",
+      "old_definition": "2048-point, 1024-hop mono STFT; bands are below 250 Hz, 250-4000 Hz, and 4000 Hz or above; centroid, rolloff, and flux are whole-source means",
+      "new_definition": "algorithm-versioned band distributions and stability are measured per exact window; overlap compares aligned outgoing/incoming distributions",
+      "source_window_semantics": "Pilot features summarize the full source; v2 features are tied to exact source-frame window IDs",
+      "missing_value_semantics": "Pilot analyzer emits finite fields even for silence; v2 omits unmeasurable values and predicates fail closed",
+      "normalization_semantics": "Pilot critic scales Hz and log-scales flux; v2 uses raw integer ppm ratios from its declared algorithm",
+      "disposition": "recompute_v2",
+      "extractor_provenance": {
+        "repository": "spotify-transition-ml-pilot-v1",
+        "revision": "227c7d04c9831a6531d8ac5b552bf0559dc9ffff",
+        "path": "transition_ml/pilot.py; features/vector-v1.json",
+        "symbols": ["analyze_track_audio", "vector feature definitions"]
+      },
+      "evidence": ["transition_ml/pilot.py:45-56,67-70,81-87", "features/vector-v1.json spectral formulas"]
+    },
+    {
+      "category": "energy",
+      "pilot_v1_fields": ["integrated_lufs", "energy"],
+      "v2_fields": ["short_term_loudness_mlu", "energy_variability_mdb", "energy_delta_mdb"],
+      "old_units": "whole-source floating LUFS and RMS amplitude clipped to 0..1",
+      "new_units": "signed integer milliloudness/millidecibels over exact windows and pair delta",
+      "old_definition": "pyloudnorm integrated loudness of full mono signal with RMS-dB fallback; energy is full-source RMS capped at one",
+      "new_definition": "declared short-time window loudness/energy series yields exact-window central level, variability, and incoming-minus-outgoing delta",
+      "source_window_semantics": "Pilot values cover the whole 22.05 kHz mono source; v2 values reference transition windows on canonical PCM",
+      "missing_value_semantics": "Pilot forces finite loudness through RMS fallback; v2 omits unavailable window measures instead of substituting a semantically different measure",
+      "normalization_semantics": "Pilot critic offsets/divides LUFS and passes capped RMS; v2 stores unnormalized signed integer units",
+      "disposition": "recompute_v2",
+      "extractor_provenance": {
+        "repository": "spotify-transition-ml-pilot-v1",
+        "revision": "227c7d04c9831a6531d8ac5b552bf0559dc9ffff",
+        "path": "transition_ml/pilot.py; features/vector-v1.json",
+        "symbols": ["_finite_db", "analyze_track_audio", "vector feature definitions"]
+      },
+      "evidence": ["transition_ml/pilot.py:15-17,57-62,77-80", "features/vector-v1.json integrated_lufs and energy formulas"]
+    },
+    {
+      "category": "whole_source_peaks",
+      "pilot_v1_fields": ["true_peak_dbfs"],
+      "v2_fields": ["sample_peak_mdbfs", "true_peak_mdbtp", "true_peak_profile"],
+      "old_units": "floating decibels relative to full scale",
+      "new_units": "signed integer millidecibels relative to full scale/sample peak and mdb true peak with closed profile",
+      "old_definition": "despite its name, true_peak_dbfs is 20*log10(max(abs(mono samples))) with a -120 dB floor; it performs no intersample oversampling",
+      "new_definition": "sample peak is measured on canonical stereo PCM and true peak uses the exact M3 bs1770_4x_v1 profile",
+      "source_window_semantics": "Both are whole-source measurements, but Pilot uses downmixed 22.05 kHz mono while v2 uses exact canonical stereo 44.1 kHz PCM",
+      "missing_value_semantics": "Pilot analyzer always emits a floored value; both v2 peaks are required for a complete locally extracted source snapshot",
+      "normalization_semantics": "Pilot critic offsets and divides the mislabeled value; v2 stores measured integer mdb without critic normalization",
+      "disposition": "recompute_v2",
+      "extractor_provenance": {
+        "repository": "spotify-transition-ml-pilot-v1",
+        "revision": "227c7d04c9831a6531d8ac5b552bf0559dc9ffff",
+        "path": "transition_ml/pilot.py",
+        "symbols": ["_finite_db", "analyze_track_audio"]
+      },
+      "evidence": ["transition_ml/pilot.py:15-17,57-58,78", "tools/build_pilot_v1.py:54-67,85-88"]
+    }
+  ],
+  "freeze_evidence": "git diff 227c7d04c9831a6531d8ac5b552bf0559dc9ffff..2afa90d3c864eca3dbf42bde4c59c688981db5f8 changes only docs/CODEX_STATE.md and the ratings template; audited extractor, schemas, and tests retain identical Git blob IDs",
+  "contradiction_gate": "pass: incompatible Pilot V1 meanings are classified recompute_v2 or omit_v2; transition-feature-snapshot/2 can represent the required evidence without changing units or template predicates"
+}
