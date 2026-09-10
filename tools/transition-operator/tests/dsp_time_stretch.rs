@@ -100,6 +100,38 @@ fn time_stretch_program_hash_is_stable_and_parameter_bound() {
 }
 
 #[test]
+fn time_stretch_drains_large_bidirectional_pipes_without_deadlock() {
+    let rate = 1_020_000;
+    let output_frames = 250_000;
+    let required = (output_frames as u64 * rate as u64).div_ceil(1_000_000) as usize + 8_192;
+    let cue_output_frame = 125_000;
+    let cue_input_frame = ((cue_output_frame as u64 * rate as u64 + 500_000) / 1_000_000) as usize;
+    let input = PcmBuffer::from_frames(
+        (0..required)
+            .map(|frame| {
+                let sample =
+                    0.1 * (2.0 * std::f64::consts::PI * 220.0 * frame as f64 / 44_100.0).sin();
+                [sample, sample]
+            })
+            .collect(),
+    )
+    .unwrap();
+
+    let output = RubberBandTimeStretch::new("ffmpeg")
+        .process(
+            &input,
+            rate,
+            output_frames,
+            TimeStretchCue {
+                input_frame: cue_input_frame,
+                output_frame: cue_output_frame,
+            },
+        )
+        .unwrap();
+    assert_eq!(output.frame_count(), output_frames);
+}
+
+#[test]
 fn unity_rate_is_an_exact_continuous_window_bypass() {
     let input = PcmBuffer::from_frames(
         (0..1_024)

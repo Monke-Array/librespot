@@ -4,7 +4,7 @@ use crate::render::artifact::ArtifactBackend;
 use crate::render::source::CanonicalPcmBackend;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 
 const ARTIFACT_ENCODE_ARGUMENTS: &[&str] = &[
     "-nostdin",
@@ -158,7 +158,7 @@ impl FfmpegBackend {
         output_frames: usize,
     ) -> Result<Vec<u8>> {
         let arguments = Self::rubberband_arguments(rate_ppm, output_frames);
-        let mut child = Command::new(&self.executable)
+        let child = Command::new(&self.executable)
             .args(arguments)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -170,18 +170,13 @@ impl FfmpegBackend {
                     "unable to start time-stretch backend",
                 )
             })?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::new("FFMPEG_STDIN_FAILED", "time-stretch stdin is unavailable"))?
-            .write_all(input)
-            .map_err(|_| Error::new("FFMPEG_STDIN_FAILED", "unable to write time-stretch input"))?;
-        let output = child.wait_with_output().map_err(|_| {
-            Error::new(
-                "FFMPEG_WAIT_FAILED",
-                "unable to wait for time-stretch backend",
-            )
-        })?;
+        let output = write_input_while_collecting_output(
+            child,
+            input,
+            "time-stretch stdin is unavailable",
+            "unable to write time-stretch input",
+            "unable to wait for time-stretch backend",
+        )?;
         if !output.status.success() {
             return Err(Error::new(
                 "TIME_STRETCH_BACKEND_FAILED",
@@ -307,32 +302,20 @@ fn pipe_bytes(
     input: &[u8],
     failure_code: &'static str,
 ) -> Result<Vec<u8>> {
-    let mut child = Command::new(executable)
+    let child = Command::new(executable)
         .args(arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|_| Error::new("FFMPEG_SPAWN_FAILED", "unable to start artifact backend"))?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| {
-            Error::new(
-                "FFMPEG_STDIN_FAILED",
-                "artifact backend stdin is unavailable",
-            )
-        })?
-        .write_all(input)
-        .map_err(|_| {
-            Error::new(
-                "FFMPEG_STDIN_FAILED",
-                "unable to write artifact backend input",
-            )
-        })?;
-    let output = child
-        .wait_with_output()
-        .map_err(|_| Error::new("FFMPEG_WAIT_FAILED", "unable to wait for artifact backend"))?;
+    let output = write_input_while_collecting_output(
+        child,
+        input,
+        "artifact backend stdin is unavailable",
+        "unable to write artifact backend input",
+        "unable to wait for artifact backend",
+    )?;
     if !output.status.success() {
         return Err(Error::new(
             failure_code,
@@ -340,4 +323,29 @@ fn pipe_bytes(
         ));
     }
     Ok(output.stdout)
+}
+
+fn write_input_while_collecting_output(
+    mut child: Child,
+    input: &[u8],
+    missing_stdin_message: &'static str,
+    write_message: &'static str,
+    wait_message: &'static str,
+) -> Result<Output> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::new("FFMPEG_STDIN_FAILED", missing_stdin_message))?;
+    std::thread::scope(|scope| {
+        // FFmpeg may produce more than an OS pipe buffer before it consumes all
+        // input. Feed stdin on a scoped thread while wait_with_output drains
+        // stdout/stderr, avoiding a bidirectional-pipe deadlock on real tracks.
+        let writer = scope.spawn(move || stdin.write_all(input));
+        let output = child.wait_with_output();
+        let write_result = writer
+            .join()
+            .map_err(|_| Error::new("FFMPEG_STDIN_FAILED", "artifact input writer panicked"))?;
+        write_result.map_err(|_| Error::new("FFMPEG_STDIN_FAILED", write_message))?;
+        output.map_err(|_| Error::new("FFMPEG_WAIT_FAILED", wait_message))
+    })
 }
