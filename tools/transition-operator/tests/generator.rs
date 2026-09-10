@@ -61,9 +61,17 @@ fn rich_inputs() -> TemplateInputs {
         incoming_vocal_activity_ppm: Some(100_000),
         outgoing_vocal_sustained: Some(false),
         vocal_collision_ppm: Some(500_000),
-        vocal_collision_span_frames: Some(20_000),
+        vocal_collision_span_frames: Some(30_000),
+        vocal_collision_start_frame: Some(-50_000),
+        vocal_collision_end_frame: Some(-20_000),
+        outgoing_vocal_collision_strength_ppm: Some(700_000),
+        incoming_vocal_collision_strength_ppm: Some(600_000),
         transient_collision_ppm: Some(100_000),
         transient_collision_span_frames: Some(20_000),
+        transient_collision_start_frame: Some(-48_000),
+        transient_collision_end_frame: Some(-28_000),
+        outgoing_transient_collision_strength_ppm: Some(700_000),
+        incoming_transient_collision_strength_ppm: Some(600_000),
         two_beats_frames: Some(44_100),
         outgoing_transient_activity_ppm: Some(700_000),
         incoming_transient_activity_ppm: Some(600_000),
@@ -79,8 +87,6 @@ fn rich_inputs() -> TemplateInputs {
         energy_delta_mdb: Some(4_000),
         outgoing_hard_cut_safe: Some(true),
         incoming_hard_cut_safe: Some(true),
-        collision_start_frame: Some(-50_000),
-        collision_end_frame: Some(-20_000),
         beat_frames: vec![
             -176_400, -154_350, -132_300, -110_250, -88_200, -66_150, -44_100, -22_050, 0,
         ],
@@ -94,7 +100,7 @@ fn request() -> GenerationRequest {
         outgoing: source("outgoing-track", 'a'),
         incoming: source("incoming-track", 'b'),
         feature_snapshot: FeatureSnapshotRef {
-            schema_version: "transition-feature-snapshot/2".into(),
+            schema_version: "transition-feature-snapshot/3".into(),
             sha256: hash('c'),
         },
         fallback_geometry: fallback.clone(),
@@ -314,7 +320,7 @@ fn candidate_set_hash_is_a_frozen_semantic_vector() {
     assert_eq!(result.candidate_set.candidates.len(), 37);
     assert_eq!(
         result.candidate_set.set_hash.as_str(),
-        "afd1ea6b570cf67c4021496a942361e381231be445c908cfccc8573c127f8ee6"
+        "183b2581ad882f3a5bca7229b0f54ecd915a865b844689bb6b354a3102c812cd"
     );
 }
 

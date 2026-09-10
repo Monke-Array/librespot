@@ -6,11 +6,14 @@ use std::collections::HashSet;
 
 pub(super) fn validate_schema_and_scalars(body: &OperatorPlanBody) -> Result<()> {
     if body.schema_version != "transition-operator-plan/1"
-        || body.feature_snapshot.schema_version != "transition-feature-snapshot/2"
+        || !matches!(
+            body.feature_snapshot.schema_version.as_str(),
+            "transition-feature-snapshot/2" | "transition-feature-snapshot/3"
+        )
     {
         return Err(Error::new(
             "UNSUPPORTED_SCHEMA_VERSION",
-            "exact v1 plan and feature reference versions are required",
+            "v1 plans require a supported feature snapshot reference",
         ));
     }
     if body.format.sample_rate_hz != 44_100

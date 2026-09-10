@@ -577,7 +577,7 @@ fn validate_request(request: &GenerationRequest) -> Result<()> {
             "v1 generator seed must be zero",
         ));
     }
-    if request.feature_snapshot.schema_version != "transition-feature-snapshot/2"
+    if request.feature_snapshot.schema_version != "transition-feature-snapshot/3"
         || !is_hash(&request.feature_snapshot.sha256)
         || !is_hash(&request.config.generator_config_sha256)
         || !printable_ascii(&request.config.generator_id)

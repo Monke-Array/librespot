@@ -51,8 +51,16 @@ fn applicable_inputs() -> TemplateInputs {
         outgoing_vocal_sustained: Some(false),
         vocal_collision_ppm: Some(500_000),
         vocal_collision_span_frames: Some(20_000),
+        vocal_collision_start_frame: Some(-50_000),
+        vocal_collision_end_frame: Some(-20_000),
+        outgoing_vocal_collision_strength_ppm: Some(800_000),
+        incoming_vocal_collision_strength_ppm: Some(600_000),
         transient_collision_ppm: Some(100_000),
         transient_collision_span_frames: Some(20_000),
+        transient_collision_start_frame: Some(-48_000),
+        transient_collision_end_frame: Some(-28_000),
+        outgoing_transient_collision_strength_ppm: Some(700_000),
+        incoming_transient_collision_strength_ppm: Some(500_000),
         two_beats_frames: Some(44_100),
         outgoing_transient_activity_ppm: Some(700_000),
         outgoing_transient_density_ppm: Some(200_000),
@@ -68,8 +76,6 @@ fn applicable_inputs() -> TemplateInputs {
         outgoing_hard_cut_safe: Some(true),
         incoming_hard_cut_safe: Some(true),
         incoming_transient_activity_ppm: Some(600_000),
-        collision_start_frame: Some(-50_000),
-        collision_end_frame: Some(-20_000),
         beat_frames: vec![-88_200, -66_150, -44_100, -22_050, 0],
         meter_beats: Some(4),
     }
@@ -135,6 +141,23 @@ fn applicability_uses_exact_thresholds_and_missing_required_values_are_false() {
         rich_template_families(&boundary)
             .iter()
             .all(|family| family.applicable)
+    );
+}
+
+#[test]
+fn duck_requires_both_collision_modalities_to_be_known() {
+    let mut inputs = applicable_inputs();
+    inputs.vocal_collision_ppm = None;
+    inputs.vocal_collision_span_frames = None;
+    inputs.vocal_collision_start_frame = None;
+    inputs.vocal_collision_end_frame = None;
+    inputs.outgoing_vocal_collision_strength_ppm = None;
+    inputs.incoming_vocal_collision_strength_ppm = None;
+    inputs.transient_collision_ppm = Some(500_000);
+    assert!(
+        !family(TemplateId::DuckedOverlap)
+            .applicability(&inputs)
+            .applicable
     );
 }
 
@@ -403,8 +426,10 @@ fn spectral_templates_emit_complementary_bass_and_staggered_three_band_ownership
 #[test]
 fn duck_is_resolved_to_the_louder_source_with_exact_attack_hold_and_release() {
     let mut inputs = applicable_inputs();
-    inputs.outgoing_vocal_activity_ppm = Some(500_000);
-    inputs.incoming_vocal_activity_ppm = Some(500_000);
+    inputs.outgoing_vocal_activity_ppm = Some(100_000);
+    inputs.incoming_vocal_activity_ppm = Some(900_000);
+    inputs.outgoing_vocal_collision_strength_ppm = Some(800_000);
+    inputs.incoming_vocal_collision_strength_ppm = Some(600_000);
     let three = geometry(DurationMode::Seconds, 132_300, 0, 900_000, "duck-three");
     let draft = emit_dynamics_template(
         TemplateId::DuckedOverlap,

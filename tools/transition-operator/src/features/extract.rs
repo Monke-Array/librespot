@@ -3,7 +3,7 @@ use crate::dsp::{
 };
 use crate::error::{Error, Result};
 use crate::features::{
-    AnalysisIdentity, CueFeature, CueKind, FeatureSnapshotBodyV2, FeatureSnapshotV2, FeatureWindow,
+    AnalysisIdentity, CueFeature, CueKind, FeatureSnapshotBodyV3, FeatureSnapshotV3, FeatureWindow,
     PairFeatures, RhythmFeatures, SourceFeatures, WindowKind, finalize_feature_snapshot,
 };
 use crate::geometry::{DurationMode, GeometryProposal, GeometryProposalCore};
@@ -148,7 +148,7 @@ pub fn extract_signal_features(source: &CanonicalSource) -> Result<SignalFeature
 pub fn build_feature_snapshot(
     outgoing: &SignalFeatures,
     incoming: &SignalFeatures,
-) -> Result<FeatureSnapshotV2> {
+) -> Result<FeatureSnapshotV3> {
     if outgoing.analysis != incoming.analysis {
         return Err(Error::new(
             "ANALYSIS_IDENTITY_MISMATCH",
@@ -223,8 +223,8 @@ pub fn build_feature_snapshot(
         incoming_rate.unwrap_or(1_000_000),
     )?;
     let alignment_error_ppm_of_beat = incoming_rate.map(|_| 0);
-    let body = FeatureSnapshotBodyV2 {
-        schema_version: "transition-feature-snapshot/2".to_owned(),
+    let body = FeatureSnapshotBodyV3 {
+        schema_version: "transition-feature-snapshot/3".to_owned(),
         analysis: outgoing.analysis.clone(),
         pair: PairFeatures {
             outgoing_cue_id: outgoing_source.cues[0].cue_id.clone(),
@@ -233,8 +233,16 @@ pub fn build_feature_snapshot(
             incoming_window_id: incoming_source.windows[0].window_id.clone(),
             vocal_collision_ppm: None,
             vocal_collision_span_frames: None,
+            vocal_collision_start_frame: None,
+            vocal_collision_end_frame: None,
+            outgoing_vocal_collision_strength_ppm: None,
+            incoming_vocal_collision_strength_ppm: None,
             transient_collision_ppm: Some(transient_collision.value_ppm),
             transient_collision_span_frames: transient_collision.span_frames,
+            transient_collision_start_frame: transient_collision.start_frame,
+            transient_collision_end_frame: transient_collision.end_frame,
+            outgoing_transient_collision_strength_ppm: transient_collision.outgoing_strength_ppm,
+            incoming_transient_collision_strength_ppm: transient_collision.incoming_strength_ppm,
             bass_collision_ppm: Some(bass_collision_ppm),
             spectral_overlap_ppm: Some(spectral_overlap_ppm),
             energy_delta_mdb: Some(
@@ -242,8 +250,6 @@ pub fn build_feature_snapshot(
                     - outgoing_measurements.short_term_loudness_mlu,
             ),
             alignment_error_ppm_of_beat,
-            collision_start_frame: transient_collision.start_frame,
-            collision_end_frame: transient_collision.end_frame,
         },
         outgoing: outgoing_source,
         incoming: incoming_source,
@@ -251,7 +257,7 @@ pub fn build_feature_snapshot(
     finalize_feature_snapshot(body)
 }
 
-pub fn propose_geometries(snapshot: &FeatureSnapshotV2) -> Result<GeometrySet> {
+pub fn propose_geometries(snapshot: &FeatureSnapshotV3) -> Result<GeometrySet> {
     crate::features::validate_feature_snapshot(snapshot)?;
     let outgoing_cue = snapshot
         .outgoing
@@ -844,6 +850,8 @@ struct TransientCollision {
     span_frames: Option<i64>,
     start_frame: Option<i64>,
     end_frame: Option<i64>,
+    outgoing_strength_ppm: Option<i64>,
+    incoming_strength_ppm: Option<i64>,
 }
 
 fn aligned_transient_collision(
@@ -899,11 +907,28 @@ fn aligned_transient_collision(
     } else {
         None
     };
+    let local_strength = |values: &[i64], interval: (i64, i64)| -> Result<i64> {
+        let start = usize::try_from((interval.0 - START) / ENVELOPE_HOP as i64)
+            .map_err(|_| Error::new("INTEGER_OVERFLOW", "collision index overflow"))?;
+        let end = usize::try_from((interval.1 - START) / ENVELOPE_HOP as i64)
+            .map_err(|_| Error::new("INTEGER_OVERFLOW", "collision index overflow"))?;
+        let sum = values[start..end].iter().try_fold(0_i64, |sum, value| {
+            sum.checked_add(*value)
+                .ok_or_else(|| Error::new("INTEGER_OVERFLOW", "collision strength overflow"))
+        })?;
+        div_round_nearest_away(sum, i64::try_from(end - start).unwrap())
+    };
     Ok(TransientCollision {
         value_ppm,
         span_frames: best.map(|(start, end)| end - start),
         start_frame: best.map(|value| value.0),
         end_frame: best.map(|value| value.1),
+        outgoing_strength_ppm: best
+            .map(|interval| local_strength(&outgoing_strengths, interval))
+            .transpose()?,
+        incoming_strength_ppm: best
+            .map(|interval| local_strength(&incoming_strengths, interval))
+            .transpose()?,
     })
 }
 
@@ -930,7 +955,7 @@ fn rhythm_rate_ppm(
     (920_000..=1_080_000).contains(&rate).then_some(rate)
 }
 
-fn rhythm_confidences(snapshot: &FeatureSnapshotV2) -> (i64, i64) {
+fn rhythm_confidences(snapshot: &FeatureSnapshotV3) -> (i64, i64) {
     match (&snapshot.outgoing.rhythm, &snapshot.incoming.rhythm) {
         (Some(outgoing), Some(incoming)) => (
             outgoing
@@ -962,7 +987,7 @@ fn median_beat_interval(rhythm: &RhythmFeatures) -> Result<i64> {
 
 #[allow(clippy::too_many_arguments)]
 fn geometry(
-    snapshot: &FeatureSnapshotV2,
+    snapshot: &FeatureSnapshotV3,
     outgoing_cue: &CueFeature,
     incoming_cue: &CueFeature,
     windows: &[String],

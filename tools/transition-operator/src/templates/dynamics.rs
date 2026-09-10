@@ -61,17 +61,21 @@ fn ducked(
             "duck requires exactly one localized collision",
         ));
     }
-    let (reason, outgoing_activity, incoming_activity) = if vocal {
+    let (reason, outgoing_activity, incoming_activity, collision_start, collision_end) = if vocal {
         (
             DuckReason::VocalCollision,
-            inputs.outgoing_vocal_activity_ppm,
-            inputs.incoming_vocal_activity_ppm,
+            inputs.outgoing_vocal_collision_strength_ppm,
+            inputs.incoming_vocal_collision_strength_ppm,
+            inputs.vocal_collision_start_frame,
+            inputs.vocal_collision_end_frame,
         )
     } else {
         (
             DuckReason::TransientCollision,
-            inputs.outgoing_transient_activity_ppm,
-            inputs.incoming_transient_activity_ppm,
+            inputs.outgoing_transient_collision_strength_ppm,
+            inputs.incoming_transient_collision_strength_ppm,
+            inputs.transient_collision_start_frame,
+            inputs.transient_collision_end_frame,
         )
     };
     let outgoing_activity = outgoing_activity
@@ -84,12 +88,10 @@ fn ducked(
         Target::Incoming
     };
     let start = -geometry.requested_dry_frames;
-    let hold_start = inputs
-        .collision_start_frame
+    let hold_start = collision_start
         .ok_or_else(|| Error::new("TEMPLATE_INAPPLICABLE", "collision window is missing"))?
         .max(start);
-    let hold_end = inputs
-        .collision_end_frame
+    let hold_end = collision_end
         .ok_or_else(|| Error::new("TEMPLATE_INAPPLICABLE", "collision window is missing"))?
         .min(0);
     let attack_start = hold_start

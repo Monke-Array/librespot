@@ -117,7 +117,7 @@
     },
     "featureSnapshot": {
       "type": "object", "additionalProperties": false, "required": ["schema_version", "sha256"],
-      "properties": { "schema_version": { "const": "transition-feature-snapshot/2" }, "sha256": { "type": "string" } }
+      "properties": { "schema_version": { "enum": ["transition-feature-snapshot/2", "transition-feature-snapshot/3"] }, "sha256": { "type": "string" } }
     },
     "provenance": {
       "type": "object", "additionalProperties": false,

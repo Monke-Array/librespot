@@ -8,7 +8,7 @@ use crate::validation::TemplateFeatureView;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const FEATURE_SNAPSHOT_SCHEMA_VERSION: &str = "transition-feature-snapshot/2";
+pub const FEATURE_SNAPSHOT_SCHEMA_VERSION: &str = "transition-feature-snapshot/3";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -260,9 +260,25 @@ pub struct PairFeatures {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vocal_collision_span_frames: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub vocal_collision_start_frame: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vocal_collision_end_frame: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outgoing_vocal_collision_strength_ppm: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incoming_vocal_collision_strength_ppm: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub transient_collision_ppm: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transient_collision_span_frames: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transient_collision_start_frame: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transient_collision_end_frame: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outgoing_transient_collision_strength_ppm: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incoming_transient_collision_strength_ppm: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bass_collision_ppm: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -271,15 +287,11 @@ pub struct PairFeatures {
     pub energy_delta_mdb: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alignment_error_ppm_of_beat: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub collision_start_frame: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub collision_end_frame: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FeatureSnapshotBodyV2 {
+pub struct FeatureSnapshotBodyV3 {
     pub schema_version: String,
     pub analysis: AnalysisIdentity,
     pub pair: PairFeatures,
@@ -289,7 +301,7 @@ pub struct FeatureSnapshotBodyV2 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FeatureSnapshotV2 {
+pub struct FeatureSnapshotV3 {
     pub schema_version: String,
     pub snapshot_sha256: String,
     pub analysis: AnalysisIdentity,
@@ -298,9 +310,9 @@ pub struct FeatureSnapshotV2 {
     pub incoming: SourceFeatures,
 }
 
-impl FeatureSnapshotV2 {
-    pub fn body(&self) -> FeatureSnapshotBodyV2 {
-        FeatureSnapshotBodyV2 {
+impl FeatureSnapshotV3 {
+    pub fn body(&self) -> FeatureSnapshotBodyV3 {
+        FeatureSnapshotBodyV3 {
             schema_version: self.schema_version.clone(),
             analysis: self.analysis.clone(),
             pair: self.pair.clone(),
@@ -380,8 +392,20 @@ impl FeatureSnapshotV2 {
                 .map(|value| value > 700_000),
             vocal_collision_ppm: self.pair.vocal_collision_ppm,
             vocal_collision_span_frames: self.pair.vocal_collision_span_frames,
+            vocal_collision_start_frame: self.pair.vocal_collision_start_frame,
+            vocal_collision_end_frame: self.pair.vocal_collision_end_frame,
+            outgoing_vocal_collision_strength_ppm: self.pair.outgoing_vocal_collision_strength_ppm,
+            incoming_vocal_collision_strength_ppm: self.pair.incoming_vocal_collision_strength_ppm,
             transient_collision_ppm: self.pair.transient_collision_ppm,
             transient_collision_span_frames: self.pair.transient_collision_span_frames,
+            transient_collision_start_frame: self.pair.transient_collision_start_frame,
+            transient_collision_end_frame: self.pair.transient_collision_end_frame,
+            outgoing_transient_collision_strength_ppm: self
+                .pair
+                .outgoing_transient_collision_strength_ppm,
+            incoming_transient_collision_strength_ppm: self
+                .pair
+                .incoming_transient_collision_strength_ppm,
             two_beats_frames,
             outgoing_transient_activity_ppm: outgoing_window.transient_activity_ppm,
             incoming_transient_activity_ppm: incoming_window.transient_activity_ppm,
@@ -397,18 +421,16 @@ impl FeatureSnapshotV2 {
             energy_delta_mdb: self.pair.energy_delta_mdb,
             outgoing_hard_cut_safe: outgoing_window.hard_cut_safe,
             incoming_hard_cut_safe: incoming_window.hard_cut_safe,
-            collision_start_frame: self.pair.collision_start_frame,
-            collision_end_frame: self.pair.collision_end_frame,
             beat_frames,
             meter_beats,
         })
     }
 }
 
-pub fn finalize_feature_snapshot(body: FeatureSnapshotBodyV2) -> Result<FeatureSnapshotV2> {
+pub fn finalize_feature_snapshot(body: FeatureSnapshotBodyV3) -> Result<FeatureSnapshotV3> {
     validate_body(&body)?;
     let snapshot_sha256 = body_hash(&body)?;
-    Ok(FeatureSnapshotV2 {
+    Ok(FeatureSnapshotV3 {
         schema_version: body.schema_version,
         snapshot_sha256,
         analysis: body.analysis,
@@ -418,11 +440,11 @@ pub fn finalize_feature_snapshot(body: FeatureSnapshotBodyV2) -> Result<FeatureS
     })
 }
 
-pub fn snapshot_sha256(snapshot: &FeatureSnapshotV2) -> Result<String> {
+pub fn snapshot_sha256(snapshot: &FeatureSnapshotV3) -> Result<String> {
     body_hash(&snapshot.body())
 }
 
-pub fn validate_feature_snapshot(snapshot: &FeatureSnapshotV2) -> Result<()> {
+pub fn validate_feature_snapshot(snapshot: &FeatureSnapshotV3) -> Result<()> {
     validate_body(&snapshot.body())?;
     require_hash(&snapshot.snapshot_sha256)?;
     if snapshot.snapshot_sha256 != snapshot_sha256(snapshot)? {
@@ -434,7 +456,7 @@ pub fn validate_feature_snapshot(snapshot: &FeatureSnapshotV2) -> Result<()> {
     Ok(())
 }
 
-pub fn parse_feature_snapshot(bytes: &[u8]) -> Result<FeatureSnapshotV2> {
+pub fn parse_feature_snapshot(bytes: &[u8]) -> Result<FeatureSnapshotV3> {
     let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
         Error::new(
             "INVALID_FEATURE_SNAPSHOT_JSON",
@@ -447,17 +469,17 @@ pub fn parse_feature_snapshot(bytes: &[u8]) -> Result<FeatureSnapshotV2> {
             "optional feature values must be omitted rather than null",
         ));
     }
-    let snapshot: FeatureSnapshotV2 = serde_json::from_value(value).map_err(|error| {
+    let snapshot: FeatureSnapshotV3 = serde_json::from_value(value).map_err(|error| {
         Error::new(
             "INVALID_FEATURE_SNAPSHOT_JSON",
-            format!("feature snapshot does not match v2 schema: {error}"),
+            format!("feature snapshot does not match v3 schema: {error}"),
         )
     })?;
     validate_feature_snapshot(&snapshot)?;
     Ok(snapshot)
 }
 
-impl TemplateFeatureView for FeatureSnapshotV2 {
+impl TemplateFeatureView for FeatureSnapshotV3 {
     fn snapshot_sha256(&self) -> &str {
         &self.snapshot_sha256
     }
@@ -528,7 +550,7 @@ impl TemplateFeatureView for FeatureSnapshotV2 {
     }
 }
 
-fn validate_body(body: &FeatureSnapshotBodyV2) -> Result<()> {
+fn validate_body(body: &FeatureSnapshotBodyV3) -> Result<()> {
     if body.schema_version != FEATURE_SNAPSHOT_SCHEMA_VERSION {
         return Err(Error::new(
             "INVALID_FEATURE_SNAPSHOT_VERSION",
@@ -659,7 +681,7 @@ fn validate_source(value: &SourceFeatures, analysis: &AnalysisIdentity) -> Resul
         {
             return Err(Error::new(
                 "INVALID_WINDOW_MEASUREMENT",
-                "window energy measurement is outside v2 bounds",
+                "window energy measurement is outside v3 bounds",
             ));
         }
         if let (Some(low), Some(mid), Some(high)) = (
@@ -681,13 +703,13 @@ fn validate_source(value: &SourceFeatures, analysis: &AnalysisIdentity) -> Resul
     {
         return Err(Error::new(
             "INVALID_SOURCE_PEAK",
-            "whole-source peaks are outside v2 bounds",
+            "whole-source peaks are outside v3 bounds",
         ));
     }
     Ok(())
 }
 
-fn validate_pair(body: &FeatureSnapshotBodyV2) -> Result<()> {
+fn validate_pair(body: &FeatureSnapshotBodyV3) -> Result<()> {
     let pair = &body.pair;
     if !body
         .outgoing
@@ -721,6 +743,10 @@ fn validate_pair(body: &FeatureSnapshotBodyV2) -> Result<()> {
         pair.bass_collision_ppm,
         pair.spectral_overlap_ppm,
         pair.alignment_error_ppm_of_beat,
+        pair.outgoing_vocal_collision_strength_ppm,
+        pair.incoming_vocal_collision_strength_ppm,
+        pair.outgoing_transient_collision_strength_ppm,
+        pair.incoming_transient_collision_strength_ppm,
     ]
     .into_iter()
     .flatten()
@@ -736,15 +762,48 @@ fn validate_pair(body: &FeatureSnapshotBodyV2) -> Result<()> {
         || pair
             .transient_collision_span_frames
             .is_some_and(|value| value <= 0)
-        || matches!((pair.collision_start_frame, pair.collision_end_frame), (Some(start), Some(end)) if start >= end)
-        || pair.collision_start_frame.is_some() != pair.collision_end_frame.is_some()
+        || invalid_collision_group(
+            pair.vocal_collision_ppm,
+            pair.vocal_collision_span_frames,
+            pair.vocal_collision_start_frame,
+            pair.vocal_collision_end_frame,
+            pair.outgoing_vocal_collision_strength_ppm,
+            pair.incoming_vocal_collision_strength_ppm,
+        )
+        || invalid_collision_group(
+            pair.transient_collision_ppm,
+            pair.transient_collision_span_frames,
+            pair.transient_collision_start_frame,
+            pair.transient_collision_end_frame,
+            pair.outgoing_transient_collision_strength_ppm,
+            pair.incoming_transient_collision_strength_ppm,
+        )
     {
         return Err(Error::new(
             "INVALID_PAIR_MEASUREMENT",
-            "pair measurement is outside v2 bounds",
+            "pair measurement is outside v3 bounds",
         ));
     }
     Ok(())
+}
+
+fn invalid_collision_group(
+    value: Option<i64>,
+    span: Option<i64>,
+    start: Option<i64>,
+    end: Option<i64>,
+    outgoing_strength: Option<i64>,
+    incoming_strength: Option<i64>,
+) -> bool {
+    let details = [span, start, end, outgoing_strength, incoming_strength];
+    let has_any_detail = details.into_iter().any(|value| value.is_some());
+    if !has_any_detail {
+        return false;
+    }
+    value.is_none()
+        || value == Some(0)
+        || details.into_iter().any(|value| value.is_none())
+        || !matches!((start, end, span), (Some(start), Some(end), Some(span)) if (-705_600..=264_600).contains(&start) && (-705_600..=264_600).contains(&end) && start < end && end - start == span)
 }
 
 fn template_id(value: &str) -> Option<TemplateId> {
@@ -801,7 +860,7 @@ fn probability(value: i64) -> Result<()> {
 }
 
 fn body_hash<T: Serialize>(value: &T) -> Result<String> {
-    domain_hash(b"transition-feature-snapshot/2\0", value)
+    domain_hash(b"transition-feature-snapshot/3\0", value)
 }
 
 fn domain_hash<T: Serialize>(domain: &[u8], value: &T) -> Result<String> {

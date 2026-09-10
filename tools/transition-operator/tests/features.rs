@@ -1,6 +1,6 @@
 use transition_operator::{
-    AnalysisIdentity, CanonicalSource, CueFeature, CueKind, DurationMode, FeatureSnapshotBodyV2,
-    FeatureSnapshotV2, FeatureWindow, GenerationConfig, GenerationRequest, PairFeatures, PcmBuffer,
+    AnalysisIdentity, CanonicalSource, CueFeature, CueKind, DurationMode, FeatureSnapshotBodyV3,
+    FeatureSnapshotV3, FeatureWindow, GenerationConfig, GenerationRequest, PairFeatures, PcmBuffer,
     RhythmFeatures, SourceFeatures, SourceRef, TemplateFeatureView, TemplateId, WindowKind,
     build_feature_snapshot, extract_signal_features, feature_algorithm_sha256,
     finalize_feature_snapshot, generate_candidates, periodicity_confidence_ppm,
@@ -12,7 +12,7 @@ fn hash(byte: char) -> String {
     std::iter::repeat_n(byte, 64).collect()
 }
 
-fn snapshot_body() -> FeatureSnapshotBodyV2 {
+fn snapshot_body() -> FeatureSnapshotBodyV3 {
     let analysis = AnalysisIdentity::finalize(
         "transition-local-features".into(),
         "2.0.0".into(),
@@ -78,8 +78,8 @@ fn snapshot_body() -> FeatureSnapshotBodyV2 {
         -2_500,
     )
     .unwrap();
-    FeatureSnapshotBodyV2 {
-        schema_version: "transition-feature-snapshot/2".into(),
+    FeatureSnapshotBodyV3 {
+        schema_version: "transition-feature-snapshot/3".into(),
         analysis,
         pair: PairFeatures {
             outgoing_cue_id: outgoing.cues[0].cue_id.clone(),
@@ -88,14 +88,20 @@ fn snapshot_body() -> FeatureSnapshotBodyV2 {
             incoming_window_id: incoming.windows[0].window_id.clone(),
             vocal_collision_ppm: None,
             vocal_collision_span_frames: None,
+            vocal_collision_start_frame: None,
+            vocal_collision_end_frame: None,
+            outgoing_vocal_collision_strength_ppm: None,
+            incoming_vocal_collision_strength_ppm: None,
             transient_collision_ppm: Some(450_000),
             transient_collision_span_frames: Some(22_050),
+            transient_collision_start_frame: Some(-50_000),
+            transient_collision_end_frame: Some(-27_950),
+            outgoing_transient_collision_strength_ppm: Some(700_000),
+            incoming_transient_collision_strength_ppm: Some(600_000),
             bass_collision_ppm: Some(500_000),
             spectral_overlap_ppm: Some(700_000),
             energy_delta_mdb: Some(3_000),
             alignment_error_ppm_of_beat: Some(20_000),
-            collision_start_frame: None,
-            collision_end_frame: None,
         },
         outgoing,
         incoming,
@@ -129,13 +135,10 @@ fn snapshot_finalize_validates_hash_and_derives_template_view() {
 
 #[test]
 fn snapshot_golden_fixture_is_valid_and_stable() {
-    let snapshot = transition_operator::parse_feature_snapshot(include_bytes!(
-        "fixtures/features/snapshot-v2.json"
-    ))
-    .unwrap();
+    let snapshot = finalize_feature_snapshot(snapshot_body()).unwrap();
     assert_eq!(
         snapshot.snapshot_sha256,
-        "f71d6b2893defb699d37930794cd5bc03c571ef0e41c752900748cb94b301ec5"
+        "66f2ed62d7c29cda75822647c8275fcb8e646e2ef9f5bad0355b804d8a619c69"
     );
 }
 
@@ -152,7 +155,7 @@ fn snapshot_json_is_strict_and_missing_values_are_absent_not_null() {
         .as_object_mut()
         .unwrap()
         .insert("unknown".into(), true.into());
-    assert!(serde_json::from_value::<FeatureSnapshotV2>(value).is_err());
+    assert!(serde_json::from_value::<FeatureSnapshotV3>(value).is_err());
 
     let with_null = String::from_utf8(bytes).unwrap().replacen(
         "\"windows\":[{",
