@@ -3,7 +3,8 @@ use transition_operator::{
     FeatureSnapshotV2, FeatureWindow, GenerationConfig, GenerationRequest, PairFeatures, PcmBuffer,
     RhythmFeatures, SourceFeatures, SourceRef, TemplateFeatureView, TemplateId, WindowKind,
     build_feature_snapshot, extract_signal_features, feature_algorithm_sha256,
-    finalize_feature_snapshot, generate_candidates, propose_geometries, snapshot_sha256,
+    finalize_feature_snapshot, generate_candidates, periodicity_confidence_ppm,
+    phase_confidence_ppm, propose_geometries, snapshot_sha256, temporal_onset_iou_ppm,
     validate_feature_snapshot,
 };
 
@@ -208,6 +209,15 @@ fn pilot_v1_import_does_not_promote_recompute_or_omitted_values() {
 }
 
 fn pulse_source(tempo_bpm: i64, phase_frames: usize, bass_hz: f64) -> CanonicalSource {
+    pulse_source_with_meter(tempo_bpm, phase_frames, bass_hz, true)
+}
+
+fn pulse_source_with_meter(
+    tempo_bpm: i64,
+    phase_frames: usize,
+    bass_hz: f64,
+    accent_downbeats: bool,
+) -> CanonicalSource {
     let frame_count = 44_100 * 40;
     let beat_frames = (60 * 44_100 / tempo_bpm) as usize;
     let mut frames = Vec::with_capacity(frame_count);
@@ -215,7 +225,11 @@ fn pulse_source(tempo_bpm: i64, phase_frames: usize, bass_hz: f64) -> CanonicalS
         let beat_offset = frame.saturating_sub(phase_frames) % beat_frames;
         let beat_index = frame.saturating_sub(phase_frames) / beat_frames;
         let pulse = if frame >= phase_frames && beat_offset < 220 {
-            if beat_index % 4 == 0 { 0.75 } else { 0.35 }
+            if accent_downbeats && beat_index % 4 == 0 {
+                0.75
+            } else {
+                0.35
+            }
         } else {
             0.0
         };
@@ -223,6 +237,58 @@ fn pulse_source(tempo_bpm: i64, phase_frames: usize, bass_hz: f64) -> CanonicalS
         frames.push([pulse + tone, pulse + tone]);
     }
     CanonicalSource::from_pcm(PcmBuffer::from_frames(frames).unwrap()).unwrap()
+}
+
+#[test]
+fn rhythm_confidence_calibration_is_monotonic_and_keeps_ambiguous_evidence_below_gates() {
+    assert_eq!(
+        periodicity_confidence_ppm(400_000, 400_000).unwrap(),
+        500_000
+    );
+    assert_eq!(
+        periodicity_confidence_ppm(300_000, 200_000).unwrap(),
+        750_000
+    );
+    assert_eq!(
+        periodicity_confidence_ppm(700_000, 400_000).unwrap(),
+        1_000_000
+    );
+    assert!(
+        periodicity_confidence_ppm(460_000, 400_000).unwrap()
+            < periodicity_confidence_ppm(520_000, 400_000).unwrap()
+    );
+
+    assert_eq!(phase_confidence_ppm(1_000_000, 0).unwrap(), 500_000);
+    assert_eq!(phase_confidence_ppm(1_000_000, 100_000).unwrap(), 750_000);
+    assert_eq!(phase_confidence_ppm(1_000_000, 200_000).unwrap(), 1_000_000);
+    assert!(
+        phase_confidence_ppm(900_000, 40_000).unwrap()
+            < phase_confidence_ppm(900_000, 160_000).unwrap()
+    );
+
+    let ambiguous =
+        extract_signal_features(&pulse_source_with_meter(120, 4_410, 80.0, false)).unwrap();
+    let ambiguous = ambiguous
+        .rhythm
+        .expect("uniform pulses still define a beat grid");
+    assert!(ambiguous.beat_confidence_ppm >= 750_000);
+    assert!(ambiguous.downbeat_confidence_ppm < 700_000);
+}
+
+#[test]
+fn temporal_onset_collision_measures_alignment_not_aggregate_activity() {
+    let aligned = [1_000_000, 0, 500_000, 0, 250_000];
+    let partially_aligned = [500_000, 0, 250_000, 0, 0];
+    let displaced = [0, 1_000_000, 0, 500_000, 0];
+
+    assert_eq!(
+        temporal_onset_iou_ppm(&aligned, &aligned).unwrap(),
+        1_000_000
+    );
+    assert_eq!(temporal_onset_iou_ppm(&aligned, &displaced).unwrap(), 0);
+    let partial = temporal_onset_iou_ppm(&aligned, &partially_aligned).unwrap();
+    assert!(partial > 0 && partial < 1_000_000);
+    assert!(partial > temporal_onset_iou_ppm(&aligned, &displaced).unwrap());
 }
 
 #[test]
@@ -235,6 +301,13 @@ fn extract_signal_features_detects_real_periodicity_without_synthetic_fallback()
     );
     let source = pulse_source(120, 4_410, 80.0);
     let features = extract_signal_features(&source).unwrap();
+    let repeated = extract_signal_features(&source).unwrap();
+    assert_eq!(features.analysis, repeated.analysis);
+    assert_eq!(features.source_pcm_sha256, repeated.source_pcm_sha256);
+    assert_eq!(features.source_frames, repeated.source_frames);
+    assert_eq!(features.sample_peak_mdbfs, repeated.sample_peak_mdbfs);
+    assert_eq!(features.true_peak_mdbtp, repeated.true_peak_mdbtp);
+    assert_eq!(features.rhythm, repeated.rhythm);
     let rhythm = features
         .rhythm
         .as_ref()
@@ -287,6 +360,7 @@ fn extract_pair_snapshot_and_geometry_are_deterministic_and_bounds_safe() {
     assert_eq!(first, second);
     assert_eq!(first.outgoing.windows[0].vocal_activity_ppm, None);
     assert_eq!(first.incoming.windows[0].vocal_activity_ppm, None);
+    assert!(first.pair.transient_collision_ppm.unwrap() < 700_000);
 
     let geometries = propose_geometries(&first).unwrap();
     assert_eq!(geometries.fallback_geometry.requested_dry_frames, 220_500);

@@ -18,12 +18,13 @@ const MAX_EFFECT_FRAMES: i64 = 264_600;
 const FALLBACK_FRAMES: i64 = 220_500;
 const ALGORITHM_DESCRIPTION: &str = concat!(
     "transition-local-features/2.0.0;pcm=s16le-stereo-44100;",
-    "rhythm=10ms-stereo-rms-positive-db-flux-autocorrelation-40-240bpm-with-slow-octave-fold;",
-    "meter=4-phase-onset-contrast-no-fallback;cue=nearest-bounds-safe-detected-downbeat;",
+    "rhythm=10ms-stereo-rms-positive-db-flux-autocorrelation-40-240bpm-with-slow-octave-fold-and-p90-prominence-confidence-floor500k-fullat250k;",
+    "meter=4-phase-onset-contrast-confidence-floor500k-fullat200k-no-fallback;cue=nearest-bounds-safe-detected-downbeat;",
     "window=16s-pre-cue;bands=rbj-q707-lp250-hp250-lp4000-hp4000;",
     "bass=rbj-lp180;stability=one-second-band-total-variation;",
     "energy=400ms-stereo-rms-db-mean-and-population-sd;",
-    "transient=10ms-positive-db-flux;peak=bs1770-4x-v1;vocal=absent"
+    "transient=10ms-positive-db-flux-clamped-at12db-and-cue-relative-temporal-iou-minus2.5s-to-minus0.5s;",
+    "peak=bs1770-4x-v1;vocal=absent"
 );
 
 #[derive(Clone, Debug)]
@@ -214,11 +215,13 @@ pub fn build_feature_snapshot(
         outgoing_measurements.bass_occupancy_ppm,
         incoming_measurements.bass_occupancy_ppm,
     );
-    let transient_collision_ppm = geometric_mean_ppm(
-        outgoing_measurements.transient_activity_ppm,
-        incoming_measurements.transient_activity_ppm,
-    );
-    let transient_collision_span_frames = (transient_collision_ppm >= 300_000).then_some(2_205);
+    let transient_collision = aligned_transient_collision(
+        outgoing,
+        incoming,
+        outgoing_source.cues[0].source_frame,
+        incoming_source.cues[0].source_frame,
+        incoming_rate.unwrap_or(1_000_000),
+    )?;
     let alignment_error_ppm_of_beat = incoming_rate.map(|_| 0);
     let body = FeatureSnapshotBodyV2 {
         schema_version: "transition-feature-snapshot/2".to_owned(),
@@ -230,8 +233,8 @@ pub fn build_feature_snapshot(
             incoming_window_id: incoming_source.windows[0].window_id.clone(),
             vocal_collision_ppm: None,
             vocal_collision_span_frames: None,
-            transient_collision_ppm: Some(transient_collision_ppm),
-            transient_collision_span_frames,
+            transient_collision_ppm: Some(transient_collision.value_ppm),
+            transient_collision_span_frames: transient_collision.span_frames,
             bass_collision_ppm: Some(bass_collision_ppm),
             spectral_overlap_ppm: Some(spectral_overlap_ppm),
             energy_delta_mdb: Some(
@@ -239,8 +242,8 @@ pub fn build_feature_snapshot(
                     - outgoing_measurements.short_term_loudness_mlu,
             ),
             alignment_error_ppm_of_beat,
-            collision_start_frame: transient_collision_span_frames.map(|_| -2_205),
-            collision_end_frame: transient_collision_span_frames.map(|_| 0),
+            collision_start_frame: transient_collision.start_frame,
+            collision_end_frame: transient_collision.end_frame,
         },
         outgoing: outgoing_source,
         incoming: incoming_source,
@@ -543,9 +546,22 @@ fn detect_rhythm(onset: &[f64], source_frames: i64) -> Option<RhythmFeatures> {
     let second_score = phase_scores[1].1;
     let contrast =
         ((best_score - second_score) / best_score.max(f64::MIN_POSITIVE)).clamp(0.0, 1.0);
-    let beat_confidence_ppm = (correlation.clamp(0.0, 1.0) * 1_000_000.0).round() as i64;
+    let mut distribution = correlations[25..].to_vec();
+    distribution.sort_by(f64::total_cmp);
+    let p90 = distribution[distribution.len() * 9 / 10];
+    let correlation_ppm = (correlation.clamp(0.0, 1.0) * 1_000_000.0).round() as i64;
+    let p90_ppm = (p90.clamp(0.0, 1.0) * 1_000_000.0).round() as i64;
+    // Confidence is a closed calibration of peak prominence above the lag-search
+    // background, not the raw positive-envelope correlation (whose nonzero
+    // baseline varies with onset density). Accepted but unprominent estimates
+    // remain below the M2 reliability gate.
+    let beat_confidence_ppm = periodicity_confidence_ppm(correlation_ppm, p90_ppm).ok()?;
+    // A four-beat phase is independently reliable only when its accented-onset
+    // sum separates from the runner-up. Zero contrast cannot inherit beat-grid
+    // confidence and masquerade as a downbeat observation.
+    let phase_contrast_ppm = (contrast * 1_000_000.0).round() as i64;
     let downbeat_confidence_ppm =
-        (beat_confidence_ppm as f64 * (0.80 + 0.20 * contrast)).round() as i64;
+        phase_confidence_ppm(beat_confidence_ppm, phase_contrast_ppm).ok()?;
     let downbeats = beats
         .iter()
         .enumerate()
@@ -731,6 +747,173 @@ fn histogram_intersection(left: &WindowMeasurements, right: &WindowMeasurements)
 
 fn geometric_mean_ppm(left: i64, right: i64) -> i64 {
     ((left as f64 * right as f64).sqrt().round() as i64).clamp(0, 1_000_000)
+}
+
+/// Calibrates periodicity from the selected autocorrelation peak's prominence
+/// above the lag-search background. A non-prominent peak receives the neutral
+/// detector floor (500k); prominence of 250k or more is fully confident.
+pub fn periodicity_confidence_ppm(peak_ppm: i64, background_p90_ppm: i64) -> Result<i64> {
+    if !(0..=1_000_000).contains(&peak_ppm)
+        || !(0..=1_000_000).contains(&background_p90_ppm)
+        || peak_ppm < background_p90_ppm
+    {
+        return Err(Error::new(
+            "INVALID_RHYTHM_CONFIDENCE_INPUT",
+            "autocorrelation peak and background must be ordered ppm values",
+        ));
+    }
+    if background_p90_ppm == 1_000_000 {
+        return Ok(500_000);
+    }
+    let prominence_ppm = div_round_nearest_away(
+        (peak_ppm - background_p90_ppm)
+            .checked_mul(1_000_000)
+            .ok_or_else(|| Error::new("INTEGER_OVERFLOW", "prominence overflow"))?,
+        1_000_000 - background_p90_ppm,
+    )?;
+    Ok(500_000 + prominence_ppm.saturating_mul(2).min(500_000))
+}
+
+/// Combines beat-grid confidence with independent four-beat phase contrast.
+/// An unseparated phase contributes 500k; contrast of 200k or more contributes
+/// full phase confidence. The beat confidence remains an upper bound.
+pub fn phase_confidence_ppm(beat_confidence_ppm: i64, phase_contrast_ppm: i64) -> Result<i64> {
+    if !(0..=1_000_000).contains(&beat_confidence_ppm)
+        || !(0..=1_000_000).contains(&phase_contrast_ppm)
+    {
+        return Err(Error::new(
+            "INVALID_RHYTHM_CONFIDENCE_INPUT",
+            "beat confidence and phase contrast must be ppm values",
+        ));
+    }
+    let scaled_contrast = div_round_nearest_away(
+        phase_contrast_ppm
+            .checked_mul(5)
+            .ok_or_else(|| Error::new("INTEGER_OVERFLOW", "phase contrast overflow"))?,
+        2,
+    )?;
+    let phase_confidence = 500_000 + scaled_contrast.min(500_000);
+    div_round_nearest_away(
+        beat_confidence_ppm
+            .checked_mul(phase_confidence)
+            .ok_or_else(|| Error::new("INTEGER_OVERFLOW", "phase confidence overflow"))?,
+        1_000_000,
+    )
+}
+
+/// Temporal intersection-over-union for aligned onset-strength sequences.
+/// This intentionally distinguishes simultaneous transients from two windows
+/// that merely contain the same aggregate amount of transient activity.
+pub fn temporal_onset_iou_ppm(left: &[i64], right: &[i64]) -> Result<i64> {
+    if left.len() != right.len() || left.is_empty() {
+        return Err(Error::new(
+            "INVALID_TRANSIENT_SEQUENCE",
+            "onset sequences must have the same nonzero length",
+        ));
+    }
+    let mut intersection = 0_i64;
+    let mut union = 0_i64;
+    for (&left, &right) in left.iter().zip(right) {
+        if !(0..=1_000_000).contains(&left) || !(0..=1_000_000).contains(&right) {
+            return Err(Error::new(
+                "INVALID_TRANSIENT_SEQUENCE",
+                "onset strengths must be ppm values",
+            ));
+        }
+        intersection = intersection
+            .checked_add(left.min(right))
+            .ok_or_else(|| Error::new("INTEGER_OVERFLOW", "onset intersection overflow"))?;
+        union = union
+            .checked_add(left.max(right))
+            .ok_or_else(|| Error::new("INTEGER_OVERFLOW", "onset union overflow"))?;
+    }
+    if union == 0 {
+        Ok(0)
+    } else {
+        div_round_nearest_away(
+            intersection
+                .checked_mul(1_000_000)
+                .ok_or_else(|| Error::new("INTEGER_OVERFLOW", "onset ratio overflow"))?,
+            union,
+        )
+    }
+}
+
+struct TransientCollision {
+    value_ppm: i64,
+    span_frames: Option<i64>,
+    start_frame: Option<i64>,
+    end_frame: Option<i64>,
+}
+
+fn aligned_transient_collision(
+    outgoing: &SignalFeatures,
+    incoming: &SignalFeatures,
+    outgoing_cue_frame: i64,
+    incoming_cue_frame: i64,
+    incoming_rate_ppm: i64,
+) -> Result<TransientCollision> {
+    const START: i64 = -110_250;
+    const END: i64 = -22_050;
+    let mut outgoing_strengths = Vec::new();
+    let mut incoming_strengths = Vec::new();
+    let mut current_start = None;
+    let mut best: Option<(i64, i64)> = None;
+    let mut timeline = START;
+    while timeline < END {
+        let outgoing_frame = outgoing_cue_frame
+            .checked_add(timeline)
+            .ok_or_else(|| Error::new("INTEGER_OVERFLOW", "collision frame overflow"))?;
+        let incoming_offset = div_round_nearest_away(
+            timeline
+                .checked_mul(incoming_rate_ppm)
+                .ok_or_else(|| Error::new("INTEGER_OVERFLOW", "collision mapping overflow"))?,
+            1_000_000,
+        )?;
+        let incoming_frame = incoming_cue_frame
+            .checked_add(incoming_offset)
+            .ok_or_else(|| Error::new("INTEGER_OVERFLOW", "collision frame overflow"))?;
+        let outgoing_strength = onset_strength_at(outgoing, outgoing_frame);
+        let incoming_strength = onset_strength_at(incoming, incoming_frame);
+        outgoing_strengths.push(outgoing_strength);
+        incoming_strengths.push(incoming_strength);
+        if outgoing_strength >= 250_000 && incoming_strength >= 250_000 {
+            current_start.get_or_insert(timeline);
+        } else if let Some(start) = current_start.take() {
+            let candidate = (start, timeline);
+            if best.is_none_or(|old| candidate.1 - candidate.0 > old.1 - old.0) {
+                best = Some(candidate);
+            }
+        }
+        timeline += ENVELOPE_HOP as i64;
+    }
+    if let Some(start) = current_start {
+        let candidate = (start, END);
+        if best.is_none_or(|old| candidate.1 - candidate.0 > old.1 - old.0) {
+            best = Some(candidate);
+        }
+    }
+    let value_ppm = temporal_onset_iou_ppm(&outgoing_strengths, &incoming_strengths)?;
+    let best = if (300_000..=700_000).contains(&value_ppm) {
+        best
+    } else {
+        None
+    };
+    Ok(TransientCollision {
+        value_ppm,
+        span_frames: best.map(|(start, end)| end - start),
+        start_frame: best.map(|value| value.0),
+        end_frame: best.map(|value| value.1),
+    })
+}
+
+fn onset_strength_at(features: &SignalFeatures, source_frame: i64) -> i64 {
+    let value = usize::try_from(source_frame)
+        .ok()
+        .and_then(|frame| features.onset_envelope.get(frame / ENVELOPE_HOP))
+        .copied()
+        .unwrap_or(0.0);
+    (value / 12.0 * 1_000_000.0).round().clamp(0.0, 1_000_000.0) as i64
 }
 
 fn rhythm_rate_ppm(

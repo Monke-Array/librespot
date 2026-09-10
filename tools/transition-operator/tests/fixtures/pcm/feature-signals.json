@@ -1,6 +1,6 @@
 {
   "schema_version": "transition-feature-signals/1",
-  "algorithm_sha256": "4ccf543654286cd19b0d5f06dc19bccbdab867596443af00379e614424ea12cd",
+  "algorithm_sha256": "df8a0eae7a1515a15de79836582ee05c66b3ca66d8b260a4a82d526a3229890e",
   "sample_rate_hz": 44100,
   "signals": {
     "silence": {"rhythm": "absent"},
