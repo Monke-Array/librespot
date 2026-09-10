@@ -1,10 +1,10 @@
 # Current objective
 
-The requested second engineering listening set stopped after its exhaustive
-family-applicability audit because four requested unseen families have zero
-honest applicable pairs. No second-set pair selection or rendering occurred.
-Wait for owner direction; do not start critic training, Pilot V2, M5/M6,
-browser evaluation, or runtime/RPI integration. Live playback remains unchanged.
+Implement the approved offline vocal-evidence path without proxy labels or
+coverage-driven calibration. Collision semantics, the deterministic trace
+layer, FeatureSnapshot/v3, and collision-local M2 duck ownership are complete.
+Separator feasibility is complete; detector calibration is paused at the
+required independent human-annotation gate. No second-set rendering occurred.
 
 # Branch / normative baselines
 
@@ -17,6 +17,10 @@ browser evaluation, or runtime/RPI integration. Live playback remains unchanged.
 - Initial Task-22 extractor: `18e2d35`.
 - Task-22 rhythm/collision follow-up: `f246f20`.
 - Large FFmpeg pipe deadlock fix: `7b9f115`.
+- Vocal-evidence implementation plan: `e922747`.
+- Vocal collision semantic clarification: `79b86d7`.
+- Deterministic vocal trace layer: `f622b4c`.
+- FeatureSnapshot/v3 and M2 collision-local migration: `5412a6e`.
 
 # Architecture and invariants
 
@@ -36,8 +40,8 @@ browser evaluation, or runtime/RPI integration. Live playback remains unchanged.
   fields unsuitable for direct reuse: peak was mono sample peak, cue confidence
   was a fixed constant, and downbeats included a synthetic fallback. These are
   recomputed in v2; vocal remains absent.
-- `transition-feature-snapshot/2` is strict, hashed, fixed-unit, absence-based,
-  and exposes only the approved M2 TemplateInputs.
+- `transition-feature-snapshot/3` is strict, hashed, fixed-unit, absence-based,
+  and adds only modality-specific collision intervals and local strengths.
 - No contradiction was found between the frozen evidence and the approved M4
   plan/specification.
 
@@ -123,9 +127,49 @@ browser evaluation, or runtime/RPI integration. Live playback remains unchanged.
   regression test hung before the fix and completes after it. DSP semantics and
   render identities were not changed.
 
+# Vocal evidence implementation
+
+- Vocal activity is occupancy of positive 441-frame hops whose centers lie in
+  the clipped half-open FeatureWindow. Missing evidence remains missing.
+- Pair vocal collision is simultaneous-positive occupancy over the explicitly
+  frozen `[-110250, -22050)` transition-relative interval. The 300k/700k M2
+  thresholds therefore mean 0.6/1.4 seconds of simultaneous evidence.
+- The earliest longest simultaneous-positive island supplies the vocal
+  collision span/interval. Duck ownership compares mean calibrated modality
+  strength within that island; whole-window occupancy cannot choose the target.
+- Vocal-vocal and transient-transient measurements have separate intervals and
+  strengths. `ducked_overlap` now requires both modalities known, so unknown
+  vocal evidence cannot enable transient-only ducking.
+- OperatorPlan/v1 operations, DSP recipes, thresholds, scoring, runtime,
+  playback, RPI, and energy-ramp semantics are unchanged. Historical v2 plan
+  references remain structurally readable; new M2 generation requires v3.
+- Synthetic trace tests cover exact 200k/300k/700k boundaries and adjacent
+  hops, clipping, negative relative frames, unequal rate mapping, empty and
+  unknown evidence, disjoint islands, earliest-longest selection, collision
+  strengths, and deterministic provenance hashes.
+
+# Separator feasibility
+
+- S-01 was woken by this task. Its GPU driver was unavailable, so all separator
+  measurements were CPU-only in isolated Python 3.10.21 environments.
+- Spleeter 2.4.2 was rejected: 0.0565x wall/audio was fast, but one bounded
+  singing track peaked at 4,042,080 KiB (3.85 GiB), materially over the approved
+  approximately 2 GiB gate.
+- HTDemucs (`demucs==4.0.1`, `torch==2.2.2+cpu`, model hash recorded in
+  `docs/TRANSITION_VOCAL_SEPARATOR_FEASIBILITY.md`) passed feasibility on
+  singing, dense rap, and transient-heavy instrumental challenges: 0.302-0.308x
+  wall/audio and 1,725,356-2,030,896 KiB peak RSS.
+- Two independent singing runs produced the same float32 vocal-stem hash.
+- HTDemucs is not yet accepted as the extractor. The required independent
+  human-audible calibration/holdout annotations are absent. The public Jamendo
+  VAD archive returned HTTP 403 from the available network and does not split
+  singing/rap/spoken labels. No proxy labels, detector threshold, production
+  separator code, full-corpus traces, or post-vocal M2 coverage were created.
+
 # Verification
 
-- Focused Task-22: 12/12 feature tests and 13/13 generator tests pass.
+- Focused current suite: 12/12 feature, 13/13 generator, 15/15 template, and
+  5/5 vocal-trace tests pass.
 - Complete standalone transition-operator suite passes, including 5/5 time
   stretch tests and 16/16 renderer tests; one performance characterization is
   intentionally ignored.
@@ -148,6 +192,7 @@ browser evaluation, or runtime/RPI integration. Live playback remains unchanged.
 
 # NEXT ACTION
 
-Owner reviews the zero-family audit and explicitly decides whether to authorize
-a separately versioned vocal-evidence extractor and/or a localized-collision
-calibration change before requesting another listening set.
+Obtain track-disjoint human vocal-activity annotations that separately cover
+singing, rap, and spoken delivery, then calibrate HTDemucs-derived activity on
+calibration only and run the untouched holdout gates before any production
+extractor integration or M2 coverage audit.
