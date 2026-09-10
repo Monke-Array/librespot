@@ -690,8 +690,10 @@ near-Nyquist tones.
 
 ### 6.1 Feature snapshot boundary
 
-Templates consume `transition-feature-snapshot/2`; they do not call feature
-extractors. Its frozen values include:
+Templates consume `transition-feature-snapshot/3`; they do not call feature
+extractors. Version 3 preserves the version 2 meanings and adds only the
+modality-specific collision evidence required to implement the already-specified
+duck target honestly. Its frozen values include:
 
 - source identity/duration and analysis identity;
 - cue IDs, source frames, cue kinds, and confidence;
@@ -708,6 +710,55 @@ Probabilities/confidences/occupancies are `0..=1_000_000` ppm. Energy and
 loudness deltas are signed millidecibels. Every derived value carries a valid
 window ID whose source-frame range is in the snapshot. Missing values are
 absent, not zero.
+
+`vocal_activity_ppm` is temporal occupancy: the fraction of valid fixed 441-frame
+(10 ms at 44.1 kHz) analysis hops whose centers fall in the exact half-open
+feature window and contain positive vocal evidence. A window is vocal-free under
+the v1 predicate at or below 200,000 ppm. `outgoing_vocal_sustained` is not a
+serialized feature and does not claim continuity; it is the derived high-vocal-
+occupancy state `vocal_activity_ppm > 700_000`.
+
+Pair collision analysis uses the candidate-independent half-open transition
+interval `[-110_250, -22_050)`, or -2.5 s through -0.5 s relative to the dry
+handoff. This is the interior two seconds of the shortest fixed three-second
+duck geometry and leaves at least 0.5 s at both ends, exceeding every v1 duck
+attack/release. Bar geometries that cannot contain the resolved attack, hold,
+and release remain inapplicable through normal recipe validation.
+
+Vocal collision is the occupancy of timeline hops in that interval for which
+both aligned sources have positive vocal evidence. It is not intersection over
+union and not intersection divided by the shorter activity. Its ppm denominator
+is always the 200 valid hops in the canonical pair interval. A valid pair with no
+simultaneous positive hops has collision value zero; an unavailable trace leaves
+the value absent. Incoming hops use the geometry's round-nearest-ties-away rate
+mapping. The collision span and modality-specific start/end are the earliest
+longest contiguous island of simultaneous-positive hops.
+
+This definition gives the existing thresholds a direct temporal meaning:
+300,000 ppm is 0.6 s and 700,000 ppm is 1.4 s of simultaneous evidence in the
+two-second interval. Competing normalizations do not preserve that meaning:
+
+| Synthetic activity in the 2 s interval | intersection/union | intersection/minimum | intersection/interval |
+| --- | ---: | ---: | ---: |
+| two 1.2 s phrases, 0.6 s overlap | 333,333 | 500,000 | 300,000 |
+| 0.4 s phrase fully inside 1.6 s phrase | 250,000 | 1,000,000 | 200,000 |
+| two 0.9 s phrases, 0.2 s overlap | 125,000 | 222,222 | 100,000 |
+| no active source, or only one active source | 0 | 0 | 0 |
+
+In particular, intersection/minimum would call every fully contained short
+phrase sustained, while intersection/union would make the threshold depend on
+unrelated solo-vocal duration. Both contradict the existing localized/sustained
+threshold vocabulary.
+
+Feature-window activity remains occupancy. Duck target comparison instead uses
+the mean calibrated modality evidence strength inside the selected collision
+island. Comparing occupancy inside an intersection would be tautological because
+both sources are active at every hop. Version 3 therefore carries separate vocal
+and transient collision intervals plus outgoing/incoming collision-strength ppm.
+M2 identifies the sole localized modality, requires both modality measurements
+to be known, compares that modality's two strengths, and gives outgoing an exact
+tie. The extractor measures these values but never classifies applicability or
+chooses a target.
 
 Feature algorithms and extractor versions live in the feature schema, not this
 IR. Applicability formulas below are exact over a valid snapshot. The outstanding
@@ -1561,10 +1612,9 @@ The later implementation is acceptable only when automated tests demonstrate:
 
 Two known evidence gaps remain and are not hidden by defaults:
 
-1. The exact S-01 Pilot V1 offline feature schema is not in the local Git object
-   store. Before feature-extractor implementation, audit it and map reusable
-   fields explicitly into `transition-feature-snapshot/2`. This may change the
-   extractor work, not `OperatorPlan/v1` semantics.
+1. A validated, frozen offline vocal separator is required before the optional
+   vocal fields in `transition-feature-snapshot/3` may be populated. Failure or
+   unavailable evidence remains absence, never zero or vocal-free.
 2. The private files lack embedded identity tags. Complete a private
    artist/album/style annotation before Pilot V2 pair and leakage manifests are
    frozen. This does not affect plan rendering.
