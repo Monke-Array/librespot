@@ -1,9 +1,10 @@
 # Current objective
 
-The private real-music engineering listening set is complete. Stop before any
-further M4 work until the owner has listened and gives a new direction. M1-M3
-remain complete; Task 20, Task 21, and the minimum Task-22 extractor bridge are
-implemented. Live playback remains unchanged.
+The requested second engineering listening set stopped after its exhaustive
+family-applicability audit because four requested unseen families have zero
+honest applicable pairs. No second-set pair selection or rendering occurred.
+Wait for owner direction; do not start critic training, Pilot V2, M5/M6,
+browser evaluation, or runtime/RPI integration. Live playback remains unchanged.
 
 # Branch / normative baselines
 
@@ -58,7 +59,7 @@ implemented. Live playback remains unchanged.
 - Frozen extractor algorithm hash is recorded in the synthetic fixture and in
   every private feature snapshot.
 
-# Private listening set
+# First private listening set
 
 - Private directory (outside Git):
   `C:\Users\janni\Desktop\spotify-transition-listening-demo-20260910`.
@@ -78,6 +79,35 @@ implemented. Live playback remains unchanged.
   bytes and decoded PCM hashes.
 - Private snapshots, full candidate sets, the private manifest, source names,
   and unblinding file remain only in the private directory outside Git.
+
+# Second vocabulary applicability audit
+
+- Private directory (outside Git):
+  `C:\Users\janni\Desktop\spotify-transition-listening-demo-v2-20260910`.
+- First-set qualitative observations are recorded privately at pair granularity
+  only. They contain no candidate labels and are not approved training data.
+- The audit used the approved FeatureSnapshot/v2 extractor and real M2 generator
+  over all 4,290 directed distinct-track pairs in the authorized 66-track
+  Downloads corpus. All 4,290 pairs produced a snapshot and candidate set.
+- Applicable-pair counts are: safe crossfade 4,290; shaped handoff 600; beat cut
+  0; bass handoff 51; spectral handoff 492; ducked overlap 0; echo-tail handoff
+  0; energy ramp 18; rhythmic handoff 0.
+- Beat cut, echo-tail handoff, and rhythmic handoff are unreachable with the
+  current approved extractor because they require outgoing vocal evidence. The
+  extractor intentionally omits vocal evidence and required missing values fail
+  closed; absence may not be interpreted as vocal-free.
+- Ducked overlap is also absent: vocal collision is unavailable and measured
+  cue-relative transient IoU spans 16,934–269,544 ppm, below the localized
+  collision band beginning at 300,000 ppm. Existing adversarial vectors show
+  the IoU metric can reach the band, so this is a real-corpus calibration gap,
+  not an implementation defect. No threshold changed.
+- Energy ramp is honestly applicable to 18 pairs. Eleven emit a distinct M2
+  candidate; in seven negative-delta cases second-based plans deduplicate with
+  shaped-handoff audio semantics while bar/filter recipes lack compatible
+  rhythm geometry.
+- The mandated zero-family stop fired before selection/rendering. The v2
+  directory contains audit evidence and zero audio samples; no unblinding or
+  ratings template was created.
 
 # Defects discovered and fixed
 
@@ -104,10 +134,20 @@ implemented. Live playback remains unchanged.
   successfully in pinned FFmpeg, and report the exact 1,587,600-frame window.
 - All listening samples map uniquely to candidates in the preserved full M2
   candidate sets. M3 recorded decoded PCM hashes and QC measurements.
+- The second audit independently recounts 4,290 pair rows with zero failures and
+  matches every recorded family count. Private manifest artifact hashes match.
+- Fresh 2026-09-10 checks pass: transition-operator formatting, all-target
+  Clippy with `-D warnings`, and its complete suite (including 12 feature, 13
+  generator, 14 template, and 16 renderer tests); root workspace formatting and
+  checking; 83 playback tests; and 113 connect unit tests plus 5 oracle tests.
+- The second audit retained at most two four-track decoded blocks. Measured peak
+  working set was 1,929,699,328 bytes (1,840.30 MiB); full-corpus PCM was never
+  retained.
 - No runtime/playback source, private music, private source filename, private
   manifest, or rendered audio is tracked by the repository.
 
 # NEXT ACTION
 
-Owner listens to the blind FLACs and records qualitative engineering feedback.
-Do not resume Task 23/24 or broader M4 work without a new explicit request.
+Owner reviews the zero-family audit and explicitly decides whether to authorize
+a separately versioned vocal-evidence extractor and/or a localized-collision
+calibration change before requesting another listening set.
