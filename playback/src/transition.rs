@@ -1092,6 +1092,34 @@ mod tests {
     }
 
     #[test]
+    fn completion_discards_gain_curves_before_later_pcm() {
+        let mut engine = TransitionEngine::new(2, 1);
+        engine
+            .arm(TransitionSpec {
+                duration: Duration::from_secs(1),
+                curve: TransitionCurve::GainCurves {
+                    current: one_segment(&[(0.0, 0.1), (1.0, 0.1)]),
+                    next: one_segment(&[(0.0, 0.2), (1.0, 0.2)]),
+                },
+                current_gain: 0.5,
+                next_gain: 0.25,
+            })
+            .expect("valid transition should arm");
+        let _ = engine
+            .render(
+                AudioPacket::Samples(vec![1.0; 2]),
+                Some(AudioPacket::Samples(vec![1.0; 2])),
+            )
+            .expect("transition should finish");
+        engine.complete().expect("finished transition should reset");
+
+        let output = engine
+            .render(AudioPacket::Samples(vec![0.4, -0.3]), None)
+            .expect("completed engine should be ordinary passthrough");
+        assert_eq!(into_samples(output), [0.4, -0.3]);
+    }
+
+    #[test]
     fn state_machine_rejects_illegal_operations() {
         let mut engine = TransitionEngine::new(4, 1);
         assert!(matches!(

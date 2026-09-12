@@ -136,6 +136,13 @@ impl SourceDecoder {
         matches!(self, Self::Worker(_))
     }
 
+    pub(crate) fn finish_transition_dsp(&mut self) -> Option<u32> {
+        if let Self::Worker(worker) = self {
+            return worker.finish_transition_dsp();
+        }
+        None
+    }
+
     #[cfg(test)]
     pub(crate) fn direct_decoder_address(&self) -> Option<*const ()> {
         match self {
@@ -150,6 +157,11 @@ impl SourceDecoder {
             Self::Worker(worker) => Some(worker.finished.clone()),
             Self::Direct(_) | Self::Invalid => None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_transition_time_stretch(&self) -> bool {
+        matches!(self, Self::Worker(worker) if worker.time_stretch.is_some())
     }
 
     fn invalid_state_error() -> DecoderError {
@@ -267,16 +279,18 @@ impl SecondaryDecodeWorker {
             })
             .map_err(DecoderError::Io)?;
 
+        if let Some(automation) = &speed_automation {
+            debug!(
+                "[transition] incoming speed automation track=<{track_label}> source_position_ms={source_position_ms} points={:?}",
+                automation.points()
+            );
+        }
         let time_stretch = speed_automation.and_then(|automation| {
             PitchPreservingTimeStretch::new(
                 automation,
                 std::time::Duration::from_millis(u64::from(source_position_ms)),
             )
         });
-        if time_stretch.is_some() {
-            debug!("[transition] incoming speed automation active track=<{track_label}>");
-        }
-
         Ok(Self {
             receiver: Some(receiver),
             cancelled,
@@ -540,7 +554,7 @@ impl SecondaryDecodeWorker {
             .as_ref()
             .is_some_and(|origin| origin.skipped && self.pcm_consumed_frames == 0);
         self.pcm_consumed_frames += (samples / NUM_CHANNELS as usize) as u64;
-        Some(SecondaryPcmBlock {
+        let block = SecondaryPcmBlock {
             generation,
             position: AudioPacketPosition {
                 position_ms,
@@ -548,7 +562,8 @@ impl SecondaryDecodeWorker {
             },
             packet,
             source_end_position_ms,
-        })
+        };
+        Some(block)
     }
 
     fn push_stretched_message(&mut self, message: SecondaryDecodeMessage) {
@@ -608,6 +623,34 @@ impl SecondaryDecodeWorker {
             },
             SecondaryDecodeEvent::Packet(_, _) => unreachable!("only terminal events are stored"),
         }
+    }
+
+    fn finish_transition_dsp(&mut self) -> Option<u32> {
+        self.retire_time_stretch().map(duration_ms_u32)
+    }
+
+    fn retire_time_stretch(&mut self) -> Option<std::time::Duration> {
+        let stretch = self.time_stretch.take()?;
+        let (source_position, samples) = stretch.finish();
+        debug_assert!(self.pcm_buffer.is_empty());
+        if self.pcm_generation.is_some() {
+            self.pcm_origin = Some(AudioPacketPosition {
+                position_ms: duration_ms_u32(source_position),
+                skipped: false,
+            });
+        } else {
+            self.pcm_origin = None;
+        }
+        self.pcm_consumed_frames = 0;
+        self.max_pcm_samples = self.max_pcm_samples.max(samples.len());
+        self.pcm_buffer = samples;
+        self.time_stretch_flushed = false;
+        debug!(
+            "[transition] incoming speed processor retired track=<{}> source_position_ms={}",
+            self.track_label,
+            duration_ms_u32(source_position)
+        );
+        Some(source_position)
     }
 
     fn recv_packet(&mut self) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>> {

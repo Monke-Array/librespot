@@ -466,10 +466,25 @@ pub(crate) fn transition_plan_for_local_auto_transition(
         linear_gain_curve(0.0, 1.0)?,
     )?;
     if (overlap.speed_b - 1.0).abs() > ITEM_SPEED_TOLERANCE as f32 {
-        let speed = SpeedAutomation::new(vec![SpeedPoint {
-            from_position: Duration::from_millis(u64::try_from(overlap.start_b_ms).unwrap()),
-            speed: f64::from(overlap.speed_b),
+        let start_b = Duration::from_millis(u64::try_from(overlap.start_b_ms).unwrap());
+        let transition_speed = f64::from(overlap.speed_b);
+        let unbounded_speed = SpeedAutomation::new(vec![SpeedPoint {
+            from_position: start_b,
+            speed: transition_speed,
         }])
+        .map_err(|_| SpotifyTransitionError::UnsupportedTempo("speedB", overlap.speed_b))?;
+        let unity_position =
+            start_b + unbounded_speed.source_duration_for_wall_time(start_b, plan.duration());
+        let speed = SpeedAutomation::new(vec![
+            SpeedPoint {
+                from_position: start_b,
+                speed: transition_speed,
+            },
+            SpeedPoint {
+                from_position: unity_position,
+                speed: 1.0,
+            },
+        ])
         .map_err(|_| SpotifyTransitionError::UnsupportedTempo("speedB", overlap.speed_b))?;
         plan = plan.with_next_speed_automation(speed);
     }
@@ -780,7 +795,7 @@ mod tests {
     }
 
     #[test]
-    fn local_auto_transition_materializes_oracle_geometry_and_speed() {
+    fn local_auto_transition_bounds_incoming_speed_to_overlap_source_time() {
         let transition = crate::spotify_auto_mix::AutoRankedTransition {
             overlap: crate::spotify_auto_mix::AutoTransitionOverlap {
                 start_a_ms: 208_960,
@@ -810,6 +825,20 @@ mod tests {
             .next_speed_automation()
             .expect("non-1.0 speedB should be attached");
         assert!((speed.speed_at(Duration::from_millis(2_763)) - 0.903_120_398_5).abs() < 1e-6);
+        let expected_unity_position = Duration::from_secs_f64(8.263_003_226_995_468);
+        assert_eq!(speed.points().len(), 2);
+        assert!(
+            speed.points()[1]
+                .from_position
+                .abs_diff(expected_unity_position)
+                <= Duration::from_nanos(1)
+        );
+        assert_eq!(speed.points()[1].speed, 1.0);
+        assert_eq!(
+            speed.speed_at(expected_unity_position - Duration::from_nanos(1)),
+            f64::from(0.903_120_4_f32)
+        );
+        assert_eq!(speed.speed_at(expected_unity_position), 1.0);
     }
 
     #[test]

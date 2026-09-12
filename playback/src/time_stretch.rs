@@ -327,6 +327,15 @@ pub(crate) struct PitchPreservingTimeStretch {
     output: VecDeque<f64>,
     generated_source_frames: f64,
     emitted_source_frames: f64,
+    // Keep the small decoded lookahead that WSOLA already requires so promotion can hand it back
+    // to ordinary playback without reloading, skipping source frames, or flushing on the sink path.
+    initial_source_frames: f64,
+    raw_origin_source_frames: f64,
+    raw_input: VecDeque<f64>,
+    // The final two emitted frames let retirement choose a phase-aligned raw handoff without
+    // running transition DSP after promotion. Raw lookahead retains at least one WSOLA frame,
+    // which is wider than the bounded correlation search used here.
+    handoff_tail: VecDeque<f64>,
 }
 
 impl PitchPreservingTimeStretch {
@@ -336,17 +345,23 @@ impl PitchPreservingTimeStretch {
         }
         let mut engine = WsolaEngine::new(SAMPLE_RATE, usize::from(NUM_CHANNELS));
         engine.set_tempo(automation.speed_at(source_position));
+        let source_frames = duration_to_frames(source_position);
         Some(Self {
             automation,
             engine,
             output: VecDeque::with_capacity(4096 * usize::from(NUM_CHANNELS)),
-            generated_source_frames: duration_to_frames(source_position),
-            emitted_source_frames: duration_to_frames(source_position),
+            generated_source_frames: source_frames,
+            emitted_source_frames: source_frames,
+            initial_source_frames: source_frames,
+            raw_origin_source_frames: source_frames,
+            raw_input: VecDeque::with_capacity(4096 * usize::from(NUM_CHANNELS)),
+            handoff_tail: VecDeque::with_capacity(2 * usize::from(NUM_CHANNELS)),
         })
     }
 
     pub(crate) fn push(&mut self, samples: &[f64]) {
         self.engine.push(samples);
+        self.raw_input.extend(samples.iter().copied());
     }
 
     pub(crate) fn fill_output(&mut self, requested_samples: usize) {
@@ -390,10 +405,23 @@ impl PitchPreservingTimeStretch {
 
     pub(crate) fn take(&mut self, samples: usize) -> Vec<f64> {
         let samples: Vec<_> = self.output.drain(..samples).collect();
-        let frames = samples.len() / usize::from(NUM_CHANNELS);
+        let channels = usize::from(NUM_CHANNELS);
+        let frames = samples.len() / channels;
         self.emitted_source_frames = self
             .automation
             .advance_source_frames(self.emitted_source_frames, frames as f64);
+        let raw_frames = ((self.emitted_source_frames
+            - self.raw_origin_source_frames
+            - self.engine.frame as f64)
+            .floor()
+            .max(0.0) as usize)
+            .min(self.raw_input.len() / channels);
+        self.raw_input.drain(..raw_frames * channels);
+        self.raw_origin_source_frames += raw_frames as f64;
+        self.handoff_tail.extend(samples.iter().copied());
+        while self.handoff_tail.len() > 2 * channels {
+            self.handoff_tail.pop_front();
+        }
         samples
     }
 
@@ -411,6 +439,51 @@ impl PitchPreservingTimeStretch {
 
     pub(crate) fn source_position(&self) -> Duration {
         frames_to_duration(self.emitted_source_frames)
+    }
+
+    pub(crate) fn finish(mut self) -> (Duration, Vec<f64>) {
+        let channels = usize::from(NUM_CHANNELS);
+        let raw_frames = self.raw_input.len() / channels;
+        let nominal = if self.handoff_tail.is_empty() {
+            self.initial_source_frames
+        } else {
+            self.emitted_source_frames
+        };
+        let nominal_index =
+            ((nominal - self.raw_origin_source_frames).round().max(0.0) as usize).min(raw_frames);
+        let discard_frames = if self.handoff_tail.len() < channels || raw_frames == 0 {
+            nominal_index
+        } else {
+            let lower = nominal_index.saturating_sub(self.engine.search);
+            let upper = nominal_index
+                .saturating_add(self.engine.search)
+                .min(raw_frames.saturating_sub(1));
+            let tail_start = self.handoff_tail.len() - channels;
+            let previous_start = tail_start.saturating_sub(channels);
+            (lower..=upper)
+                .min_by(|left, right| {
+                    let score = |candidate: usize| {
+                        (0..channels)
+                            .map(|channel| {
+                                let last = self.handoff_tail[tail_start + channel];
+                                let previous = self.handoff_tail[previous_start + channel];
+                                let jump = self.raw_input[candidate * channels + channel] - last;
+                                let slope_error = jump - (last - previous);
+                                jump * jump + slope_error * slope_error
+                            })
+                            .sum::<f64>()
+                    };
+                    score(*left).total_cmp(&score(*right))
+                })
+                .unwrap_or(nominal_index)
+        };
+        self.raw_input.drain(..discard_frames * channels);
+        (
+            // Correlation search chooses acoustically equivalent nearby source PCM, while the
+            // source clock remains the nominal automation position represented by that grain.
+            frames_to_duration(nominal),
+            self.raw_input.into_iter().collect(),
+        )
     }
 }
 
@@ -552,6 +625,110 @@ mod tests {
         assert!(
             (measured_hz - frequency).abs() < 0.1,
             "pitch was {measured_hz} Hz"
+        );
+    }
+
+    #[test]
+    fn bounded_speed_restores_unity_duration_and_pitch_after_endpoint() {
+        let frequency = 440.0;
+        let frames = 3 * SAMPLE_RATE as usize;
+        let mut input = Vec::with_capacity(frames * usize::from(NUM_CHANNELS));
+        for frame in 0..frames {
+            let sample = (TAU * frequency * frame as f64 / f64::from(SAMPLE_RATE)).sin() * 0.5;
+            input.extend([sample, sample]);
+        }
+
+        let output = stretch_all(&input, automation(&[(0, 0.9), (900, 1.0)]));
+        let output_frames = output.len() / usize::from(NUM_CHANNELS);
+        let expected_frames = (3.1 * f64::from(SAMPLE_RATE)) as usize;
+        assert!(output_frames.abs_diff(expected_frames) < 400);
+
+        let left: Vec<_> = output
+            .chunks_exact(usize::from(NUM_CHANNELS))
+            .map(|frame| frame[0])
+            .collect();
+        let start = (1.2 * f64::from(SAMPLE_RATE)) as usize;
+        let end = (2.8 * f64::from(SAMPLE_RATE)) as usize;
+        let crossings = left[start..end]
+            .windows(2)
+            .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
+            .count();
+        let measured_hz = crossings as f64 * f64::from(SAMPLE_RATE) / (end - start) as f64;
+        assert!(
+            (measured_hz - frequency).abs() < 0.1,
+            "post-transition pitch was {measured_hz} Hz"
+        );
+    }
+
+    #[test]
+    fn finishing_transition_returns_raw_pcm_from_emitted_source_position() {
+        let frames = 10_000;
+        let mut input = Vec::with_capacity(frames * usize::from(NUM_CHANNELS));
+        for frame in 0..frames {
+            input.extend([frame as f64, frame as f64]);
+        }
+        let mut stretch =
+            PitchPreservingTimeStretch::new(automation(&[(0, 0.5), (5_000, 1.0)]), Duration::ZERO)
+                .expect("non-unity automation should create a processor");
+        stretch.push(&input);
+        stretch.fill_output(1_024 * usize::from(NUM_CHANNELS));
+        let _ = stretch.take(1_024 * usize::from(NUM_CHANNELS));
+
+        let search = stretch.engine.search;
+        let (position, raw) = stretch.finish();
+
+        let position_frame = duration_to_frames(position).round() as usize;
+        let raw_frame = raw.first().copied().expect("raw handoff PCM") as usize;
+        assert!(raw_frame.abs_diff(position_frame) <= search);
+        assert_eq!(raw.len(), (frames - raw_frame) * usize::from(NUM_CHANNELS));
+    }
+
+    #[test]
+    fn finishing_before_first_emission_returns_untouched_raw_preload() {
+        let frames = 4_000;
+        let mut input = Vec::with_capacity(frames * usize::from(NUM_CHANNELS));
+        for frame in 0..frames {
+            input.extend([frame as f64, frame as f64]);
+        }
+        let mut stretch =
+            PitchPreservingTimeStretch::new(automation(&[(0, 0.5), (5_000, 1.0)]), Duration::ZERO)
+                .expect("non-unity automation should create a processor");
+        stretch.push(&input);
+        stretch.fill_output(1_024 * usize::from(NUM_CHANNELS));
+        assert_eq!(stretch.source_position(), Duration::ZERO);
+
+        let (position, raw) = stretch.finish();
+        assert_eq!(position, Duration::ZERO);
+        assert_eq!(raw, input);
+    }
+
+    #[test]
+    fn finishing_transition_hands_off_without_a_large_waveform_step() {
+        let frames = 2 * SAMPLE_RATE as usize;
+        let mut input = Vec::with_capacity(frames * usize::from(NUM_CHANNELS));
+        for frame in 0..frames {
+            let sample = (TAU * 440.0 * frame as f64 / f64::from(SAMPLE_RATE)).sin() * 0.5;
+            input.extend([sample, sample]);
+        }
+        let mut stretch =
+            PitchPreservingTimeStretch::new(automation(&[(0, 0.9), (900, 1.0)]), Duration::ZERO)
+                .expect("non-unity automation should create a processor");
+        stretch.push(&input);
+        stretch.fill_output(SAMPLE_RATE as usize * usize::from(NUM_CHANNELS));
+        let transition = stretch.take(SAMPLE_RATE as usize * usize::from(NUM_CHANNELS));
+
+        let emitted = stretch.emitted_source_frames;
+        let raw_origin = stretch.raw_origin_source_frames;
+        let ideal_source = stretch.engine.ideal_source;
+        let last_source = stretch.engine.last_source;
+        let (_, raw) = stretch.finish();
+        let boundary_step =
+            (transition[transition.len() - usize::from(NUM_CHANNELS)] - raw[0]).abs();
+        assert!(
+            boundary_step < 0.05,
+            "handoff step was {boundary_step}; emitted={emitted} raw_origin={raw_origin} ideal={ideal_source} last={last_source} last_sample={} raw_sample={}",
+            transition[transition.len() - usize::from(NUM_CHANNELS)],
+            raw[0]
         );
     }
 

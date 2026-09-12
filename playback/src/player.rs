@@ -2402,6 +2402,15 @@ impl PlayerInternal {
         }
     }
 
+    fn cancel_transition(&mut self, reason: &str) {
+        self.transition.cancel(reason);
+        if let PlayerPreload::Ready { source, .. } = &mut self.preload {
+            if let Some(position_ms) = source.decoder.finish_transition_dsp() {
+                source.stream_position_ms = position_ms;
+            }
+        }
+    }
+
     fn start_secondary_decode(&mut self) -> Result<bool, DecoderError> {
         if self.config.passthrough {
             return Ok(false);
@@ -2594,7 +2603,7 @@ impl PlayerInternal {
 
     fn cancel_secondary_source_unless(&mut self, retained_track_id: &SpotifyUri, reason: &str) {
         if self.preload.track_id() == Some(retained_track_id) {
-            self.transition.cancel(reason);
+            self.cancel_transition(reason);
         } else {
             self.cancel_secondary_source(reason);
         }
@@ -3151,14 +3160,13 @@ impl PlayerInternal {
                         Ok(()) => return,
                         Err(error) => {
                             error!("Unable to complete active transition at current EOF: {error}");
-                            self.transition.cancel("promotion failed at current EOF");
+                            self.cancel_transition("promotion failed at current EOF");
                             self.handle_pause();
                             return;
                         }
                     }
                 }
-                self.transition
-                    .cancel("current source reached EOF before transition completion");
+                self.cancel_transition("current source reached EOF before transition completion");
                 self.state.playing_to_end_of_track();
                 if let PlayerState::EndOfTrack {
                     ref track_id,
@@ -3266,7 +3274,7 @@ impl PlayerInternal {
                 "Transition current PCM has {} samples not aligned to {channels} channels",
                 samples.len()
             );
-            self.transition.cancel("unaligned current PCM");
+            self.cancel_transition("unaligned current PCM");
             self.write_output_packet(AudioPacket::Samples(samples), volume);
             return;
         }
@@ -3279,7 +3287,7 @@ impl PlayerInternal {
                 .min(self.transition.remaining_frames());
             if frames == 0 {
                 error!("Transition reached zero remaining frames without finishing");
-                self.transition.cancel("invalid frame accounting");
+                self.cancel_transition("invalid frame accounting");
                 self.write_output_packet(AudioPacket::Samples(samples[offset..].to_vec()), volume);
                 return;
             }
@@ -3290,7 +3298,7 @@ impl PlayerInternal {
                 SecondaryFrameRead::Ready(block) => block,
                 SecondaryFrameRead::Pending => {
                     debug!("Transition aborted: secondary PCM underrun; continuing current track");
-                    self.transition.cancel("secondary PCM underrun");
+                    self.cancel_transition("secondary PCM underrun");
                     self.write_output_packet(
                         AudioPacket::Samples(samples[offset..].to_vec()),
                         volume,
@@ -3309,7 +3317,7 @@ impl PlayerInternal {
             let next_factor = match &self.preload {
                 PlayerPreload::Ready { source, .. } => source.normalisation_factor,
                 PlayerPreload::None | PlayerPreload::Loading { .. } => {
-                    self.transition.cancel("secondary source disappeared");
+                    self.cancel_transition("secondary source disappeared");
                     self.write_output_packet(
                         AudioPacket::Samples(samples[offset..].to_vec()),
                         volume,
@@ -3330,7 +3338,7 @@ impl PlayerInternal {
                 Ok(packet) => packet,
                 Err(e) => {
                     error!("Transition engine rejected aligned PCM: {e}");
-                    self.transition.cancel("rendering failed");
+                    self.cancel_transition("rendering failed");
                     self.write_output_packet(
                         AudioPacket::Samples(samples[offset..].to_vec()),
                         volume,
@@ -3340,8 +3348,7 @@ impl PlayerInternal {
             };
 
             if !self.write_output_packet(mixed, volume) {
-                self.transition
-                    .cancel("sink write failed during transition");
+                self.cancel_transition("sink write failed during transition");
                 return;
             }
             if let PlayerPreload::Ready { source, .. } = &mut self.preload {
@@ -3356,7 +3363,7 @@ impl PlayerInternal {
             if self.transition.state() == TransitionState::Finishing {
                 if let Err(e) = self.complete_crossfade() {
                     error!("Unable to complete transition: {e}");
-                    self.transition.cancel("promotion failed");
+                    self.cancel_transition("promotion failed");
                     self.handle_pause();
                 }
                 return;
@@ -3394,6 +3401,13 @@ impl PlayerInternal {
             unreachable!("ready secondary was validated before promotion");
         };
 
+        if let Some(position_ms) = source.decoder.finish_transition_dsp() {
+            source.stream_position_ms = position_ms;
+        }
+        debug!(
+            "[transition] promoting incoming source outgoing_position_ms={} incoming_position_ms={} normalisation_factor={} transition_dsp_active=false",
+            old_source.stream_position_ms, source.stream_position_ms, source.normalisation_factor
+        );
         drop(old_source);
         let play_request_id = self.play_request_id_generator.get();
         let position_ms = source.stream_position_ms;
@@ -4009,11 +4023,17 @@ impl PlayerInternal {
                     track_id,
                     transition,
                     ..
+                }
+                | PlayerPreload::Ready {
+                    track_id,
+                    transition,
+                    ..
                 } => Some((track_id.clone(), transition.clone())),
-                PlayerPreload::None | PlayerPreload::Ready { .. } => None,
+                PlayerPreload::None => None,
             };
             if let Some((track_id, transition)) = preload_restart {
                 let position_ms = transition.next_start_position_ms();
+                self.cancel_secondary_source("session replacement invalidated secondary preload");
                 debug!(
                     "Restarting in-flight secondary preload for <{track_id}> at {position_ms} ms on replacement session"
                 );
@@ -4913,15 +4933,27 @@ mod tests {
             }])
             .expect("test curve should validate")
         };
+        let unbounded = crate::SpeedAutomation::new(vec![crate::SpeedPoint {
+            from_position: next_start,
+            speed,
+        }])
+        .expect("test speed should validate");
+        let unity_position =
+            next_start + unbounded.source_duration_for_wall_time(next_start, duration);
+        let bounded = crate::SpeedAutomation::new(vec![
+            crate::SpeedPoint {
+                from_position: next_start,
+                speed,
+            },
+            crate::SpeedPoint {
+                from_position: unity_position,
+                speed: 1.0,
+            },
+        ])
+        .expect("bounded test speed should validate");
         TransitionPlan::new(Duration::ZERO, next_start, duration, gain(1.0), gain(1.0))
             .expect("test plan should validate")
-            .with_next_speed_automation(
-                crate::SpeedAutomation::new(vec![crate::SpeedPoint {
-                    from_position: Duration::ZERO,
-                    speed,
-                }])
-                .expect("test speed should validate"),
-            )
+            .with_next_speed_automation(bounded)
     }
 
     fn arm_test_transition(player: &mut PlayerInternal) {
@@ -5500,18 +5532,23 @@ mod tests {
         let stops = Arc::new(AtomicUsize::new(0));
         let mut player = player_internal_with_sink(&runtime, starts, stops);
         let decode_calls = Arc::new(AtomicUsize::new(0));
-        set_ready_secondary(
-            &mut player,
-            next_track_uri(),
-            scripted_source(
+        player.preload = PlayerPreload::Ready {
+            track_id: next_track_uri(),
+            transition: PreloadTransition::Scheduled(speed_transition_plan(
+                Duration::from_millis(100),
+                Duration::ZERO,
+                0.9,
+            )),
+            secondary_trim_frames: 0,
+            source: Box::new(scripted_source(
                 next_track_uri(),
                 0,
                 Box::new(CountingPcmDecoder {
                     calls: decode_calls.clone(),
                     packets_remaining: None,
                 }),
-            ),
-        );
+            )),
+        };
         arm_test_transition(&mut player);
         assert!(
             player
@@ -6072,7 +6109,120 @@ mod tests {
     }
 
     #[test]
-    fn time_stretched_transition_completes_on_wall_clock_and_promotes_at_source_time() {
+    fn promoted_source_matches_normal_load_normalisation_and_gain() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let data = NormalisationData {
+            track_gain_db: -6.0,
+            track_peak: 0.75,
+            album_gain_db: -3.0,
+            album_peak: 0.5,
+        };
+
+        let mut normal = player_internal_with_sink(
+            &runtime,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        normal.config.normalisation = true;
+        normal.config.normalisation_type = NormalisationType::Track;
+        normal.config.normalisation_method = NormalisationMethod::Basic;
+        let mut normal_source =
+            scripted_source(next_track_uri(), 12_000, Box::new(ScriptedDecoder));
+        normal_source.normalisation_data = data;
+        normal.start_playback(next_track_uri(), 8, normal_source, false);
+        let normal_factor = normal
+            .state
+            .source_mut()
+            .expect("normal load should own a source")
+            .normalisation_factor;
+
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut promoted = player_internal_with_sink(&runtime, starts, stops);
+        promoted.config.normalisation = true;
+        promoted.config.normalisation_type = NormalisationType::Track;
+        promoted.config.normalisation_method = NormalisationMethod::Basic;
+        promoted.transition = TransitionEngine::new(1, 1);
+        let mut current = scripted_loaded_track(1_000);
+        current.duration_ms = 6_000;
+        set_playing_source(&mut promoted, track_uri(), current);
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        let mut incoming = scripted_source(
+            next_track_uri(),
+            12_000,
+            Box::new(CountingPcmDecoder {
+                calls: decode_calls.clone(),
+                packets_remaining: None,
+            }),
+        );
+        incoming.normalisation_data = data;
+        promoted.preload = PlayerPreload::Ready {
+            track_id: next_track_uri(),
+            transition: PreloadTransition::Scheduled(scheduled_test_plan()),
+            secondary_trim_frames: 0,
+            source: Box::new(incoming),
+        };
+        promoted
+            .start_secondary_decode()
+            .expect("secondary worker should start");
+        wait_until("secondary queue did not fill", || {
+            decode_calls.load(Ordering::Acquire) >= 9
+        });
+        promoted.arm_transition_if_selected();
+        let _ = promoted
+            .transition
+            .render(
+                AudioPacket::Samples(vec![0.0; 5]),
+                Some(AudioPacket::Samples(vec![0.0; 5])),
+            )
+            .expect("test transition should finish");
+        promoted
+            .complete_crossfade()
+            .expect("source should promote");
+        let promoted_factor = promoted
+            .state
+            .source_mut()
+            .expect("promotion should own a source")
+            .normalisation_factor;
+
+        assert!((normal_factor - 0.501_187_233_627_272_2).abs() < 1e-15);
+        assert_eq!(promoted_factor.to_bits(), normal_factor.to_bits());
+        let mut normal_pcm = [0.8, -0.4];
+        let mut promoted_pcm = normal_pcm;
+        normal.apply_source_normalisation(&mut normal_pcm, normal_factor, 1.0);
+        promoted.apply_source_normalisation(&mut promoted_pcm, promoted_factor, 1.0);
+        assert_eq!(promoted_pcm, normal_pcm);
+    }
+
+    #[test]
+    fn dynamic_limiter_transition_peak_releases_to_ordinary_gain() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let mut player = player_internal_with_sink(
+            &runtime,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        player.config.normalisation = true;
+        player.config.normalisation_method = NormalisationMethod::Dynamic;
+        player.normalisation_knee_factor = 1.0 / (8.0 * player.config.normalisation_knee_db);
+
+        let mut transition_peak = vec![2.0; 2_000];
+        player.apply_global_output_dsp(&mut transition_peak, 1.0);
+        assert!(player.normalisation_peaks.iter().any(|peak| *peak > 0.0));
+
+        let mut ordinary_pcm = vec![0.1; 4 * SAMPLE_RATE as usize];
+        player.apply_global_output_dsp(&mut ordinary_pcm, 1.0);
+        let last = ordinary_pcm.last().copied().unwrap();
+        assert!(
+            last > 0.099_99,
+            "limiter stayed at {last} with peaks {:?} and integrators {:?}",
+            player.normalisation_peaks,
+            player.normalisation_integrators
+        );
+    }
+
+    #[test]
+    fn time_stretched_transition_promotes_at_source_time_without_persistent_dsp() {
         let runtime = tokio::runtime::Runtime::new().expect("test runtime");
         let starts = Arc::new(AtomicUsize::new(0));
         let stops = Arc::new(AtomicUsize::new(0));
@@ -6120,12 +6270,38 @@ mod tests {
 
         let PlayerState::Playing {
             track_id, source, ..
-        } = &player.state
+        } = &mut player.state
         else {
             panic!("time-stretched secondary should be promoted");
         };
         assert_eq!(track_id, &next_track_uri());
         assert_eq!(source.stream_position_ms, 2_853);
+        assert!(!source.decoder.has_transition_time_stretch());
+        let (first_position, first_packet) = source
+            .decoder
+            .next_packet()
+            .expect("promoted decoder should remain usable")
+            .expect("promoted decoder should have PCM");
+        let (second_position, second_packet) = source
+            .decoder
+            .next_packet()
+            .expect("promoted decoder should remain usable")
+            .expect("promoted decoder should have more PCM");
+        assert_eq!(first_position.position_ms, 2_853);
+        let first_samples = first_packet.samples().unwrap();
+        let first_wall_ms =
+            (first_samples.len() / NUM_CHANNELS as usize) as u64 * 1_000 / u64::from(SAMPLE_RATE);
+        assert_eq!(
+            second_position.position_ms,
+            first_position.position_ms + first_wall_ms as u32
+        );
+        assert!(!first_samples.is_empty());
+        assert_eq!(first_samples.len() % NUM_CHANNELS as usize, 0);
+        assert!(first_samples.iter().all(|sample| *sample == 0.25));
+        let second_samples = second_packet.samples().unwrap();
+        assert_eq!(second_samples.len(), 2_048);
+        assert!(second_samples.iter().all(|sample| *sample == 0.25));
+        assert!(!source.decoder.has_transition_time_stretch());
         assert_eq!(player.transition.state(), TransitionState::Idle);
     }
 
@@ -6314,18 +6490,23 @@ mod tests {
         current.transition_attempted = true;
         set_playing_source(&mut player, track_uri(), current);
         let decode_calls = Arc::new(AtomicUsize::new(0));
-        set_ready_secondary(
-            &mut player,
-            next_track_uri(),
-            scripted_source(
+        player.preload = PlayerPreload::Ready {
+            track_id: next_track_uri(),
+            transition: PreloadTransition::Scheduled(speed_transition_plan(
+                Duration::from_millis(100),
+                Duration::ZERO,
+                0.9,
+            )),
+            secondary_trim_frames: 0,
+            source: Box::new(scripted_source(
                 next_track_uri(),
                 0,
                 Box::new(CountingPcmDecoder {
                     calls: decode_calls.clone(),
                     packets_remaining: None,
                 }),
-            ),
-        );
+            )),
+        };
         player
             .start_secondary_decode()
             .expect("secondary worker should start");
@@ -6366,6 +6547,7 @@ mod tests {
         let promoted_request_id = *play_request_id;
         assert_eq!(track_id, &next_track_uri());
         assert!(source.decoder.is_worker());
+        assert!(!source.decoder.has_transition_time_stretch());
         assert_eq!(player.transition.state(), TransitionState::Idle);
         assert_eq!(starts.load(Ordering::Acquire), 0);
         assert_eq!(stops.load(Ordering::Acquire), 0);
@@ -6395,18 +6577,23 @@ mod tests {
         current.transition_attempted = true;
         set_playing_source(&mut player, track_uri(), current);
         let decode_calls = Arc::new(AtomicUsize::new(0));
-        set_ready_secondary(
-            &mut player,
-            next_track_uri(),
-            scripted_source(
+        player.preload = PlayerPreload::Ready {
+            track_id: next_track_uri(),
+            transition: PreloadTransition::Scheduled(speed_transition_plan(
+                Duration::from_millis(100),
+                Duration::ZERO,
+                0.9,
+            )),
+            secondary_trim_frames: 0,
+            source: Box::new(scripted_source(
                 next_track_uri(),
                 0,
                 Box::new(CountingPcmDecoder {
                     calls: decode_calls.clone(),
                     packets_remaining: None,
                 }),
-            ),
-        );
+            )),
+        };
         player
             .start_secondary_decode()
             .expect("secondary worker should start");
@@ -6433,11 +6620,152 @@ mod tests {
 
         assert_eq!(player.transition.state(), TransitionState::Idle);
         assert!(matches!(player.preload, PlayerPreload::None));
+        let PlayerState::Playing {
+            track_id, source, ..
+        } = &mut player.state
+        else {
+            panic!("explicit load should promote the ready worker");
+        };
+        assert_eq!(track_id, &next_track_uri());
+        assert!(source.decoder.is_worker());
+        assert!(!source.decoder.has_transition_time_stretch());
+        let (position, packet) = source
+            .decoder
+            .next_packet()
+            .expect("promoted decoder should remain usable")
+            .expect("promoted decoder should retain raw preload PCM");
+        assert_eq!(position.position_ms, 0);
+        assert!(
+            packet
+                .samples()
+                .unwrap()
+                .iter()
+                .all(|sample| *sample == 0.25)
+        );
+        assert!(!source.decoder.has_transition_time_stretch());
+    }
+
+    #[test]
+    fn cancellation_before_promotion_neutralizes_retained_speed_worker() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let mut player = player_internal_with_sink(
+            &runtime,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(0));
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        player.preload = PlayerPreload::Ready {
+            track_id: next_track_uri(),
+            transition: PreloadTransition::Scheduled(speed_transition_plan(
+                Duration::from_millis(100),
+                Duration::ZERO,
+                0.9,
+            )),
+            secondary_trim_frames: 0,
+            source: Box::new(scripted_source(
+                next_track_uri(),
+                0,
+                Box::new(CountingPcmDecoder {
+                    calls: decode_calls.clone(),
+                    packets_remaining: None,
+                }),
+            )),
+        };
+        player
+            .start_secondary_decode()
+            .expect("secondary worker should start");
+        wait_until("secondary queue did not fill", || {
+            decode_calls.load(Ordering::Acquire) >= 9
+        });
+        player.transition = TransitionEngine::new(8, NUM_CHANNELS as usize);
+        arm_test_transition(&mut player);
+        player.handle_packet(
+            Some((
+                AudioPacketPosition {
+                    position_ms: 0,
+                    skipped: false,
+                },
+                AudioPacket::Samples(vec![1.0; 4 * NUM_CHANNELS as usize]),
+            )),
+            1.0,
+        );
+        assert_eq!(player.transition.state(), TransitionState::Active);
+
+        player.cancel_transition("test cancellation");
+
+        assert_eq!(player.transition.state(), TransitionState::Idle);
         assert!(matches!(
-            &player.state,
-            PlayerState::Playing { track_id, source, .. }
-                if track_id == &next_track_uri() && source.decoder.is_worker()
+            &player.preload,
+            PlayerPreload::Ready { source, .. }
+                if source.decoder.is_worker()
+                    && !source.decoder.has_transition_time_stretch()
         ));
+        player.cancel_secondary_source("test cleanup");
+    }
+
+    #[test]
+    fn explicit_load_before_speed_transition_neutralizes_worker_dsp() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let mut player = player_internal_with_sink(
+            &runtime,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(0));
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        player.preload = PlayerPreload::Ready {
+            track_id: next_track_uri(),
+            transition: PreloadTransition::Scheduled(speed_transition_plan(
+                Duration::from_millis(100),
+                Duration::ZERO,
+                0.9,
+            )),
+            secondary_trim_frames: 0,
+            source: Box::new(scripted_source(
+                next_track_uri(),
+                0,
+                Box::new(CountingPcmDecoder {
+                    calls: decode_calls.clone(),
+                    packets_remaining: None,
+                }),
+            )),
+        };
+        player
+            .start_secondary_decode()
+            .expect("secondary worker should start");
+        wait_until("secondary queue did not fill", || {
+            decode_calls.load(Ordering::Acquire) >= 9
+        });
+        assert_eq!(player.transition.state(), TransitionState::Idle);
+
+        player
+            .handle_command_load(next_track_uri(), None, true, 0)
+            .expect("explicit load should promote ready worker");
+
+        let PlayerState::Playing {
+            track_id, source, ..
+        } = &mut player.state
+        else {
+            panic!("explicit load should promote the ready worker");
+        };
+        assert_eq!(track_id, &next_track_uri());
+        assert!(source.decoder.is_worker());
+        assert!(!source.decoder.has_transition_time_stretch());
+        let (position, packet) = source
+            .decoder
+            .next_packet()
+            .expect("promoted decoder should remain usable")
+            .expect("promoted decoder should retain raw preload PCM");
+        assert_eq!(position.position_ms, 0);
+        assert!(
+            packet
+                .samples()
+                .unwrap()
+                .iter()
+                .all(|sample| *sample == 0.25)
+        );
+        assert!(!source.decoder.has_transition_time_stretch());
     }
 
     #[test]
@@ -6508,18 +6836,23 @@ mod tests {
         let mut player = player_internal_with_sink(&runtime, starts, stops);
         set_playing_source(&mut player, track_uri(), scripted_loaded_track(0));
         let decode_calls = Arc::new(AtomicUsize::new(0));
-        set_ready_secondary(
-            &mut player,
-            next_track_uri(),
-            scripted_source(
+        player.preload = PlayerPreload::Ready {
+            track_id: next_track_uri(),
+            transition: PreloadTransition::Scheduled(speed_transition_plan(
+                Duration::from_millis(100),
+                Duration::ZERO,
+                0.9,
+            )),
+            secondary_trim_frames: 0,
+            source: Box::new(scripted_source(
                 next_track_uri(),
                 0,
                 Box::new(CountingPcmDecoder {
                     calls: decode_calls.clone(),
                     packets_remaining: None,
                 }),
-            ),
-        );
+            )),
+        };
         player
             .start_secondary_decode()
             .expect("secondary worker should start");
@@ -6532,7 +6865,10 @@ mod tests {
         let finished = player
             .state
             .source_mut()
-            .and_then(|source| source.decoder.worker_finished())
+            .and_then(|source| {
+                assert!(!source.decoder.has_transition_time_stretch());
+                source.decoder.worker_finished()
+            })
             .expect("current source should remain worker-backed");
         let _guard = runtime.enter();
 
@@ -7072,6 +7408,65 @@ mod tests {
                 ..
             } if restarted == &track_id && restarted_plan == &transition_plan
         ));
+    }
+
+    #[test]
+    fn replacement_session_discards_speed_worker_and_restarts_preload() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        let track_id = SpotifyUri::from_uri("spotify:local:test:test:test:100")
+            .expect("test local URI should be valid");
+        let transition_plan =
+            speed_transition_plan(Duration::from_millis(100), Duration::ZERO, 0.9);
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        player.preload = PlayerPreload::Ready {
+            track_id: track_id.clone(),
+            transition: PreloadTransition::Scheduled(transition_plan.clone()),
+            secondary_trim_frames: 0,
+            source: Box::new(scripted_source(
+                track_id.clone(),
+                0,
+                Box::new(CountingPcmDecoder {
+                    calls: decode_calls.clone(),
+                    packets_remaining: None,
+                }),
+            )),
+        };
+        player
+            .start_secondary_decode()
+            .expect("secondary worker should start");
+        wait_until("secondary queue did not fill", || {
+            decode_calls.load(Ordering::Acquire) >= 9
+        });
+        let finished = match &player.preload {
+            PlayerPreload::Ready { source, .. } => {
+                assert!(source.decoder.has_transition_time_stretch());
+                source
+                    .decoder
+                    .worker_finished()
+                    .expect("preload should be worker-backed")
+            }
+            _ => panic!("speed preload should be ready"),
+        };
+        player.session.shutdown();
+
+        let replacement = session(&runtime);
+        let _guard = runtime.enter();
+        player.handle_set_session(replacement);
+
+        assert!(matches!(
+            &player.preload,
+            PlayerPreload::Loading {
+                track_id: restarted,
+                transition: PreloadTransition::Scheduled(restarted_plan),
+                ..
+            } if restarted == &track_id && restarted_plan == &transition_plan
+        ));
+        wait_until("replaced speed worker did not stop", || {
+            finished.load(Ordering::Acquire)
+        });
     }
 
     #[test]

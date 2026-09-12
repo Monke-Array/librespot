@@ -1,198 +1,125 @@
 # Current objective
 
-Implement the approved offline vocal-evidence path without proxy labels or
-coverage-driven calibration. Collision semantics, the deterministic trace
-layer, FeatureSnapshot/v3, and collision-local M2 duck ownership are complete.
-Separator feasibility is complete; detector calibration is paused at the
-required independent human-annotation gate. No second-set rendering occurred.
+Make the existing live transition runtime correct and safe for an RPI-01 build.
+This is bug-fix-only work: no new transition family, generator/ranking change,
+blind-test UI, lossless work, or transition-quality tuning.
 
-# Branch / normative baselines
+# Branch / baseline
 
 - Branch: `codex/m3a-live-auto-metadata`.
-- Formal specification: `25da884a0c2e648d9cf86fc938d3efade827f389`.
-- Approved implementation plan: `01818f0145da91ca00b96e76c61001d3e195c262`.
-- M3 gate/state: `449dc7f`.
-- Task 20 Pilot V1 audit: `e399875`.
-- Task 21 feature snapshot schema: `aeb76da`.
-- Initial Task-22 extractor: `18e2d35`.
-- Task-22 rhythm/collision follow-up: `f246f20`.
-- Large FFmpeg pipe deadlock fix: `7b9f115`.
-- Vocal-evidence implementation plan: `e922747`.
-- Vocal collision semantic clarification: `79b86d7`.
-- Deterministic vocal trace layer: `f622b4c`.
-- FeatureSnapshot/v3 and M2 collision-local migration: `5412a6e`.
+- RPI-01 deployed baseline at session start:
+  `af58ae155c33c299aa56b7844b4337eb2abe96e3`.
+- The working tree was clean at that baseline before this task.
+- RPI-01 was not edited or deployed during this task; U-01 remains source of
+  truth.
 
 # Architecture and invariants
 
-- `tools/transition-operator` remains a standalone offline crate with no root
-  workspace, librespot playback, or connect dependency.
-- Data flow remains audio-derived feature snapshot -> deterministic M2
-  candidates -> validated OperatorPlan -> certified M3 render/QC.
-- `safe_crossfade/v1` is the fallback/control, not the rich musical target.
-- The extractor does not fabricate missing values. Vocal activity/collision is
-  absent because Task 20 found no reusable frozen Pilot V1 semantic source.
-- No critic, Pilot V2 freeze/evaluator, M5/M6, runtime integration, RPI work,
-  new transition family, or arbitrary DSP graph was started.
+- Mixer/local-Auto and non-Mixer normal-crossfade routes remain distinct.
+- Incoming speed automation uses absolute source-track time. Transition overlap
+  duration uses wall-clock time and must be converted before placing its unity
+  endpoint.
+- `SecondaryDecodeWorker` owns transition time stretching while preloaded.
+- Completion, retained-source cancellation, or worker-backed promotion must
+  retire time stretching synchronously and non-blockingly before ordinary
+  playback owns the source.
+- Promotion retains decoded raw PCM and the nominal source clock; it does not
+  reload the promoted track or join the decoder thread.
+- Source normalization is applied once before mixing. Master volume and dynamic
+  limiting are applied once after mixing.
 
-# Task 20 / Task 21
+# Confirmed root causes and fixes
 
-- The S-01 evidence audit found Pilot V1 BPM/downbeat/cue-confidence and peak
-  fields unsuitable for direct reuse: peak was mono sample peak, cue confidence
-  was a fixed constant, and downbeats included a synthetic fallback. These are
-  recomputed in v2; vocal remains absent.
-- `transition-feature-snapshot/3` is strict, hashed, fixed-unit, absence-based,
-  and adds only modality-specific collision intervals and local strengths.
-- No contradiction was found between the frozen evidence and the approved M4
-  plan/specification.
+- P0 persistent DSP leak: local Auto emitted one non-unity incoming speed point.
+  `SpeedAutomation::speed_at()` correctly holds the latest point indefinitely,
+  so the promoted worker retained non-unity WSOLA for the rest of the track.
+- Fix: local Auto now adds a 1.0 point at
+  `start_b + source_duration_for_wall_time(start_b, overlap_wall_duration)`.
+  For the captured oracle this is 8263.003226995468 ms, not
+  `start_b + overlap_duration`.
+- P0 ownership leak: the same worker/time-stretch processor was promoted or
+  retained after transition cancellation without any retirement boundary.
+- Fix: completion and every cancellation path that retains the preload call one
+  centralized retirement path. It immediately removes WSOLA, preserves bounded
+  decoded raw lookahead, hands off at the nominal automation clock, and chooses
+  only a correlation-window-equivalent raw grain to avoid a large waveform
+  step. No worker join, decoder reload, or blocking decode occurs.
+- P1 session-replacement leak: a ready secondary worker, unlike a loading
+  preload, survived replacement of its invalid owning Spotify session. It could
+  retain transition DSP and continue decoding through obsolete session state.
+- Fix: replacement now invalidates both loading and ready secondary preloads,
+  advances their generation, drops any worker, and restarts the same track and
+  transition preload on the replacement session.
+- The leaked processor explains persistent speed/pitch and can alter apparent
+  level beyond the transition. Independent tests found no persistent gain-curve
+  or per-source-normalization leak.
 
-# Minimum Task-22 extractor
+# Loudness findings
 
-- Canonical input is complete s16le stereo 44.1 kHz PCM with exact PCM identity.
-- Whole-source true peak uses the M3 BS.1770 4x implementation.
-- Rhythm uses 10 ms positive RMS-dB flux and a 40-240 BPM autocorrelation search.
-  Confidence is based on selected-peak prominence over the lag-distribution p90,
-  with explicit monotone anchors. Four-beat phase confidence is independent and
-  has no synthetic fallback.
-- Synthetic strong periodic/accented, uniform-meter-ambiguous, silence,
-  monotonic calibration, repeatability, and invalid-input cases are covered.
-- Cue-relative transient collision is temporal onset intersection-over-union,
-  not the geometric mean of aggregate transient activity. Aligned, partial, and
-  displaced onset vectors have adversarial coverage.
-- Windows measure transient, bass, three-band occupancy/stability, energy mean
-  and variability. Geometry proposal remains deterministic and bounds-safe.
-- Frozen extractor algorithm hash is recorded in the synthetic fixture and in
-  every private feature snapshot.
+- A promoted source and the same normally loaded source compute bit-identical
+  Basic/Track normalization factors and identical normalized PCM.
+- `TransitionEngine::complete()` and cancellation reset gain curves/spec/frame
+  state; later single-source PCM is exact passthrough.
+- Dynamic normalization/limiter state is intentionally global ordinary output
+  DSP. A transition peak decays back to ordinary gain; it is bounded and is not
+  transition gain automation.
+- Master volume is not applied twice: source normalization precedes mixing and
+  global volume/limiting follows it.
 
-# First private listening set
+# Regression coverage
 
-- Private directory (outside Git):
-  `C:\Users\janni\Desktop\spotify-transition-listening-demo-20260910`.
-- Four pairs were selected deterministically before transition rendering from a
-  20-track order-statistic pool under the authorized Downloads root.
-- Complete M2 candidate counts are 16, 25, 9, and 9.
-- Rendered family sets are respectively:
-  - pair 01: safe crossfade, shaped handoff, bass handoff;
-  - pair 02: safe crossfade, shaped handoff, bass handoff, spectral handoff;
-  - pair 03: safe crossfade, shaped handoff, spectral handoff;
-  - pair 04: safe crossfade, shaped handoff, spectral handoff.
-- One lowest-candidate-ID representative per applicable family was selected,
-  then presentation order was deterministically hash-shuffled.
-- Thirteen blind 36-second FLACs passed M3 validation, rendering, encode/decode
-  PCM identity, and QC. There were zero render/QC failures.
-- A safe control and one rich sample were rendered twice with identical FLAC
-  bytes and decoded PCM hashes.
-- Private snapshots, full candidate sets, the private manifest, source names,
-  and unblinding file remain only in the private directory outside Git.
+- Local-Auto speed has a mathematically correct unity endpoint in source time.
+- Bounded speed changes duration only in its region and preserves post-region
+  pitch.
+- Promotion immediately removes time stretching, retains raw PCM, and keeps
+  unity source-position increments.
+- Raw handoff before first emission is lossless; active handoff is bounded and
+  avoids a large waveform discontinuity.
+- Cancellation before promotion, active manual-next promotion, current EOF,
+  seek/reload, session replacement, and dropped-secondary cancellation do not
+  retain speed DSP.
+- Promoted and normally loaded normalization/gain behavior match.
+- Completed transition gain curves cannot affect later PCM.
+- Normal crossfade/no-speed behavior continues to use the existing path.
 
-# Second vocabulary applicability audit
+# Related audit
 
-- Private directory (outside Git):
-  `C:\Users\janni\Desktop\spotify-transition-listening-demo-v2-20260910`.
-- First-set qualitative observations are recorded privately at pair granularity
-  only. They contain no candidate labels and are not approved training data.
-- The audit used the approved FeatureSnapshot/v2 extractor and real M2 generator
-  over all 4,290 directed distinct-track pairs in the authorized 66-track
-  Downloads corpus. All 4,290 pairs produced a snapshot and candidate set.
-- Applicable-pair counts are: safe crossfade 4,290; shaped handoff 600; beat cut
-  0; bass handoff 51; spectral handoff 492; ducked overlap 0; echo-tail handoff
-  0; energy ramp 18; rhythmic handoff 0.
-- Beat cut, echo-tail handoff, and rhythmic handoff are unreachable with the
-  current approved extractor because they require outgoing vocal evidence. The
-  extractor intentionally omits vocal evidence and required missing values fail
-  closed; absence may not be interpreted as vocal-free.
-- Ducked overlap is also absent: vocal collision is unavailable and measured
-  cue-relative transient IoU spans 16,934–269,544 ppm, below the localized
-  collision band beginning at 300,000 ppm. Existing adversarial vectors show
-  the IoU metric can reach the band, so this is a real-corpus calibration gap,
-  not an implementation defect. No threshold changed.
-- Energy ramp is honestly applicable to 18 pairs. Eleven emit a distinct M2
-  candidate; in seven negative-delta cases second-based plans deduplicate with
-  shaped-handoff audio semantics while bar/filter recipes lack compatible
-  rhythm geometry.
-- The mandated zero-family stop fired before selection/rendering. The v2
-  directory contains audit evidence and zero audio samples; no unblinding or
-  ratings template was created.
-
-# Defects discovered and fixed
-
-- Prior ~3.7 GB usage came from retaining 20 complete decoded `f64` stereo PCM
-  buffers inside `SignalFeatures`: the actual pool represented 3,252,838,400
-  bytes (3.03 GiB) before allocator/renderer overhead. The private harness now
-  retains only small immutable rhythm/identity summaries, releases each pool
-  PCM immediately, and re-decodes only one selected pair at a time. Observed
-  rendering working set was about 415 MiB.
-- Real non-unity time stretching exposed a bidirectional pipe deadlock: the M3
-  backend wrote multi-megabyte stdin before draining FFmpeg stdout. The backend
-  now feeds stdin on a scoped writer while stdout/stderr are collected. A 4 MiB
-  regression test hung before the fix and completes after it. DSP semantics and
-  render identities were not changed.
-
-# Vocal evidence implementation
-
-- Vocal activity is occupancy of positive 441-frame hops whose centers lie in
-  the clipped half-open FeatureWindow. Missing evidence remains missing.
-- Pair vocal collision is simultaneous-positive occupancy over the explicitly
-  frozen `[-110250, -22050)` transition-relative interval. The 300k/700k M2
-  thresholds therefore mean 0.6/1.4 seconds of simultaneous evidence.
-- The earliest longest simultaneous-positive island supplies the vocal
-  collision span/interval. Duck ownership compares mean calibrated modality
-  strength within that island; whole-window occupancy cannot choose the target.
-- Vocal-vocal and transient-transient measurements have separate intervals and
-  strengths. `ducked_overlap` now requires both modalities known, so unknown
-  vocal evidence cannot enable transient-only ducking.
-- OperatorPlan/v1 operations, DSP recipes, thresholds, scoring, runtime,
-  playback, RPI, and energy-ramp semantics are unchanged. Historical v2 plan
-  references remain structurally readable; new M2 generation requires v3.
-- Synthetic trace tests cover exact 200k/300k/700k boundaries and adjacent
-  hops, clipping, negative relative frames, unequal rate mapping, empty and
-  unknown evidence, disjoint islands, earliest-longest selection, collision
-  strengths, and deterministic provenance hashes.
-
-# Separator feasibility
-
-- S-01 was woken by this task. Its GPU driver was unavailable, so all separator
-  measurements were CPU-only in isolated Python 3.10.21 environments.
-- Spleeter 2.4.2 was rejected: 0.0565x wall/audio was fast, but one bounded
-  singing track peaked at 4,042,080 KiB (3.85 GiB), materially over the approved
-  approximately 2 GiB gate.
-- HTDemucs (`demucs==4.0.1`, `torch==2.2.2+cpu`, model hash recorded in
-  `docs/TRANSITION_VOCAL_SEPARATOR_FEASIBILITY.md`) passed feasibility on
-  singing, dense rap, and transient-heavy instrumental challenges: 0.302-0.308x
-  wall/audio and 1,725,356-2,030,896 KiB peak RSS.
-- Two independent singing runs produced the same float32 vocal-stem hash.
-- HTDemucs is not yet accepted as the extractor. The required independent
-  human-audible calibration/holdout annotations are absent. The public Jamendo
-  VAD archive returned HTTP 403 from the available network and does not split
-  singing/rap/spoken labels. No proxy labels, detector threshold, production
-  separator code, full-corpus traces, or post-vocal M2 coverage were created.
+- Existing deterministic tests cover transition state progression and illegal
+  operations, exact frame completion, mid-packet starts, unaligned PCM,
+  underrun, current/secondary EOF and decoder errors, worker backpressure and
+  cancellation, stale generations, promotion without double load, seek/load/
+  stop, pause/resume, recovery, session replacement, and normal crossfade.
+- Connect tests cover stale local-Auto results, context/edge identity, official
+  transition precedence, repeated preload, canonical/playable identities,
+  malformed metadata, unsupported DSP fail-closed behavior, and queue terminal
+  event de-duplication.
+- No additional provable deployment bug beyond the three fixes above was found
+  in these audited boundaries.
 
 # Verification
 
-- Focused current suite: 12/12 feature, 13/13 generator, 15/15 template, and
-  5/5 vocal-trace tests pass.
-- Complete standalone transition-operator suite passes, including 5/5 time
-  stretch tests and 16/16 renderer tests; one performance characterization is
-  intentionally ignored.
-- Standalone formatting and all-target Clippy with `-D warnings` pass.
-- All 13 private FLACs are non-empty, match recorded container hashes, decode
-  successfully in pinned FFmpeg, and report the exact 1,587,600-frame window.
-- All listening samples map uniquely to candidates in the preserved full M2
-  candidate sets. M3 recorded decoded PCM hashes and QC measurements.
-- The second audit independently recounts 4,290 pair rows with zero failures and
-  matches every recorded family count. Private manifest artifact hashes match.
-- Fresh 2026-09-10 checks pass: transition-operator formatting, all-target
-  Clippy with `-D warnings`, and its complete suite (including 12 feature, 13
-  generator, 14 template, and 16 renderer tests); root workspace formatting and
-  checking; 83 playback tests; and 113 connect unit tests plus 5 oracle tests.
-- The second audit retained at most two four-track decoded blocks. Measured peak
-  working set was 1,929,699,328 bytes (1,840.30 MiB); full-corpus PCM was never
-  retained.
-- No runtime/playback source, private music, private source filename, private
-  manifest, or rendered audio is tracked by the repository.
+- Pre-change baseline: playback 83/83 passed; connect 113 unit + 5 oracle + 1
+  doctest passed.
+- Current playback suite: 93/93 unit tests and doctests passed.
+- Current connect suite: 113 unit + 5 oracle + 1 doctest passed.
+- `cargo check --workspace` passed.
+- Playback/connect all-target Clippy passed with `-D warnings` after explicitly
+  allowing six verified pre-existing lints (`int-plus-one`,
+  `too-many-arguments`, `large-enum-variant`, `if-same-then-else`,
+  `excessive-precision`, and `type-complexity`).
+- Fresh final `cargo fmt --all -- --check`, playback, and connect suite runs
+  passed immediately before the deployable commit gate.
+
+# Unresolved issues
+
+- No confirmed transition-runtime correctness issue from this session remains.
+- Live audible confirmation on RPI-01 is still a post-build deployment gate,
+  not a source-code blocker.
+- The RPI-01 spotifyd build needs at least 2 GB swap available; preserve that
+  requirement when executing the next action.
 
 # NEXT ACTION
 
-Obtain track-disjoint human vocal-activity annotations that separately cover
-singing, rap, and spoken delivery, then calibrate HTDemucs-derived activity on
-calibration only and run the untouched holdout gates before any production
-extractor integration or M2 coverage audit.
+Ensure RPI-01 has at least 2 GB swap, build spotifyd with all eight librespot
+crates pinned to the final commit, deploy that exact binary, and run one logged
+live transition repro.
