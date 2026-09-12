@@ -18,6 +18,51 @@ pub(crate) fn log_context_json(source: &str, json: &str) {
 }
 
 pub(crate) fn log_player_command_json(json: &str) {
+    if crate::runtime_trace::enabled() {
+        if let Ok(root) = serde_json::from_str::<Value>(json) {
+            let command = &root["command"];
+            // Allowlist avoids logging credentials, context URLs, or arbitrary metadata.
+            let mut fields = Map::new();
+            for name in [
+                "endpoint",
+                "signal_id",
+                "value",
+                "position",
+                "relative",
+                "session_id",
+                "queue_revision",
+                "shuffling_context",
+                "repeating_context",
+                "repeating_track",
+            ] {
+                if let Some(value) = command.get(name) {
+                    if value.to_string().len() <= 256 {
+                        fields.insert(name.into(), value.clone());
+                    }
+                }
+            }
+            for (label, value) in [
+                ("message_id", &root["message_id"]),
+                ("command_id", &command["logging_params"]["command_id"]),
+            ] {
+                if value.to_string().len() <= 256 {
+                    fields.insert(label.into(), value.clone());
+                }
+            }
+            crate::runtime_trace!("dealer_command={}", Value::Object(fields));
+            if command["signal_id"] == "automix-preview" {
+                if let Some(parameters) = command["parameters"].as_str() {
+                    if parameters.len() <= 16384
+                        && parameters
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b))
+                    {
+                        crate::runtime_trace!("preview_parameters={parameters}");
+                    }
+                }
+            }
+        }
+    }
     if !enabled() {
         return;
     }

@@ -28,6 +28,7 @@ pub mod mercury;
 mod mix_debug;
 pub mod packet;
 mod proxytunnel;
+pub mod runtime_trace;
 pub mod session;
 mod socket;
 #[allow(dead_code)]

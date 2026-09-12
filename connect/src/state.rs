@@ -497,6 +497,24 @@ impl ConnectState {
         self.request.last_command_sent_by_device_id = command.sent_by_device_id;
     }
 
+    pub(super) fn trace_runtime_queue(&self, reason: &str) {
+        crate::core::runtime_trace!(
+            "queue reason={reason:?} message_id={} context={} current={} next={:?} queue_first={:?} queue_len={} shuffle={} repeat_track={} repeat_context={}",
+            self.request.last_command_message_id,
+            self.context_uri(),
+            self.current_track(|t| &t.uri),
+            self.preview_next_provided_track()
+                .map(|t| (&t.uri, &t.uid, &t.provider)),
+            self.next_tracks()
+                .first()
+                .map(|t| (&t.uri, &t.uid, &t.provider)),
+            self.next_tracks().len(),
+            self.player().options.shuffling_context,
+            self.repeat_track(),
+            self.repeat_context()
+        );
+    }
+
     pub fn set_now(&mut self, now: u64) {
         self.request.client_side_timestamp = now;
 

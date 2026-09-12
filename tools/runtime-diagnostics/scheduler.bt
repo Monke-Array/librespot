@@ -1,0 +1,45 @@
+// Use: sudo bpftrace scheduler.bt <current spotifyd PID>
+// No kernel BTF required. Maps are bounded by spotifyd's thread population.
+tracepoint:sched:sched_switch
+/pid == $1/
+{
+    @known[tid] = 1;
+    @off[tid] = nsecs;
+    @state[tid] = args->prev_state;
+    @stack[tid] = kstack(12);
+    if (args->prev_state == 0) { @wake[tid] = nsecs; }
+}
+
+tracepoint:sched:sched_wakeup
+/@known[args->pid]/
+{
+    if (!@wake[args->pid]) { @wake[args->pid] = nsecs; }
+}
+
+tracepoint:sched:sched_switch
+/@known[args->next_pid]/
+{
+    $t = args->next_pid;
+    if (@wake[$t]) {
+        $delay = (nsecs - @wake[$t]) / 1000;
+        if ($delay >= 2000) {
+            printf("mono_ns=%llu tid=%d runnable_us=%llu\n", nsecs, $t, $delay);
+        }
+    }
+    if (@off[$t]) {
+        $off = (nsecs - @off[$t]) / 1000;
+        if ($off >= 50000) {
+            printf("mono_ns=%llu tid=%d offcpu_us=%llu state=%d stack=%s\n",
+                nsecs, $t, $off, @state[$t], @stack[$t]);
+        }
+    }
+    delete(@off[$t]); delete(@wake[$t]); delete(@state[$t]); delete(@stack[$t]);
+}
+
+tracepoint:sched:sched_process_exit
+/pid == $1/
+{
+    delete(@known[tid]); delete(@off[tid]); delete(@wake[tid]); delete(@state[tid]); delete(@stack[tid]);
+}
+
+END { clear(@known); clear(@off); clear(@wake); clear(@state); clear(@stack); }

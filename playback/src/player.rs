@@ -1777,7 +1777,7 @@ impl PlayerInternal {
             return Box::pin(futures_util::future::ready(outcome));
         }
 
-        Box::pin(self.load_track(track_id, position_ms, true))
+        Box::pin(self.load_track(track_id, position_ms, true, "recovery"))
     }
 
     fn cancel_recovery(&mut self, reason: &str) {
@@ -2202,7 +2202,14 @@ impl Future for PlayerInternal {
                 {
                     let track_id = track_id.clone();
                     let normalisation_factor = source.normalisation_factor;
-                    match source.decoder.next_packet() {
+                    let result = {
+                        let _timing = crate::core::runtime_trace::SlowOperation::new(
+                            "current_decoder_next_packet",
+                            10,
+                        );
+                        source.decoder.next_packet()
+                    };
+                    match result {
                         Ok(result) => {
                             if let Some((ref packet_position, ref packet)) = result {
                                 let new_stream_position_ms = packet_position.position_ms;
@@ -2386,6 +2393,13 @@ impl PlayerInternal {
     }
 
     fn cancel_secondary_source(&mut self, reason: &str) {
+        crate::core::runtime_trace!(
+            "cancel_secondary player={} generation={} track={:?} reason={reason:?}",
+            self.player_id,
+            self.secondary_generation,
+            self.preload.track_id()
+        );
+        let _timing = crate::core::runtime_trace::SlowOperation::new("cancel_secondary_source", 10);
         self.transition.cancel(reason);
         let preload = mem::replace(&mut self.preload, PlayerPreload::None);
         if !matches!(preload, PlayerPreload::None) {
@@ -2403,6 +2417,13 @@ impl PlayerInternal {
     }
 
     fn cancel_transition(&mut self, reason: &str) {
+        crate::core::runtime_trace!(
+            "cancel_transition player={} generation={} track={:?} reason={reason:?}",
+            self.player_id,
+            self.secondary_generation,
+            self.preload.track_id()
+        );
+        let _timing = crate::core::runtime_trace::SlowOperation::new("cancel_transition", 10);
         self.transition.cancel(reason);
         if let PlayerPreload::Ready { source, .. } = &mut self.preload {
             if let Some(position_ms) = source.decoder.finish_transition_dsp() {
@@ -2441,6 +2462,11 @@ impl PlayerInternal {
         };
 
         let generation = self.next_secondary_generation();
+        crate::core::runtime_trace!(
+            "worker_create player={} generation={generation} track={:?} speed={speed_automation:?} pcm_capacity={pcm_channel_capacity}",
+            self.player_id,
+            self.preload.track_id()
+        );
         let PlayerPreload::Ready {
             track_id, source, ..
         } = &mut self.preload
@@ -2668,6 +2694,8 @@ impl PlayerInternal {
         play: bool,
         position_ms: u32,
     ) -> Result<bool, Error> {
+        let _timing =
+            crate::core::runtime_trace::SlowOperation::new("promote_preloaded_source", 10);
         let PlayerPreload::Ready {
             track_id, source, ..
         } = &self.preload
@@ -2710,6 +2738,15 @@ impl PlayerInternal {
             // This may be blocking, exactly as in the existing preloaded-track path.
             source.stream_position_ms = source.decoder.seek(position_ms)?;
         }
+
+        crate::core::runtime_trace!(
+            "promote player={} generation={} play_request_id={play_request_id} track={track_id} playable={} position_ms={} worker={}",
+            self.player_id,
+            self.secondary_generation,
+            source.audio_item.uri,
+            source.stream_position_ms,
+            source.decoder.is_worker()
+        );
 
         debug!("Secondary promoted for <{track_id}>");
         self.start_playback(track_id, play_request_id, *source, play);
@@ -3258,6 +3295,7 @@ impl PlayerInternal {
     }
 
     fn write_sink_packet(&mut self, packet: AudioPacket) -> bool {
+        let _timing = crate::core::runtime_trace::SlowOperation::new("sink_write", 100);
         if let Err(e) = self.sink.write(packet, &mut self.converter) {
             error!("{e}");
             self.handle_pause();
@@ -3372,6 +3410,7 @@ impl PlayerInternal {
     }
 
     fn complete_crossfade(&mut self) -> PlayerResult {
+        let _timing = crate::core::runtime_trace::SlowOperation::new("complete_crossfade", 10);
         if !matches!(self.state, PlayerState::Playing { .. })
             || !matches!(self.preload, PlayerPreload::Ready { .. })
         {
@@ -3407,6 +3446,13 @@ impl PlayerInternal {
         debug!(
             "[transition] promoting incoming source outgoing_position_ms={} incoming_position_ms={} normalisation_factor={} transition_dsp_active=false",
             old_source.stream_position_ms, source.stream_position_ms, source.normalisation_factor
+        );
+        crate::core::runtime_trace!(
+            "transition_promote player={} generation={} outgoing={old_track_id} incoming={track_id} playable={} position_ms={}",
+            self.player_id,
+            self.secondary_generation,
+            source.audio_item.uri,
+            source.stream_position_ms
         );
         drop(old_source);
         let play_request_id = self.play_request_id_generator.get();
@@ -3734,8 +3780,9 @@ impl PlayerInternal {
         self.cancel_secondary_source("preload moved or superseded by current load");
 
         // If we don't have a loader yet, create one from scratch.
-        let loader = loader
-            .unwrap_or_else(|| Box::pin(self.load_track(track_id.clone(), position_ms, true)));
+        let loader = loader.unwrap_or_else(|| {
+            Box::pin(self.load_track(track_id.clone(), position_ms, true, "current"))
+        });
 
         // Set ourselves to a loading state.
         self.state = PlayerState::Loading {
@@ -3750,6 +3797,11 @@ impl PlayerInternal {
     }
 
     fn handle_command_preload(&mut self, track_id: SpotifyUri, transition: PreloadTransition) {
+        crate::core::runtime_trace!(
+            "preload_request player={} generation={} target={track_id} transition={transition:?}",
+            self.player_id,
+            self.secondary_generation
+        );
         if self.recovery.is_some() || self.network_health != RecoveryHealth::Healthy {
             debug!(
                 "Deferring preload of <{track_id}> while current-track networking is degraded or recovering"
@@ -3803,7 +3855,7 @@ impl PlayerInternal {
             debug!(
                 "[transition] secondary preload start track=<{track_id}> position_ms={position_ms}"
             );
-            let loader = self.load_track(track_id.clone(), position_ms, true);
+            let loader = self.load_track(track_id.clone(), position_ms, true, "secondary");
             self.preload = PlayerPreload::Loading {
                 track_id,
                 transition,
@@ -4008,7 +4060,12 @@ impl PlayerInternal {
                 debug!(
                     "Restarting in-flight load for <{track_id}> at {position_ms} ms on replacement session"
                 );
-                let loader = Box::pin(self.load_track(track_id.clone(), position_ms, true));
+                let loader = Box::pin(self.load_track(
+                    track_id.clone(),
+                    position_ms,
+                    true,
+                    "session_current",
+                ));
                 self.state = PlayerState::Loading {
                     track_id,
                     play_request_id,
@@ -4037,7 +4094,12 @@ impl PlayerInternal {
                 debug!(
                     "Restarting in-flight secondary preload for <{track_id}> at {position_ms} ms on replacement session"
                 );
-                let loader = Box::pin(self.load_track(track_id.clone(), position_ms, true));
+                let loader = Box::pin(self.load_track(
+                    track_id.clone(),
+                    position_ms,
+                    true,
+                    "session_secondary",
+                ));
                 self.preload = PlayerPreload::Loading {
                     track_id,
                     transition,
@@ -4048,6 +4110,14 @@ impl PlayerInternal {
     }
 
     fn handle_command(&mut self, cmd: PlayerCommand) -> PlayerResult {
+        let _timing = crate::core::runtime_trace::SlowOperation::new("player_command", 10);
+        crate::core::runtime_trace!(
+            "player_command player={} session={} generation={} command={cmd:?} preload={:?}",
+            self.player_id,
+            self.session.session_id(),
+            self.secondary_generation,
+            self.preload.track_id()
+        );
         debug!("command={cmd:?}");
         match cmd {
             PlayerCommand::Load {
@@ -4158,6 +4228,43 @@ impl PlayerInternal {
     }
 
     fn send_event(&mut self, event: PlayerEvent) {
+        if crate::core::runtime_trace::enabled() {
+            match &event {
+                PlayerEvent::TrackChanged {
+                    track_id,
+                    audio_item,
+                    ..
+                } => {
+                    crate::core::runtime_trace!(
+                        "track_changed player={} canonical={track_id} playable={}",
+                        self.player_id,
+                        audio_item.uri
+                    );
+                }
+                PlayerEvent::Preloading {
+                    track_id,
+                    playable_uri,
+                    ..
+                } => {
+                    crate::core::runtime_trace!(
+                        "preload_ready player={} generation={} canonical={track_id} playable={playable_uri}",
+                        self.player_id,
+                        self.secondary_generation
+                    );
+                }
+                PlayerEvent::Loading { .. }
+                | PlayerEvent::Playing { .. }
+                | PlayerEvent::EndOfTrack { .. }
+                | PlayerEvent::LoadFailed { .. }
+                | PlayerEvent::PlayRequestIdChanged { .. } => {
+                    crate::core::runtime_trace!(
+                        "player_event player={} event={event:?}",
+                        self.player_id
+                    );
+                }
+                _ => {}
+            }
+        }
         self.event_senders
             .retain(|sender| sender.send(event.clone()).is_ok());
     }
@@ -4167,6 +4274,7 @@ impl PlayerInternal {
         spotify_uri: SpotifyUri,
         position_ms: u32,
         prebuffer: bool,
+        role: &'static str,
     ) -> impl FusedFuture<Output = Result<PlaybackSource, PlayerLoadError>> + Send + 'static {
         // This method creates a future that returns the loaded stream and associated info.
         // Ideally all work should be done using asynchronous code. However, seek() on the
@@ -4174,6 +4282,14 @@ impl PlayerInternal {
         // easily. Instead we spawn a thread to do the work and return a one-shot channel as the
         // future to work with.
 
+        static LOAD_ID: AtomicUsize = AtomicUsize::new(1);
+        let load_id = LOAD_ID.fetch_add(1, Ordering::Relaxed);
+        crate::core::runtime_trace!(
+            "loader_create id={load_id} player={} session={} generation={} role={role} track={spotify_uri} position_ms={position_ms}",
+            self.player_id,
+            self.session.session_id(),
+            self.secondary_generation
+        );
         let loader = PlayerTrackLoader {
             session: self.session.clone(),
             config: self.config.clone(),
@@ -4190,8 +4306,19 @@ impl PlayerInternal {
         let handle = tokio::runtime::Handle::current();
 
         let load_handle = thread::spawn(move || {
+            let started = Instant::now();
+            crate::core::runtime_trace!(
+                "loader_start id={load_id} role={role} track={spotify_uri}"
+            );
             let session = loader.session.clone();
             let mut data = handle.block_on(loader.load_track(spotify_uri, position_ms));
+            crate::core::runtime_trace!(
+                "loader_metadata_ready id={load_id} role={role} elapsed_us={} result={:?}",
+                started.elapsed().as_micros(),
+                data.as_ref()
+                    .map(|s| &s.audio_item.uri)
+                    .map_err(|e| &e.kind)
+            );
 
             if worker_cancelled.load(Ordering::Acquire) {
                 if let Ok(loaded_track) = data.as_ref() {
@@ -4241,6 +4368,14 @@ impl PlayerInternal {
                 .lock()
                 .expect(LOAD_HANDLES_POISON_MSG)
                 .take();
+            crate::core::runtime_trace!(
+                "loader_result id={load_id} role={role} elapsed_us={} cancelled={} result={:?}",
+                started.elapsed().as_micros(),
+                worker_cancelled.load(Ordering::Acquire),
+                data.as_ref()
+                    .map(|s| &s.audio_item.uri)
+                    .map_err(|e| &e.kind)
+            );
             let _ = result_tx.send(data);
 
             let mut load_handles = load_handles_clone.lock().expect(LOAD_HANDLES_POISON_MSG);

@@ -1,17 +1,29 @@
 # Current objective
 
-Make the existing live transition runtime correct and safe for an RPI-01 build.
-This is bug-fix-only work: no new transition family, generator/ranking change,
-blind-test UI, lossless work, or transition-quality tuning.
+Investigate live xruns, dual loads, queue authority, and automix-preview.
+No speculative playback fixes, generator integration, lossless, or UI work.
+Session plan: `docs/superpowers/plans/2026-09-12-live-runtime-investigation.md`.
 
 # Branch / baseline
 
 - Branch: `codex/m3a-live-auto-metadata`.
-- RPI-01 deployed baseline at session start:
-  `af58ae155c33c299aa56b7844b4337eb2abe96e3`.
+- RPI-01 deployed baseline at 2026-09-12 session start:
+  `87f23002a1b3a0460fe6d70fefa38bd6560f7057`.
 - The working tree was clean at that baseline before this task.
-- RPI-01 was not edited or deployed during this task; U-01 remains source of
-  truth.
+- Baseline binary and existing ARM target both SHA256
+  `387f79791fcbea90feafa3a8b6991193fd0c7a89192515e7589e0202841a586f`.
+- All eight release-build librespot pins match 87f2300. Existing remote spotifyd
+  source is dirty; preserve it. Its captured build source archive SHA256 is
+  `2456d84d62a73fc4d87057c282f2e874dc6656d3d815456cf060176eb27406ad`.
+- Diagnostic-only changes add opt-in `LIBRESPOT_RUNTIME_TRACE=1` events.
+- Recorder enabled: system `spotifyd-diagnostics.service`, evidence under
+  `/var/lib/spotifyd-diagnostics`; 12-minute/size-bound rings, 45-second post-event,
+  at most three incidents (~700 MiB total cap). See tools/runtime-diagnostics.
+- Runtime user unit has separate `runtime-debug.conf` enabling DEBUG logs.
+- Pi kernel 6.12.96: bpftrace scheduler tracepoints work; PSI absent; perf absent
+  from PATH; BCC runqlat fails missing BTF. No throttling, ondemand governor.
+- Temporary additional swap `/var/lib/spotifyd-diagnostics-build.swap` provides
+  2 GiB total for ARM build; original `/var/swap` preserved.
 
 # Architecture and invariants
 
@@ -112,14 +124,18 @@ blind-test UI, lossless work, or transition-quality tuning.
 
 # Unresolved issues
 
-- No confirmed transition-runtime correctness issue from this session remains.
-- Live audible confirmation on RPI-01 is still a post-build deployment gate,
-  not a source-code blocker.
+- Xruns at 14:07:14, 14:21:03, 15:19:53 on Sept 12; third incident follows
+  load churn and TransientService. Historical INFO logs do not prove load roles
+  or the source/duration of starvation. Do not claim dual loads caused xruns.
+- Candidate queue defect: SetQueue refreshes preload only in Mixer context;
+  ordinary crossfade can retain an obsolete target. Regression pending.
+- One preview payload decoded: nested Transition field 9, starts 184812/944 ms,
+  overlap 7385 ms, four bars, BPM 129.993225, preset 10 beatmatched fade.
+  Client codec confirms preview envelope fields 1–15; more captures pending.
 - The RPI-01 spotifyd build needs at least 2 GB swap available; preserve that
   requirement when executing the next action.
 
 # NEXT ACTION
 
-Ensure RPI-01 has at least 2 GB swap, build spotifyd with all eight librespot
-crates pinned to the final commit, deploy that exact binary, and run one logged
-live transition repro.
+Deploy the verified diagnostic candidate with all eight exact pins, then
+correlate a live command/queue/loader/worker trace and test the queue defect.

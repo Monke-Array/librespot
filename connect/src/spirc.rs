@@ -1435,6 +1435,15 @@ impl SpircTask {
         (request, sender): RequestReply,
     ) -> Result<(), Error> {
         self.connect_state.set_last_command(request.clone());
+        self.connect_state
+            .trace_runtime_queue("before dealer command");
+        crate::core::runtime_trace!(
+            "spirc_command spirc={} session={} message_id={} command={}",
+            self.spirc_id,
+            self.session.session_id(),
+            request.message_id,
+            request.command
+        );
 
         debug!(
             "handling: '{}' from {}",
@@ -1449,6 +1458,8 @@ impl SpircTask {
             }
         };
 
+        self.connect_state
+            .trace_runtime_queue("after dealer command");
         sender.send(response).map_err(Into::into)
     }
 
@@ -2046,6 +2057,7 @@ impl SpircTask {
     }
 
     fn handle_preload_next_track(&mut self) {
+        self.connect_state.trace_runtime_queue("select preload");
         // Requests the player thread to preload the next track
         match self.play_status {
             SpircPlayStatus::Paused {
@@ -2682,6 +2694,8 @@ impl SpircTask {
     }
 
     fn handle_next(&mut self, track_uri: Option<String>) -> Result<(), Error> {
+        self.connect_state.trace_runtime_queue("before next");
+        crate::core::runtime_trace!("next requested_uri={track_uri:?}");
         self.cancel_transition_hydrations();
         let continue_playing = self.connect_state.is_playing();
 
@@ -2703,6 +2717,7 @@ impl SpircTask {
         };
 
         if has_next_track {
+            self.connect_state.trace_runtime_queue("after next");
             self.add_autoplay_resolving_when_required();
             self.load_track(continue_playing, 0)
         } else {

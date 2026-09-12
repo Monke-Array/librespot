@@ -795,6 +795,7 @@ fn run_decode_worker(
     track_label: &str,
 ) {
     debug!("Secondary decode started for <{track_label}>");
+    crate::core::runtime_trace!("worker_start generation={generation} track={track_label}");
     let mut reported_ready = false;
     let mut pending_samples = Vec::with_capacity(SECONDARY_PCM_CHUNK_SAMPLES);
     let mut pending_position = None;
@@ -841,6 +842,9 @@ fn run_decode_worker(
                         pending_samples = Vec::with_capacity(SECONDARY_PCM_CHUNK_SAMPLES);
                         if !reported_ready {
                             debug!("Secondary PCM ready for transition for <{track_label}>");
+                            crate::core::runtime_trace!(
+                                "worker_pcm_ready generation={generation} track={track_label}"
+                            );
                             reported_ready = true;
                         }
                     }
