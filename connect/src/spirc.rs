@@ -1559,12 +1559,12 @@ impl SpircTask {
             AddToQueue(add_to_queue) => {
                 self.cancel_transition_hydrations();
                 self.connect_state.add_to_queue(add_to_queue.track, true);
-                self.eagerly_preload_mixer_edge_if_known("queue changed");
+                self.handle_preload_next_track();
             }
             SetQueue(set_queue) => {
                 self.cancel_transition_hydrations();
                 self.connect_state.handle_set_queue(set_queue);
-                self.eagerly_preload_mixer_edge_if_known("queue changed");
+                self.handle_preload_next_track();
             }
             SetOptions(set_options) => {
                 if let Some(repeat_context) = set_options.repeating_context {
@@ -2929,6 +2929,122 @@ mod tests {
     const CURRENT_URI: &str = "spotify:track:2TpxZ7JUBn3uw46aR7qd6V";
     const NEXT_URI: &str = "spotify:track:4cOdK2wGLETKBW3PvgPWqT";
     const LATER_URI: &str = "spotify:track:7ouMYWpwJ422jRcDASZB7P";
+
+    // Real command handler and queue state; only the audio hardware is replaced.
+    // Missing local files fail locally, so these tests never contact Spotify.
+    fn queue_command_task() -> SpircTask {
+        struct NoAudio;
+        impl crate::playback::audio_backend::Sink for NoAudio {
+            fn write(
+                &mut self,
+                _: crate::playback::decoder::AudioPacket,
+                _: &mut crate::playback::convert::Converter,
+            ) -> crate::playback::audio_backend::SinkResult<()> {
+                panic!("queue test must not play audio")
+            }
+        }
+        let session = Session::new(SessionConfig::default(), None);
+        let mixer = Arc::new(
+            crate::playback::mixer::softmixer::SoftMixer::open(Default::default()).unwrap(),
+        );
+        let player = Player::new(
+            Default::default(),
+            session.clone(),
+            mixer.get_soft_volume(),
+            || Box::new(NoAudio),
+        );
+        let mut connect_state = ConnectState::new(Default::default(), &session);
+        connect_state.set_track(ProvidedTrack {
+            uri: CURRENT_URI.into(),
+            ..Default::default()
+        });
+        SpircTask {
+            player,
+            mixer,
+            connect_state,
+            connect_established: false,
+            play_request_id: None,
+            play_status: SpircPlayStatus::Paused {
+                position_ms: 0,
+                preloading_of_next_track_triggered: false,
+            },
+            connection_id_update: Box::pin(futures_util::stream::pending()),
+            connect_state_update: Box::pin(futures_util::stream::pending()),
+            connect_state_volume_update: Box::pin(futures_util::stream::pending()),
+            connect_state_logout_request: Box::pin(futures_util::stream::pending()),
+            playlist_update: Box::pin(futures_util::stream::pending()),
+            session_update: Box::pin(futures_util::stream::pending()),
+            connect_state_command: Box::pin(futures_util::stream::pending()),
+            user_attributes_update: Box::pin(futures_util::stream::pending()),
+            user_attributes_mutation: Box::pin(futures_util::stream::pending()),
+            commands: None,
+            player_events: None,
+            context_resolver: ContextResolver::new(session.clone()),
+            transition_hydration_cache: Default::default(),
+            transition_hydrations: JoinSet::new(),
+            local_auto_pair: None,
+            local_auto_current_identity: None,
+            local_auto_tasks: JoinSet::new(),
+            shutdown: false,
+            session,
+            credentials: Credentials::with_access_token("test-unused"),
+            retain_on_session_failure: false,
+            transfer_state: None,
+            update_volume: false,
+            update_state: false,
+            spirc_id: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_replacement_refreshes_preload_outside_mixer() {
+        use crate::core::dealer::protocol::{LoggingParams, SetQueueCommand};
+        let mut task = queue_command_task();
+        let replacement = "spotify:local:test:album:replacement:10";
+        task.connect_state.set_next_tracks(vec![ProvidedTrack {
+            uri: NEXT_URI.into(),
+            ..Default::default()
+        }]);
+        assert!(!task.connect_state.is_mixer_context());
+        task.handle_request(Request {
+            message_id: 71,
+            sent_by_device_id: "test".into(),
+            command: Command::SetQueue(SetQueueCommand {
+                next_tracks: vec![ProvidedTrack {
+                    uri: replacement.into(),
+                    ..Default::default()
+                }],
+                prev_tracks: vec![],
+                queue_revision: "test".into(),
+                logging_params: LoggingParams {
+                    interaction_ids: None,
+                    device_identifier: None,
+                    command_initiated_time: None,
+                    page_instance_ids: None,
+                    command_id: Some("replace-next".into()),
+                },
+            }),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            task.connect_state
+                .preview_next_provided_track()
+                .unwrap()
+                .uri,
+            replacement
+        );
+        assert!(
+            matches!(
+                task.play_status,
+                SpircPlayStatus::Paused {
+                    preloading_of_next_track_triggered: true,
+                    ..
+                }
+            ),
+            "authoritative queue replacement must schedule the new player preload even outside Mixer"
+        );
+    }
 
     #[test]
     fn speculative_local_auto_starts_while_hydration_is_pending_but_not_after_official_selection() {
