@@ -44,4 +44,12 @@ binary payloads and a wire-type inventory. Decode embedded field 9 with
 `protoc --decode=spotify.automix.proto.Transition automix_transition.proto`.
 Do not infer absent fields or wire-number semantics without the client codec.
 
+`automix_preview.proto` reconstructs the preview envelope from the installed
+Spotify desktop client's generated `r_.encode`/`r_.decode` codec captured on
+2026-09-12. Its field numbers and types match that codec. The first live
+envelope, kept outside Git under `.codex/runtime-20260912/preview`, has SHA256
+`b26a59943bf8da2e1331931a84ca1bba3ef90a09de86a685bb6d4f0cad4abf2c` and
+matches the schema's wire types; structural consistency across more envelopes
+is still unverified.
+
 Verification: `python -m unittest discover -s tools/runtime-diagnostics -v`.
