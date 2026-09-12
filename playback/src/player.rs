@@ -3784,6 +3784,11 @@ impl PlayerInternal {
             Box::pin(self.load_track(track_id.clone(), position_ms, true, "current"))
         });
 
+        // No source can produce PCM while this loader is pending. Drain/close the
+        // sink now and reopen it when ready; gapless ready-source promotion above
+        // keeps the sink running. This is the same lifecycle as buffering recovery.
+        self.ensure_sink_stopped(play);
+
         // Set ourselves to a loading state.
         self.state = PlayerState::Loading {
             track_id,
@@ -7285,6 +7290,42 @@ mod tests {
         player.ensure_sink_running();
         player.ensure_sink_running();
         assert_eq!(starts.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn explicit_load_waiting_for_pcm_closes_running_sink_until_ready() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts.clone(), stops.clone());
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(800));
+        player.sink_status = SinkStatus::Running;
+        player.preload = PlayerPreload::Loading {
+            track_id: next_track_uri(),
+            transition: PreloadTransition::SafetyFallback,
+            loader: Box::pin(DropTrackingLoader {
+                dropped: Arc::new(AtomicBool::new(false)),
+            }),
+        };
+        player
+            .handle_command_load(next_track_uri(), None, true, 0)
+            .unwrap();
+        assert!(matches!(player.state, PlayerState::Loading { .. }));
+        assert_eq!(
+            player.sink_status,
+            SinkStatus::TemporarilyClosed,
+            "a pending loader produces no PCM; ALSA must not remain running"
+        );
+        assert_eq!(stops.load(Ordering::Acquire), 1);
+        player.start_playback(
+            next_track_uri(),
+            8,
+            scripted_source(next_track_uri(), 0, Box::new(ScriptedDecoder)),
+            true,
+        );
+        assert_eq!(starts.load(Ordering::Acquire), 1);
+        assert_eq!(player.sink_status, SinkStatus::Running);
     }
 
     #[test]
