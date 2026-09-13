@@ -3295,7 +3295,9 @@ impl PlayerInternal {
     }
 
     fn write_sink_packet(&mut self, packet: AudioPacket) -> bool {
-        let _timing = crate::core::runtime_trace::SlowOperation::new("sink_write", 100);
+        // ALSA deliberately uses periods up to 125 ms, so a blocking write can
+        // normally take about one period. Report only stalls lasting two periods.
+        let _timing = crate::core::runtime_trace::SlowOperation::new("sink_write", 250);
         if let Err(e) = self.sink.write(packet, &mut self.converter) {
             error!("{e}");
             self.handle_pause();
