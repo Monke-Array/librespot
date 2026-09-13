@@ -117,8 +117,16 @@ class Recorder:
                 self.record("unavailable", dict(path=path, error=str(error)))
         if tick % 30 == 0:
             for arg in ["get_throttled", "measure_temp", "measure_clock arm"]:
-                result = subprocess.run(["vcgencmd", *arg.split()], capture_output=True, text=True, timeout=2)
-                self.record("pi", dict(command=arg, output=result.stdout, error=result.stderr))
+                try:
+                    result = subprocess.run(
+                        ["vcgencmd", *arg.split()], capture_output=True, text=True, timeout=2
+                    )
+                    self.record("pi", dict(command=arg, output=result.stdout, error=result.stderr))
+                except subprocess.TimeoutExpired as error:
+                    self.record(
+                        "pi",
+                        dict(command=arg, output="", error=f"timed out after {error.timeout} seconds"),
+                    )
             self.record("disk_free", shutil.disk_usage(self.root).free)
 
     def run(self):

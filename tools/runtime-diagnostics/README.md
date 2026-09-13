@@ -3,7 +3,9 @@
 `recorder.py` runs as the dedicated `spotifyd-diagnostics.service`, independently
 of SSH and spotifyd. It reads the UID 1000 spotifyd user journal and Linux
 telemetry. It never issues playback commands. Optional unavailable PSI is
-reported explicitly. `pidstat` follows spotifyd by process name across restarts.
+reported explicitly. A timed-out `vcgencmd` sample is recorded and skipped
+without restarting the recorder. `pidstat` follows spotifyd by process name
+across restarts.
 
 Storage: `/var/lib/spotifyd-diagnostics` (root, 0700). Each telemetry and packet
 ring has 12 segments, rotated every minute or 4 MiB. At an ALSA EPIPE/underrun,
@@ -28,7 +30,7 @@ logs plus `LIBRESPOT_RUNTIME_TRACE=1`. Runtime instrumentation is inert unless
 that variable is exactly `1`. It records shared loader IDs/roles, session,
 generation, command and queue identity, worker readiness and promotion. Slow
 decoder/command/cancellation/promotion operations log above 10 ms; sink writes
-above 100 ms. These thresholds are observational, never playback decisions.
+above 250 ms. These thresholds are observational, never playback decisions.
 Monotonic trace time is relative to first runtime event; journal JSON supplies
 boot-relative monotonic time and boot ID for scheduler correlation.
 

@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from recorder import Recorder, Ring
 
 
@@ -32,6 +34,29 @@ class RetentionTests(unittest.TestCase):
                 self.assertEqual((event / "before/pcap/test.pcapng").read_bytes(), b"packet-evidence")
             self.assertEqual(len(list(recorder.incidents.iterdir())), 3)
             recorder.ring.file.close()
+
+    def test_vcgencmd_timeout_is_recorded_without_stopping_sampling(self):
+        with tempfile.TemporaryDirectory() as root:
+            recorder = Recorder(root)
+            timeout = subprocess.TimeoutExpired(["vcgencmd", "get_throttled"], 2)
+            successful = subprocess.CompletedProcess(["vcgencmd"], 0, "ok\n", "")
+            try:
+                with patch("recorder.subprocess.run", side_effect=[timeout, successful, successful]):
+                    recorder.proc_sample(0)
+            finally:
+                if recorder.ring.file:
+                    recorder.ring.file.close()
+
+            records = [
+                json.loads(line)
+                for path in sorted((Path(root) / "ring").glob("*.jsonl"))
+                for line in path.read_text().splitlines()
+            ]
+            pi_records = [record["data"] for record in records if record["source"] == "pi"]
+            self.assertEqual(len(pi_records), 3)
+            self.assertEqual(pi_records[0]["command"], "get_throttled")
+            self.assertIn("timed out", pi_records[0]["error"])
+            self.assertEqual(pi_records[1]["output"], "ok\n")
 
 
 if __name__ == "__main__":
