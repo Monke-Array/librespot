@@ -3871,6 +3871,12 @@ impl PlayerInternal {
 
     fn handle_command_seek(&mut self, position_ms: u32) -> PlayerResult {
         self.crossfade_load_ack = None;
+        if matches!(self.state, PlayerState::Playing { .. }) {
+            // Decoder seek and read-ahead below can block PCM production. Close the
+            // running sink first; the normal playback poll restarts it once this
+            // source is ready to produce again.
+            self.ensure_sink_stopped(true);
+        }
         self.cancel_secondary_source("player seeked");
         if let Some(mut recovery) = self.recovery.take() {
             let old_generation = recovery.generation;
@@ -4763,6 +4769,41 @@ mod tests {
             &mut self,
         ) -> Result<Option<(AudioPacketPosition, AudioPacket)>, DecoderError> {
             Ok(None)
+        }
+    }
+
+    struct SeekLifecycleDecoder {
+        sink_stops: Arc<AtomicUsize>,
+        position_ms: u32,
+        packet_pending: bool,
+    }
+
+    impl AudioDecoder for SeekLifecycleDecoder {
+        fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError> {
+            assert_eq!(
+                self.sink_stops.load(Ordering::Acquire),
+                1,
+                "the running sink must close before seek/read-ahead can block PCM production"
+            );
+            self.position_ms = position_ms;
+            self.packet_pending = true;
+            Ok(position_ms)
+        }
+
+        fn next_packet(
+            &mut self,
+        ) -> Result<Option<(AudioPacketPosition, AudioPacket)>, DecoderError> {
+            if !mem::take(&mut self.packet_pending) {
+                return Ok(None);
+            }
+
+            Ok(Some((
+                AudioPacketPosition {
+                    position_ms: self.position_ms,
+                    skipped: false,
+                },
+                AudioPacket::Samples(vec![0.25; NUM_CHANNELS as usize]),
+            )))
         }
     }
 
@@ -7139,6 +7180,55 @@ mod tests {
         assert!(matches!(player.preload, PlayerPreload::None));
         assert_eq!(player.transition.state(), TransitionState::Idle);
         assert!(matches!(player.state, PlayerState::Stopped));
+    }
+
+    #[test]
+    fn playing_seek_closes_sink_until_normal_poll_has_pcm() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts.clone(), stops.clone());
+        let (command_tx, commands) = mpsc::unbounded_channel();
+        player.commands = commands;
+        set_playing_source(
+            &mut player,
+            track_uri(),
+            scripted_source(
+                track_uri(),
+                0,
+                Box::new(SeekLifecycleDecoder {
+                    sink_stops: stops.clone(),
+                    position_ms: 0,
+                    packet_pending: false,
+                }),
+            ),
+        );
+        set_ready_secondary(
+            &mut player,
+            next_track_uri(),
+            scripted_source(next_track_uri(), 0, Box::new(PanicDecoder)),
+        );
+        arm_test_transition(&mut player);
+
+        player
+            .handle_command_seek(12_345)
+            .expect("playing source should seek");
+
+        assert_eq!(stops.load(Ordering::Acquire), 1);
+        assert_eq!(starts.load(Ordering::Acquire), 0);
+        assert_eq!(player.sink_status, SinkStatus::TemporarilyClosed);
+        assert_eq!(
+            player.state.source_mut().unwrap().stream_position_ms,
+            12_345
+        );
+        assert!(matches!(player.preload, PlayerPreload::None));
+        assert_eq!(player.transition.state(), TransitionState::Idle);
+
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        assert!(Pin::new(&mut player).poll(&mut context).is_pending());
+        assert_eq!(starts.load(Ordering::Acquire), 1);
+        assert_eq!(player.sink_status, SinkStatus::Running);
+        drop(command_tx);
     }
 
     #[test]
