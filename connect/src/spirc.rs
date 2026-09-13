@@ -992,6 +992,16 @@ impl SpircTask {
         self.session.dealer().close().await;
     }
 
+    fn active_preload_edge(&self) -> (Option<String>, Option<String>) {
+        (
+            self.connect_state
+                .current_track(|track| track.as_ref().map(|track| track.uri.clone())),
+            self.connect_state
+                .preview_next_provided_track()
+                .map(|track| track.uri.clone()),
+        )
+    }
+
     fn handle_next_context(&mut self, next_context: Result<Context, Error>) -> bool {
         let next_context = match next_context {
             Err(why) => {
@@ -1010,7 +1020,9 @@ impl SpircTask {
 
         debug!("handling next context {:?}", next_context.uri);
 
-        match self
+        let previous_edge = self.active_preload_edge();
+
+        let context_applied = match self
             .context_resolver
             .apply_next_context(&mut self.connect_state, next_context)
         {
@@ -1018,11 +1030,13 @@ impl SpircTask {
                 if let Some(remaining) = remaining {
                     self.context_resolver.add_list(remaining)
                 }
+                true
             }
             Err(why) => {
-                error!("{why}")
+                error!("{why}");
+                false
             }
-        }
+        };
 
         let update_state = if self
             .context_resolver
@@ -1033,6 +1047,15 @@ impl SpircTask {
         } else {
             false
         };
+
+        let active_edge = self.active_preload_edge();
+        if context_applied && active_edge != previous_edge {
+            debug!(
+                "resolved context changed active preload edge from {previous_edge:?} to {active_edge:?}"
+            );
+            self.cancel_transition_hydrations();
+            self.handle_preload_next_track();
+        }
 
         self.context_resolver.remove_used_and_invalid();
         update_state
@@ -2925,6 +2948,7 @@ impl Drop for SpircTask {
 mod tests {
     use super::*;
     use crate::{core::config::SessionConfig, playback::player::PlayerLoadErrorKind};
+    use librespot_protocol::context_track::ContextTrack;
 
     const CURRENT_URI: &str = "spotify:track:2TpxZ7JUBn3uw46aR7qd6V";
     const NEXT_URI: &str = "spotify:track:4cOdK2wGLETKBW3PvgPWqT";
@@ -2994,6 +3018,157 @@ mod tests {
             update_state: false,
             spirc_id: 0,
         }
+    }
+
+    fn context_with_tracks(context_uri: &str, track_uris: &[&str]) -> Context {
+        Context {
+            uri: Some(context_uri.into()),
+            pages: vec![ContextPage {
+                tracks: track_uris
+                    .iter()
+                    .map(|uri| ContextTrack {
+                        uri: Some((*uri).into()),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn mixer_context_with_tracks(context_uri: &str, track_uris: &[&str]) -> Context {
+        let mut context = context_with_tracks(context_uri, track_uris);
+        context.metadata.insert("mix".into(), "true".into());
+        context
+    }
+
+    #[tokio::test]
+    async fn resolved_context_edge_replacement_preloads_the_new_next_track() {
+        const CONTEXT_URI: &str = "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M";
+        const OLD_NEXT_URI: &str = "spotify:local:test:album:old-next:10";
+        const REPLACEMENT_URI: &str = "spotify:local:test:album:replacement:10";
+
+        let mut task = queue_command_task();
+        let initial = mixer_context_with_tracks(CONTEXT_URI, &[CURRENT_URI, OLD_NEXT_URI]);
+        task.connect_state
+            .update_context(initial, ContextType::Default)
+            .expect("initial context should apply");
+        task.connect_state.set_active_context(ContextType::Default);
+        task.connect_state
+            .reset_playback_to_position(Some(0))
+            .expect("initial edge should be selected");
+        assert!(task.connect_state.is_mixer_context());
+        assert_eq!(
+            task.connect_state
+                .preview_next_provided_track()
+                .expect("old next track")
+                .uri,
+            OLD_NEXT_URI
+        );
+
+        let replacement = mixer_context_with_tracks(CONTEXT_URI, &[CURRENT_URI, REPLACEMENT_URI]);
+        task.context_resolver.add(ResolveContext::from_context(
+            replacement.clone(),
+            ContextType::Default,
+            ContextAction::Replace,
+        ));
+        let obsolete_ownership = local_auto_key(
+            CONTEXT_URI,
+            CURRENT_URI,
+            OLD_NEXT_URI,
+            "current-row",
+            "old-next-row",
+        );
+        task.local_auto_pair = Some(LocalAutoPairState {
+            key: obsolete_ownership.clone(),
+            higher_priority: HigherPriorityTransitionState::Pending,
+            attempted: true,
+            incoming_identity: None,
+            prepared_transition: None,
+            selected_local_auto: false,
+        });
+
+        assert!(task.handle_next_context(Ok(replacement)));
+        assert_eq!(
+            task.connect_state
+                .preview_next_provided_track()
+                .expect("replacement next track")
+                .uri,
+            REPLACEMENT_URI
+        );
+        assert!(
+            matches!(
+                task.play_status,
+                SpircPlayStatus::Paused {
+                    preloading_of_next_track_triggered: true,
+                    ..
+                }
+            ),
+            "resolved edge replacement must schedule the authoritative next track for preload"
+        );
+        let replacement_ownership = &task
+            .local_auto_pair
+            .as_ref()
+            .expect("Mixer replacement should establish ownership for the new edge")
+            .key;
+        assert_ne!(replacement_ownership, &obsolete_ownership);
+        assert_eq!(replacement_ownership.incoming_uri, REPLACEMENT_URI);
+    }
+
+    #[tokio::test]
+    async fn resolved_context_with_unchanged_edge_does_not_restart_preload() {
+        const CONTEXT_URI: &str = "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M";
+        const NEXT_LOCAL_URI: &str = "spotify:local:test:album:next:10";
+
+        let mut task = queue_command_task();
+        let initial = mixer_context_with_tracks(CONTEXT_URI, &[CURRENT_URI, NEXT_LOCAL_URI]);
+        task.connect_state
+            .update_context(initial, ContextType::Default)
+            .expect("initial context should apply");
+        task.connect_state.set_active_context(ContextType::Default);
+        task.connect_state
+            .reset_playback_to_position(Some(0))
+            .expect("initial edge should be selected");
+        assert!(task.connect_state.is_mixer_context());
+        let ownership = local_auto_key(
+            CONTEXT_URI,
+            CURRENT_URI,
+            NEXT_LOCAL_URI,
+            "current-row",
+            "next-row",
+        );
+        task.local_auto_pair = Some(LocalAutoPairState {
+            key: ownership.clone(),
+            higher_priority: HigherPriorityTransitionState::Pending,
+            attempted: true,
+            incoming_identity: None,
+            prepared_transition: None,
+            selected_local_auto: false,
+        });
+
+        let refresh = mixer_context_with_tracks(CONTEXT_URI, &[CURRENT_URI, NEXT_LOCAL_URI]);
+        task.context_resolver.add(ResolveContext::from_context(
+            refresh.clone(),
+            ContextType::Default,
+            ContextAction::Replace,
+        ));
+
+        assert!(task.handle_next_context(Ok(refresh)));
+        assert!(matches!(
+            task.play_status,
+            SpircPlayStatus::Paused {
+                preloading_of_next_track_triggered: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            task.local_auto_pair
+                .as_ref()
+                .expect("unchanged edge should retain transition ownership")
+                .key,
+            ownership
+        );
     }
 
     #[tokio::test]

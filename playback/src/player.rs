@@ -5303,6 +5303,40 @@ mod tests {
     }
 
     #[test]
+    fn different_target_preload_invalidates_ready_transition_ownership() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(0));
+        let obsolete_track = next_track_uri();
+        set_ready_secondary(
+            &mut player,
+            obsolete_track.clone(),
+            scripted_source(obsolete_track.clone(), 0, Box::new(ScriptedDecoder)),
+        );
+        arm_test_transition(&mut player);
+        let obsolete_generation = player.secondary_generation;
+        let replacement_track = SpotifyUri::from_uri("spotify:track:7ouMYWpwJ422jRcDASZB7P")
+            .expect("replacement URI should be valid");
+
+        let _guard = runtime.enter();
+        player.handle_command_preload(replacement_track.clone(), PreloadTransition::SafetyFallback);
+
+        assert_eq!(player.transition.state(), TransitionState::Idle);
+        assert_ne!(player.secondary_generation, obsolete_generation);
+        assert!(matches!(
+            &player.preload,
+            PlayerPreload::Loading { track_id, .. } if track_id == &replacement_track
+        ));
+        assert!(
+            !player
+                .promote_preloaded_source(&obsolete_track, 9, true, 0)
+                .expect("obsolete promotion should be rejected")
+        );
+    }
+
+    #[test]
     fn normal_crossfade_uses_configured_duration_after_secondary_pcm_is_ready() {
         let runtime = tokio::runtime::Runtime::new().expect("test runtime");
         let starts = Arc::new(AtomicUsize::new(0));
