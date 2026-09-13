@@ -1,21 +1,20 @@
 # Current objective
 
-Deploy and validate the resolved-context edge ownership fix after the live
-Hypa Hypa -> Y.K.P -> Nash Gimn stale-promotion incident. Keep the bounded
-recorder passive and classify any new XRUN independently.
+Validate the deployed resolved-context edge ownership fix under live playback.
+Keep the bounded recorder passive and classify any new XRUN independently.
 
 # Branch and deployment
 
-- Branch: `codex/m3a-live-auto-metadata`; latest implementation commit
-  `b78e849929a3e57778db46996a34d6abbd32bd53`.
-- Playback candidate source commit: `09369c860eb8890603b2a50dcbafc6acd6673c96`.
+- Branch: `codex/m3a-live-auto-metadata`; implementation commit `b78e849`;
+  deployed source snapshot `90e16289089fc4e339552d4529894e27a06676ad`.
+- Deployed candidate source commit: `90e16289089fc4e339552d4529894e27a06676ad`.
 - The ARM spotifyd snapshot pins all eight librespot dependencies and lockfile
-  sources exactly to that commit. Build unit `spotifyd-arm-build-09369c86`
-  finished successfully with `--release --locked -j 2`.
+  sources exactly to that commit. Build unit `spotifyd-arm-build-90e1628`
+  finished successfully in 44m19s with `--release --locked -j 2`.
 - Deployed `/usr/local/bin/spotifyd` SHA256:
+  `54a8c36d487c5cbc39239fac1dd9f19fa9a50a5fc82695259b2e315d3edd2e9c`.
+- Rollback `/usr/local/bin/spotifyd.rollback-09369c86-pre-90e1628` SHA256:
   `c2f208c471ced9e2675f5f48fe32b06c0d6d41c0b42cd718b49025ca92edac5d`.
-- Rollback `/usr/local/bin/spotifyd.rollback-5448a347-pre-09369c86` SHA256:
-  `ee0f561df0bef9bbda122695a73acb5803a95fde52a3c0686e4cd5e5d92ce252`.
 - Diagnostic recorder commits `eab442a` and `477c2c9` are separately deployed.
   Installed recorder SHA256:
   `667d8d3df981550397d0120f1b58ed5710a30b5419cb6ab735f8742554eb2715`.
@@ -109,6 +108,9 @@ recorder passive and classify any new XRUN independently.
   Connect then loaded Nash Gimn about 0.62 seconds later. There was no ALSA XRUN,
   decoder/load failure, or network failure in the incident window. Classification:
   stale transition ownership across asynchronous resolved-context replacement.
+- The `90e1628` post-deploy smoke window authenticated, launched the dealer, and
+  initialized ALSA with zero XRUN markers. Spotifyd and recorder remained active
+  with zero restarts; automatic incident count remained three.
 
 # Targeted audit findings
 
@@ -125,22 +127,22 @@ recorder passive and classify any new XRUN independently.
 
 # External artifacts
 
-- ARM snapshot: `/home/amogus/.cache/spotifyd-runtime-build-09369c86`.
+- ARM snapshot: `/home/amogus/.cache/spotifyd-runtime-build-90e1628`.
 - ARM target: `/home/amogus/.cache/codex-spotifyd-target-5448a347`.
 - Recorder state and incidents: `/var/lib/spotifyd-diagnostics`.
 - Preserved context-edge incident:
   `/var/lib/spotifyd-diagnostics/manual/1789308023769543909-skip`.
-- Post-deploy journal cursor at 15:22:13 CEST:
-  `s=a7721078550c4aad9c2c6e841619427c;i=1d1a7005;b=c372bd5fe0114b7ebdbd81298aa3a7f4;m=13f2690e84;t=65b5d343c72b1;x=772ec61232f1652a`.
+- Post-deploy journal cursor at 20:27:41 CEST:
+  `s=a7721078550c4aad9c2c6e841619427c;i=1d1b0d82;b=c372bd5fe0114b7ebdbd81298aa3a7f4;m=183644779d;t=65b617817dbca;x=9f47e36490ea0e1`.
 
 # Unresolved issues
 
-- `b78e849` is locally verified but not yet built or deployed on RPI-01; the
-  runtime still uses playback source `09369c860eb8890603b2a50dcbafc6acd6673c96`.
+- The resolved-context fix now needs live transition validation; startup smoke
+  cannot reproduce or prove absence of the prior stale-promotion sequence.
 - Earlier context-update XRUNs remain unclassified. Neither the seek fix nor
   instrumentation threshold should be credited or blamed without new evidence.
 
 # NEXT ACTION
 
-Push `b78e849`, build one exact ARM candidate pinned to that source revision,
-deploy it with rollback/hash verification, then resume passive monitoring.
+Continue passive monitoring while the user listens. Preserve and reconstruct
+any new skip/XRUN independently from the post-deploy cursor.
