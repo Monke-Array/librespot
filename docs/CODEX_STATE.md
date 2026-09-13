@@ -1,141 +1,124 @@
 # Current objective
 
-Investigate live xruns, dual loads, queue authority, and automix-preview.
-No speculative playback fixes, generator integration, lossless, or UI work.
-Session plan: `docs/superpowers/plans/2026-09-12-live-runtime-investigation.md`.
+Validate the deployed seek/sink lifecycle fix and corrected sink-write tracing
+under live playback while the bounded recorder runs passively. Preserve and
+classify any new XRUN independently; do not attribute remaining context-update
+XRUNs without new evidence.
 
-# Branch / baseline
+# Branch and deployment
 
-- Branch: `codex/m3a-live-auto-metadata`.
-- RPI-01 deployed baseline at 2026-09-12 session start:
-  `87f23002a1b3a0460fe6d70fefa38bd6560f7057`.
-- The working tree was clean at that baseline before this task.
-- Baseline binary and existing ARM target both SHA256
-  `387f79791fcbea90feafa3a8b6991193fd0c7a89192515e7589e0202841a586f`.
-- All eight release-build librespot pins match 87f2300. Existing remote spotifyd
-  source is dirty; preserve it. Its captured build source archive SHA256 is
-  `2456d84d62a73fc4d87057c282f2e874dc6656d3d815456cf060176eb27406ad`.
-- Diagnostic-only changes add opt-in `LIBRESPOT_RUNTIME_TRACE=1` events.
-- Recorder enabled: system `spotifyd-diagnostics.service`, evidence under
-  `/var/lib/spotifyd-diagnostics`; 12-minute/size-bound rings, 45-second post-event,
-  at most three incidents (~700 MiB total cap). See tools/runtime-diagnostics.
-- Runtime user unit has separate `runtime-debug.conf` enabling DEBUG logs.
-- Pi kernel 6.12.96: bpftrace scheduler tracepoints work; PSI absent; perf absent
-  from PATH; BCC runqlat fails missing BTF. No throttling, ondemand governor.
-- Temporary additional swap `/var/lib/spotifyd-diagnostics-build.swap` provides
-  2 GiB total for ARM build; original `/var/swap` preserved.
+- Branch: `codex/m3a-live-auto-metadata`; latest implementation commit `477c2c9`.
+- Playback candidate source commit: `09369c860eb8890603b2a50dcbafc6acd6673c96`.
+- The ARM spotifyd snapshot pins all eight librespot dependencies and lockfile
+  sources exactly to that commit. Build unit `spotifyd-arm-build-09369c86`
+  finished successfully with `--release --locked -j 2`.
+- Deployed `/usr/local/bin/spotifyd` SHA256:
+  `c2f208c471ced9e2675f5f48fe32b06c0d6d41c0b42cd718b49025ca92edac5d`.
+- Rollback `/usr/local/bin/spotifyd.rollback-5448a347-pre-09369c86` SHA256:
+  `ee0f561df0bef9bbda122695a73acb5803a95fde52a3c0686e4cd5e5d92ce252`.
+- Diagnostic recorder commits `eab442a` and `477c2c9` are separately deployed.
+  Installed recorder SHA256:
+  `667d8d3df981550397d0120f1b58ed5710a30b5419cb6ab735f8742554eb2715`.
+- Spotifyd and `spotifyd-diagnostics.service` are active with zero restarts
+  since intentional deployment restarts.
 
 # Architecture and invariants
 
 - Mixer/local-Auto and non-Mixer normal-crossfade routes remain distinct.
-- Incoming speed automation uses absolute source-track time. Transition overlap
-  duration uses wall-clock time and must be converted before placing its unity
-  endpoint.
-- `SecondaryDecodeWorker` owns transition time stretching while preloaded.
-- Completion, retained-source cancellation, or worker-backed promotion must
-  retire time stretching synchronously and non-blockingly before ordinary
-  playback owns the source.
-- Promotion retains decoded raw PCM and the nominal source clock; it does not
-  reload the promoted track or join the decoder thread.
-- Source normalization is applied once before mixing. Master volume and dynamic
-  limiting are applied once after mixing.
+- A playing-source seek closes a Running sink before decoder seek or blocking
+  read-ahead. It cancels secondary ownership and resets transition state.
+- Seek completion leaves the sink temporarily closed. The normal playback poll
+  reopens it only when the current source is again available to produce PCM.
+- Ready/loading secondary state belongs to its session and generation. Stale
+  generations cannot deliver PCM or promote; cancellation retires transition
+  DSP and runnable worker state.
+- Promotion occurs once, advances queue ownership through the old request's
+  terminal event, preserves the incoming source clock, and retires transition
+  DSP before ordinary playback owns the source.
+- Mixer/local-Auto queue ownership remains deterministic; networking and ML do
+  not control sink, decoder, queue, or transition lifetime.
 
-# Confirmed root causes and fixes
+# Confirmed fixes
 
-- P0 persistent DSP leak: local Auto emitted one non-unity incoming speed point.
-  `SpeedAutomation::speed_at()` correctly holds the latest point indefinitely,
-  so the promoted worker retained non-unity WSOLA for the rest of the track.
-- Fix: local Auto now adds a 1.0 point at
-  `start_b + source_duration_for_wall_time(start_b, overlap_wall_duration)`.
-  For the captured oracle this is 8263.003226995468 ms, not
-  `start_b + overlap_duration`.
-- P0 ownership leak: the same worker/time-stretch processor was promoted or
-  retained after transition cancellation without any retirement boundary.
-- Fix: completion and every cancellation path that retains the preload call one
-  centralized retirement path. It immediately removes WSOLA, preserves bounded
-  decoded raw lookahead, hands off at the nominal automation clock, and chooses
-  only a correlation-window-equivalent raw grain to avoid a large waveform
-  step. No worker join, decoder reload, or blocking decode occurs.
-- P1 session-replacement leak: a ready secondary worker, unlike a loading
-  preload, survived replacement of its invalid owning Spotify session. It could
-  retain transition DSP and continue decoding through obsolete session state.
-- Fix: replacement now invalidates both loading and ready secondary preloads,
-  advances their generation, drops any worker, and restarts the same track and
-  transition preload on the replacement session.
-- The leaked processor explains persistent speed/pitch and can alter apparent
-  level beyond the transition. Independent tests found no persistent gain-curve
-  or per-source-normalization leak.
+- `f51a26b`: playing seeks call `ensure_sink_stopped(true)` before synchronous
+  decoder seek/read-ahead. Existing explicit-load promotion behavior is intact.
+- `09369c8`: `slow_operation=sink_write` threshold is 250 ms. ALSA periods can
+  normally block for about 125 ms, so the old 100 ms threshold logged ordinary
+  writes; 250 ms retains detection of stalls lasting at least two periods.
+- `eab442a`: a timed-out `vcgencmd` telemetry sample is recorded and skipped
+  instead of terminating the recorder.
+- `477c2c9`: the recorder persists its journal cursor every 30 seconds,
+  immediately on XRUN, and on shutdown. It resumes with `--after-cursor`, so a
+  restart cannot replay a recent XRUN as a new incident.
 
-# Loudness findings
+# Regression and verification evidence
 
-- A promoted source and the same normally loaded source compute bit-identical
-  Basic/Track normalization factors and identical normalized PCM.
-- `TransitionEngine::complete()` and cancellation reset gain curves/spec/frame
-  state; later single-source PCM is exact passthrough.
-- Dynamic normalization/limiter state is intentionally global ordinary output
-  DSP. A transition peak decays back to ordinary gain; it is bounded and is not
-  transition gain automation.
-- Master volume is not applied twice: source normalization precedes mixing and
-  global volume/limiting follows it.
+- The seek lifecycle regression failed before the fix because the sink stop
+  count was zero inside decoder seek; it passes after the fix.
+- It verifies sink stop ordering, secondary/transition cancellation, source
+  position, no premature restart, and normal-poll restart with PCM available.
+- Existing explicit-load regression remains green.
+- Fresh gate for the playback candidate passed:
+  `cargo fmt --all -- --check`, `cargo check --workspace --locked`,
+  `cargo test -p librespot-playback -p librespot-connect --locked`, targeted
+  all-target Clippy with `-D warnings`, and `git diff --check`.
+- Results: playback 95/95; connect 114/114 unit, 5/5 oracle, 1/1 doctest.
+- Recorder tests are 4/4 and include forced telemetry timeout plus persistent
+  XRUN cursor restart coverage; Python byte-compilation and diff checks pass.
+- Independent review of `5448a347..09369c86` found no critical, important, or
+  minor issue.
 
-# Regression coverage
+# Runtime evidence
 
-- Local-Auto speed has a mathematically correct unity endpoint in source time.
-- Bounded speed changes duration only in its region and preserves post-region
-  pitch.
-- Promotion immediately removes time stretching, retains raw PCM, and keeps
-  unity source-position increments.
-- Raw handoff before first emission is lossless; active handoff is bounded and
-  avoids a large waveform discontinuity.
-- Cancellation before promotion, active manual-next promotion, current EOF,
-  seek/reload, session replacement, and dropped-secondary cancellation do not
-  retain speed DSP.
-- Promoted and normally loaded normalization/gain behavior match.
-- Completed transition gain curves cannot affect later PCM.
-- Normal crossfade/no-speed behavior continues to use the existing path.
+- Pre-change active eight-second window: 67 sink-write events and 10,050 text
+  bytes at 100 ms; none reached 250 ms. Earlier 15-minute evidence contained
+  7,068 sink-write events, all below 150 ms.
+- Audible "little stop" reported at 2026-09-13 14:06:08+02:00 is preserved as
+  incident `1789301128310568290`. On the old binary, current decoder packet
+  production stalled for 4.486 s and 1.447 s while the Pi ARM build ran; each
+  stall produced one ALSA Broken-pipe/underrun pair.
+- Incident telemetry showed about 1.0 GiB memory available and stable swap, but
+  eight blocked tasks and 60-66% I/O wait. Classification: Pi build-induced
+  storage I/O starvation, not memory exhaustion and not evidence about either
+  deployed playback change. Do not build on RPI-01 while listening.
+- Recorder restarts 7 and 8 came from uncaught `vcgencmd get_throttled`
+  timeouts. Restart replay also created duplicate incident
+  `1789301558842656438` with the same underlying journal cursor. Both recorder
+  defects are now fixed and deployed.
+- Post-deploy startup/idle windows through 15:32 CEST contain zero XRUN markers,
+  zero spotifyd/recorder restarts, and zero sink-write traces. They do not prove
+  active-playback rate because no sink-start or Playing event occurred.
 
-# Related audit
+# Targeted audit findings
 
-- Existing deterministic tests cover transition state progression and illegal
-  operations, exact frame completion, mid-packet starts, unaligned PCM,
-  underrun, current/secondary EOF and decoder errors, worker backpressure and
-  cancellation, stale generations, promotion without double load, seek/load/
-  stop, pause/resume, recovery, session replacement, and normal crossfade.
-- Connect tests cover stale local-Auto results, context/edge identity, official
-  transition precedence, repeated preload, canonical/playable identities,
-  malformed metadata, unsupported DSP fail-closed behavior, and queue terminal
-  event de-duplication.
-- No additional provable deployment bug beyond the three fixes above was found
-  in these audited boundaries.
+- Transition generation, cancellation, EOF/promotion exclusivity, session
+  replacement, queue replacement, and DSP retirement guards are coherent with
+  existing regressions. No additional demonstrated transition defect was found.
+- Preload TransientService cancels secondary/transition state and preserves the
+  Connect queue. Current-source transient failures latch same-track recovery;
+  success resumes the URI/position, repeated failure stays latched, and invalid
+  session waits for replacement. No concrete local recovery violation was found.
+- Ordinary crossfade queue replacement is already fixed by `82d71a2` and covered
+  by `queue_replacement_refreshes_preload_outside_mixer`; the previous state-file
+  note calling it pending was stale.
 
-# Verification
+# External artifacts
 
-- Pre-change baseline: playback 83/83 passed; connect 113 unit + 5 oracle + 1
-  doctest passed.
-- Current playback suite: 93/93 unit tests and doctests passed.
-- Current connect suite: 113 unit + 5 oracle + 1 doctest passed.
-- `cargo check --workspace` passed.
-- Playback/connect all-target Clippy passed with `-D warnings` after explicitly
-  allowing six verified pre-existing lints (`int-plus-one`,
-  `too-many-arguments`, `large-enum-variant`, `if-same-then-else`,
-  `excessive-precision`, and `type-complexity`).
-- Fresh final `cargo fmt --all -- --check`, playback, and connect suite runs
-  passed immediately before the deployable commit gate.
+- ARM snapshot: `/home/amogus/.cache/spotifyd-runtime-build-09369c86`.
+- ARM target: `/home/amogus/.cache/codex-spotifyd-target-5448a347`.
+- Recorder state and incidents: `/var/lib/spotifyd-diagnostics`.
+- Post-deploy journal cursor at 15:22:13 CEST:
+  `s=a7721078550c4aad9c2c6e841619427c;i=1d1a7005;b=c372bd5fe0114b7ebdbd81298aa3a7f4;m=13f2690e84;t=65b5d343c72b1;x=772ec61232f1652a`.
 
 # Unresolved issues
 
-- Xruns at 14:07:14, 14:21:03, 15:19:53 on Sept 12; third incident follows
-  load churn and TransientService. Historical INFO logs do not prove load roles
-  or the source/duration of starvation. Do not claim dual loads caused xruns.
-- Candidate queue defect: SetQueue refreshes preload only in Mixer context;
-  ordinary crossfade can retain an obsolete target. Regression pending.
-- One preview payload decoded: nested Transition field 9, starts 184812/944 ms,
-  overlap 7385 ms, four bars, BPM 129.993225, preset 10 beatmatched fade.
-  Client codec confirms preview envelope fields 1–15; more captures pending.
-- The RPI-01 spotifyd build needs at least 2 GB swap available; preserve that
-  requirement when executing the next action.
+- A bounded post-deploy window with confirmed active PCM playback is still
+  required to quantify the 250 ms sink-write event/byte rate in live use.
+- Earlier context-update XRUNs remain unclassified. Neither the seek fix nor
+  instrumentation threshold should be credited or blamed without new evidence.
 
 # NEXT ACTION
 
-Deploy the verified diagnostic candidate with all eight exact pins, then
-correlate a live command/queue/loader/worker trace and test the queue defect.
+Capture one cursor-bounded window with confirmed active PCM playback, measure
+250 ms sink-write events/bytes against the retained baseline, and independently
+preserve any new XRUN detected in that same window.
