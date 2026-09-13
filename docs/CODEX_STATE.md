@@ -1,13 +1,13 @@
 # Current objective
 
-Validate the deployed seek/sink lifecycle fix and corrected sink-write tracing
-under live playback while the bounded recorder runs passively. Preserve and
-classify any new XRUN independently; do not attribute remaining context-update
-XRUNs without new evidence.
+Deploy and validate the resolved-context edge ownership fix after the live
+Hypa Hypa -> Y.K.P -> Nash Gimn stale-promotion incident. Keep the bounded
+recorder passive and classify any new XRUN independently.
 
 # Branch and deployment
 
-- Branch: `codex/m3a-live-auto-metadata`; latest implementation commit `477c2c9`.
+- Branch: `codex/m3a-live-auto-metadata`; latest implementation commit
+  `b78e849929a3e57778db46996a34d6abbd32bd53`.
 - Playback candidate source commit: `09369c860eb8890603b2a50dcbafc6acd6673c96`.
 - The ARM spotifyd snapshot pins all eight librespot dependencies and lockfile
   sources exactly to that commit. Build unit `spotifyd-arm-build-09369c86`
@@ -32,6 +32,10 @@ XRUNs without new evidence.
 - Ready/loading secondary state belongs to its session and generation. Stale
   generations cannot deliver PCM or promote; cancellation retires transition
   DSP and runnable worker state.
+- After an asynchronously resolved context is applied, SPIRC compares the
+  active `(current, next)` edge with the pre-resolution edge. A changed edge
+  cancels old hydration/local-Auto ownership and schedules the authoritative
+  next preload; an unchanged edge does not churn the existing preload.
 - Promotion occurs once, advances queue ownership through the old request's
   terminal event, preserves the incoming source clock, and retires transition
   DSP before ordinary playback owns the source.
@@ -50,6 +54,8 @@ XRUNs without new evidence.
 - `477c2c9`: the recorder persists its journal cursor every 30 seconds,
   immediately on XRUN, and on shutdown. It resumes with `--after-cursor`, so a
   restart cannot replay a recent XRUN as a new incident.
+- `b78e849`: resolved context replacement now invalidates stale transition
+  ownership and preloads the new authoritative edge.
 
 # Regression and verification evidence
 
@@ -62,7 +68,15 @@ XRUNs without new evidence.
   `cargo fmt --all -- --check`, `cargo check --workspace --locked`,
   `cargo test -p librespot-playback -p librespot-connect --locked`, targeted
   all-target Clippy with `-D warnings`, and `git diff --check`.
-- Results: playback 95/95; connect 114/114 unit, 5/5 oracle, 1/1 doctest.
+- The resolved-context regression failed before `b78e849` because no replacement
+  preload was scheduled. It now covers the Mixer A -> B to A -> C replacement,
+  B ownership retirement, C preload scheduling, and unchanged-edge no-churn.
+- The paired player regression starts with B ready and armed, replaces it with
+  C, and verifies B's generation is retired, transition state is Idle, C owns
+  the loader, and B cannot promote.
+- Fresh `b78e849` results: playback 96/96; connect 116/116 unit, 5/5 oracle,
+  1/1 doctest. Format, workspace check, targeted tests, all-target Clippy with
+  the six documented pre-existing lint allowances, and diff check pass.
 - Recorder tests are 4/4 and include forced telemetry timeout plus persistent
   XRUN cursor restart coverage; Python byte-compilation and diff checks pass.
 - Independent review of `5448a347..09369c86` found no critical, important, or
@@ -88,6 +102,13 @@ XRUNs without new evidence.
 - Post-deploy startup/idle windows through 15:32 CEST contain zero XRUN markers,
   zero spotifyd/recorder restarts, and zero sink-write traces. They do not prove
   active-playback rate because no sink-start or Playing event occurred.
+- A user-reported skip at 16:00:23 CEST is preserved in
+  `/var/lib/spotifyd-diagnostics/manual/1789308023769543909-skip`. Hypa Hypa
+  prepared Y.K.P, two `update_context` commands changed Connect's authoritative
+  next edge to Nash Gimn, but the already-ready Y.K.P transition still promoted.
+  Connect then loaded Nash Gimn about 0.62 seconds later. There was no ALSA XRUN,
+  decoder/load failure, or network failure in the incident window. Classification:
+  stale transition ownership across asynchronous resolved-context replacement.
 
 # Targeted audit findings
 
@@ -107,18 +128,19 @@ XRUNs without new evidence.
 - ARM snapshot: `/home/amogus/.cache/spotifyd-runtime-build-09369c86`.
 - ARM target: `/home/amogus/.cache/codex-spotifyd-target-5448a347`.
 - Recorder state and incidents: `/var/lib/spotifyd-diagnostics`.
+- Preserved context-edge incident:
+  `/var/lib/spotifyd-diagnostics/manual/1789308023769543909-skip`.
 - Post-deploy journal cursor at 15:22:13 CEST:
   `s=a7721078550c4aad9c2c6e841619427c;i=1d1a7005;b=c372bd5fe0114b7ebdbd81298aa3a7f4;m=13f2690e84;t=65b5d343c72b1;x=772ec61232f1652a`.
 
 # Unresolved issues
 
-- A bounded post-deploy window with confirmed active PCM playback is still
-  required to quantify the 250 ms sink-write event/byte rate in live use.
+- `b78e849` is locally verified but not yet built or deployed on RPI-01; the
+  runtime still uses playback source `09369c860eb8890603b2a50dcbafc6acd6673c96`.
 - Earlier context-update XRUNs remain unclassified. Neither the seek fix nor
   instrumentation threshold should be credited or blamed without new evidence.
 
 # NEXT ACTION
 
-Capture one cursor-bounded window with confirmed active PCM playback, measure
-250 ms sink-write events/bytes against the retained baseline, and independently
-preserve any new XRUN detected in that same window.
+Push `b78e849`, build one exact ARM candidate pinned to that source revision,
+deploy it with rollback/hash verification, then resume passive monitoring.
