@@ -58,6 +58,26 @@ class RetentionTests(unittest.TestCase):
             self.assertIn("timed out", pi_records[0]["error"])
             self.assertEqual(pi_records[1]["output"], "ok\n")
 
+    def test_xrun_cursor_is_persisted_and_used_after_restart(self):
+        with tempfile.TemporaryDirectory() as root:
+            recorder = Recorder(root)
+            try:
+                recorder.record(
+                    "journal",
+                    json.dumps({"MESSAGE": "underrun occurred", "__CURSOR": "test-cursor"}),
+                )
+                self.assertEqual((Path(root) / "journal.cursor").read_text(), "test-cursor\n")
+                recorder.ring.file.close()
+                recorder.ring.file = None
+
+                restarted = Recorder(root)
+                command = restarted.journal_command()
+                self.assertIn("--after-cursor=test-cursor", command)
+                self.assertNotIn("--since=-10min", command)
+            finally:
+                if recorder.ring.file:
+                    recorder.ring.file.close()
+
 
 if __name__ == "__main__":
     unittest.main()

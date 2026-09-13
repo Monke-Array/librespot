@@ -7,6 +7,11 @@ reported explicitly. A timed-out `vcgencmd` sample is recorded and skipped
 without restarting the recorder. `pidstat` follows spotifyd by process name
 across restarts.
 
+The journal collector persists its latest journal cursor every 30 seconds, at
+each XRUN trigger, and on orderly shutdown. After a restart it resumes after
+that cursor instead of replaying a recent XRUN as a new incident. The
+ten-minute lookback is used only before the first cursor is established.
+
 Storage: `/var/lib/spotifyd-diagnostics` (root, 0700). Each telemetry and packet
 ring has 12 segments, rotated every minute or 4 MiB. At an ALSA EPIPE/underrun,
 the recorder immediately copies the rings and copies again 45 seconds later.

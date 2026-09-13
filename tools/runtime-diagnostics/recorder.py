@@ -52,12 +52,32 @@ class Recorder:
         self.pending = None
         self.stopping = False
         self.last_incident = -1000
+        self.journal_cursor_file = self.root / "journal.cursor"
+        try:
+            self.journal_cursor = self.journal_cursor_file.read_text().strip() or None
+        except OSError:
+            self.journal_cursor = None
 
     def record(self, source, data):
         value = dict(wall_ns=time.time_ns(), mono_ns=time.monotonic_ns(), source=source, data=data)
         self.ring.write(value)
-        if source == "journal" and TRIGGER.search(data):
-            self.trigger(value)
+        if source == "journal":
+            try:
+                cursor = json.loads(data).get("__CURSOR")
+            except (AttributeError, json.JSONDecodeError):
+                cursor = None
+            if isinstance(cursor, str) and cursor:
+                self.journal_cursor = cursor
+            if TRIGGER.search(data):
+                self.persist_journal_cursor()
+                self.trigger(value)
+
+    def persist_journal_cursor(self):
+        if not self.journal_cursor:
+            return
+        temporary = self.journal_cursor_file.with_name(self.journal_cursor_file.name + ".tmp")
+        temporary.write_text(self.journal_cursor + "\n")
+        os.replace(temporary, self.journal_cursor_file)
 
     def snapshot(self, target):
         target.mkdir(exist_ok=True)
@@ -94,6 +114,14 @@ class Recorder:
         self.children[name] = proc
         self.record("collector", dict(start=name, pid=proc.pid, args=args))
 
+    def journal_command(self):
+        command = ["journalctl", "_UID=1000", "_SYSTEMD_USER_UNIT=spotifyd.service"]
+        if self.journal_cursor:
+            command.append(f"--after-cursor={self.journal_cursor}")
+        else:
+            command.append("--since=-10min")
+        return [*command, "-f", "-o", "json", "--no-pager"]
+
     def proc_sample(self, tick):
         paths = glob.glob("/proc/pressure/*") + glob.glob("/proc/asound/card*/pcm*p/sub*/status")
         paths += ["/proc/stat", "/proc/meminfo", "/proc/diskstats", "/proc/interrupts", "/proc/softirqs"]
@@ -128,10 +156,10 @@ class Recorder:
                         dict(command=arg, output="", error=f"timed out after {error.timeout} seconds"),
                     )
             self.record("disk_free", shutil.disk_usage(self.root).free)
+            self.persist_journal_cursor()
 
     def run(self):
-        self.start("journal", ["journalctl", "_UID=1000", "_SYSTEMD_USER_UNIT=spotifyd.service",
-                               "--since=-10min", "-f", "-o", "json", "--no-pager"])
+        self.start("journal", self.journal_command())
         self.start("vmstat", ["stdbuf", "-oL", "vmstat", "-t", "1"])
         self.start("iostat", ["stdbuf", "-oL", "iostat", "-xz", "-t", "1"])
         self.start("pidstat", ["stdbuf", "-oL", "pidstat", "-t", "-u", "-r", "-d", "-w", "-h", "-G", "spotifyd", "1"])
@@ -166,6 +194,7 @@ class Recorder:
                     (event / "complete.json").write_text(json.dumps(dict(wall_ns=time.time_ns())))
                     self.pending = None
         finally:
+            self.persist_journal_cursor()
             for proc in self.children.values():
                 if proc.poll() is None:
                     proc.terminate()
