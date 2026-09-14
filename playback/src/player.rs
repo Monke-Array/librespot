@@ -2705,39 +2705,18 @@ impl PlayerInternal {
         if track_id != requested_track_id {
             return Ok(false);
         }
-        if source.decoder.is_worker()
-            && position_ms != 0
-            && position_ms != source.stream_position_ms
+        if position_ms != source.stream_position_ms
+            && !(source.decoder.is_worker() && position_ms == 0)
         {
             return Ok(false);
         }
 
         let PlayerPreload::Ready {
-            track_id,
-            mut source,
-            transition,
-            secondary_trim_frames,
+            track_id, source, ..
         } = mem::replace(&mut self.preload, PlayerPreload::None)
         else {
             unreachable!("ready preload changed while being promoted");
         };
-
-        if transition.scheduled_plan().is_some() && position_ms != source.stream_position_ms {
-            self.preload = PlayerPreload::Ready {
-                track_id,
-                transition,
-                secondary_trim_frames,
-                source,
-            };
-            return Ok(false);
-        }
-
-        if position_ms != source.stream_position_ms
-            && !(source.decoder.is_worker() && position_ms == 0)
-        {
-            // This may be blocking, exactly as in the existing preloaded-track path.
-            source.stream_position_ms = source.decoder.seek(position_ms)?;
-        }
 
         crate::core::runtime_trace!(
             "promote player={} generation={} play_request_id={play_request_id} track={track_id} playable={} position_ms={} worker={}",
@@ -5256,6 +5235,40 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn different_position_load_retires_ready_fallback_and_starts_fresh_loader() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts.clone(), stops.clone());
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(20_000));
+        set_ready_secondary(
+            &mut player,
+            next_track_uri(),
+            scripted_source(next_track_uri(), 0, Box::new(PanicDecoder)),
+        );
+
+        let _guard = runtime.enter();
+        player
+            .handle_command_load(next_track_uri(), None, true, 42_000)
+            .expect("different-position load should fall back to a fresh loader");
+
+        assert!(matches!(
+            &player.state,
+            PlayerState::Loading {
+                track_id,
+                start_playback: true,
+                position_ms: 42_000,
+                ..
+            } if track_id == &next_track_uri()
+        ));
+        assert!(matches!(player.preload, PlayerPreload::None));
+        assert_eq!(player.transition.state(), TransitionState::Idle);
+        assert_eq!(player.sink_status, SinkStatus::TemporarilyClosed);
+        assert_eq!(stops.load(Ordering::Acquire), 1);
+        assert_eq!(starts.load(Ordering::Acquire), 0);
     }
 
     #[test]
