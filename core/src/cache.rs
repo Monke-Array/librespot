@@ -429,6 +429,42 @@ impl Cache {
         Err(CacheError::Path.into())
     }
 
+    /// Save a completed download, reusing its on-disk data when the download and cache are on
+    /// the same filesystem. If linking is unavailable (for example across filesystems), fall back
+    /// to copying from `contents` as [`Cache::save_file`] does.
+    pub fn save_file_from_path<F: Read>(
+        &self,
+        file: FileId,
+        source: &Path,
+        contents: &mut F,
+    ) -> Result<PathBuf, Error> {
+        if let Some(path) = self.file_path(file) {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+                let size = match fs::hard_link(source, &path) {
+                    Ok(()) => {
+                        debug!("Linked completed download into cache at {path:?}");
+                        path.metadata()?.len()
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => path.metadata()?.len(),
+                    Err(e) => {
+                        debug!(
+                            "Could not link completed download into cache at {path:?}: {e}; copying"
+                        );
+                        File::create(&path).and_then(|mut file| io::copy(contents, &mut file))?
+                    }
+                };
+
+                if let Some(limiter) = self.size_limiter.as_deref() {
+                    limiter.add(&path, size);
+                    limiter.prune()?;
+                }
+                return Ok(path);
+            }
+        }
+        Err(CacheError::Path.into())
+    }
+
     pub fn remove_file(&self, file: FileId) -> Result<(), Error> {
         let path = self.file_path(file).ok_or(CacheError::Path)?;
 
@@ -490,5 +526,55 @@ mod test {
         limiter.add(Path::new("f"), 500, ordered_time(2));
         assert!(limiter.remove(Path::new("c")));
         assert!(!limiter.exceeds_limit());
+    }
+
+    #[test]
+    fn save_file_from_path_reuses_same_filesystem_inode() {
+        let root = std::env::temp_dir().join(format!(
+            "librespot-cache-hardlink-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let source_path = root.join("completed-download");
+        fs::write(&source_path, b"completed audio").unwrap();
+        let mut source = File::open(&source_path).unwrap();
+        let cache = Cache::new(None::<&Path>, None::<&Path>, Some(root.as_path()), None).unwrap();
+        let file_id = FileId([1; 20]);
+
+        let cached_path = cache
+            .save_file_from_path(file_id, &source_path, &mut source)
+            .unwrap();
+        drop(source);
+
+        fs::write(&source_path, b"same inode").unwrap();
+        assert_eq!(fs::read(cached_path).unwrap(), b"same inode");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn save_file_from_path_copies_when_linking_is_unavailable() {
+        let root = std::env::temp_dir().join(format!(
+            "librespot-cache-copy-fallback-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let cache = Cache::new(None::<&Path>, None::<&Path>, Some(root.as_path()), None).unwrap();
+        let file_id = FileId([2; 20]);
+        let mut contents = io::Cursor::new(b"fallback audio");
+
+        let cached_path = cache
+            .save_file_from_path(file_id, &root.join("missing-source"), &mut contents)
+            .unwrap();
+
+        assert_eq!(fs::read(cached_path).unwrap(), b"fallback audio");
+        fs::remove_dir_all(root).unwrap();
     }
 }

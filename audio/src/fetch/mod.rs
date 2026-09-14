@@ -553,7 +553,8 @@ impl AudioFile {
 
             if let Some(cache) = session_.cache() {
                 if let Some(cache_id) = cache.file_path(file_id) {
-                    if let Err(e) = cache.save_file(file_id, &mut file) {
+                    let source_path = file.path().to_owned();
+                    if let Err(e) = cache.save_file_from_path(file_id, &source_path, &mut file) {
                         error!("Error caching file {file_id} to {cache_id:?}: {e}");
                     } else {
                         debug!("File {file_id} cached to {cache_id:?}");
