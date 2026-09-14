@@ -2664,15 +2664,11 @@ impl PlayerInternal {
 
         let position_ms = transition.next_start_position_ms();
         if source.stream_position_ms != position_ms {
-            match source.decoder.seek(position_ms) {
-                Ok(actual_position_ms) => source.stream_position_ms = actual_position_ms,
-                Err(error) => {
-                    debug!(
-                        "Unable to retarget ready secondary source for <{track_id}> to {position_ms} ms: {error}"
-                    );
-                    return false;
-                }
-            }
+            debug!(
+                "Ready secondary source for <{track_id}> is at {} ms; reloading asynchronously for updated plan position {position_ms} ms",
+                source.stream_position_ms
+            );
+            return false;
         }
 
         *secondary_trim_frames = Self::secondary_trim_frames_for_plan(
@@ -3618,7 +3614,7 @@ impl PlayerInternal {
         // Now we check at different positions whether we already have a pre-loaded version
         // of this track somewhere. If so, use it and return.
 
-        let worker_source_requires_reload = match &self.state {
+        let position_mismatch_requires_reload = match &self.state {
             PlayerState::Playing {
                 track_id: current_track_id,
                 source,
@@ -3633,16 +3629,12 @@ impl PlayerInternal {
                 track_id: current_track_id,
                 source,
                 ..
-            } => {
-                current_track_id == &track_id
-                    && source.decoder.is_worker()
-                    && position_ms != source.stream_position_ms
-            }
+            } => current_track_id == &track_id && position_ms != source.stream_position_ms,
             _ => false,
         };
-        if worker_source_requires_reload {
+        if position_mismatch_requires_reload {
             debug!(
-                "Reopening worker-backed current <{track_id}> at requested position {position_ms} ms"
+                "Reopening current <{track_id}> at requested position {position_ms} ms instead of synchronously seeking it"
             );
         }
 
@@ -3653,7 +3645,7 @@ impl PlayerInternal {
             ..
         } = &self.state
         {
-            if *previous_track_id == track_id && !worker_source_requires_reload {
+            if *previous_track_id == track_id && !position_mismatch_requires_reload {
                 let mut source = match mem::replace(&mut self.state, PlayerState::Invalid) {
                     PlayerState::EndOfTrack { source, .. } => source,
                     _ => {
@@ -3692,7 +3684,7 @@ impl PlayerInternal {
             ..
         } = self.state
         {
-            if *current_track_id == track_id && !worker_source_requires_reload {
+            if *current_track_id == track_id && !position_mismatch_requires_reload {
                 // we can use the current decoder. Ensure it's at the correct position.
                 if position_ms != source.stream_position_ms {
                     // This may be blocking.
@@ -3802,10 +3794,16 @@ impl PlayerInternal {
             if currently_loading == track_id {
                 if self.preload.transition() == Some(&transition)
                     || self.update_ready_preload_transition(&track_id, transition.clone())
-                    || matches!(self.preload, PlayerPreload::Ready { .. })
+                    || matches!(
+                        &self.preload,
+                        PlayerPreload::Ready { source, .. }
+                            if self.transition.state() != TransitionState::Idle
+                                || source.decoder.is_worker()
+                    )
                 {
                     // we're already preloading the requested track, or a dormant ready preload was
-                    // retargeted to the new scheduled transition plan.
+                    // retargeted to a new plan at the same source position. An active transition or
+                    // worker-backed source cannot safely be replaced here, so it retains ownership.
                     preload_track = false;
                 } else {
                     self.cancel_secondary_source("next-track preload was replaced");
@@ -5272,6 +5270,45 @@ mod tests {
     }
 
     #[test]
+    fn different_position_load_reopens_playing_source_without_blocking_seek() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts.clone(), stops.clone());
+        set_playing_source(
+            &mut player,
+            track_uri(),
+            scripted_source(track_uri(), 20_000, Box::new(PanicDecoder)),
+        );
+        set_ready_secondary(
+            &mut player,
+            next_track_uri(),
+            scripted_source(next_track_uri(), 0, Box::new(PanicDecoder)),
+        );
+        arm_test_transition(&mut player);
+
+        let _guard = runtime.enter();
+        player
+            .handle_command_load(track_uri(), None, true, 42_000)
+            .expect("different-position current load should use a fresh loader");
+
+        assert!(matches!(
+            &player.state,
+            PlayerState::Loading {
+                track_id,
+                start_playback: true,
+                position_ms: 42_000,
+                ..
+            } if track_id == &track_uri()
+        ));
+        assert!(matches!(player.preload, PlayerPreload::None));
+        assert_eq!(player.transition.state(), TransitionState::Idle);
+        assert_eq!(player.sink_status, SinkStatus::TemporarilyClosed);
+        assert_eq!(stops.load(Ordering::Acquire), 1);
+        assert_eq!(starts.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn same_track_ready_preload_accepts_scheduled_plan_without_reloading() {
         let runtime = tokio::runtime::Runtime::new().expect("test runtime");
         let starts = Arc::new(AtomicUsize::new(0));
@@ -5280,12 +5317,22 @@ mod tests {
         set_playing_source(&mut player, track_uri(), scripted_loaded_track(800));
 
         let next_track_id = next_track_uri();
-        let next_source = scripted_source(next_track_id.clone(), 0, Box::new(ScriptedDecoder));
+        let next_source = scripted_source(next_track_id.clone(), 12_000, Box::new(ScriptedDecoder));
         let decoder_address = next_source
             .decoder
             .direct_decoder_address()
             .expect("ready preload should own a direct decoder");
         set_ready_secondary(&mut player, next_track_id.clone(), next_source);
+        let previous_plan = speed_transition_plan(
+            Duration::from_millis(5_000),
+            Duration::from_millis(12_000),
+            1.0,
+        );
+        let PlayerPreload::Ready { transition, .. } = &mut player.preload else {
+            unreachable!("test installed a ready preload")
+        };
+        *transition = PreloadTransition::Scheduled(previous_plan);
+        let previous_generation = player.secondary_generation;
 
         let _guard = runtime.enter();
         player.handle_command_preload(
@@ -5313,6 +5360,43 @@ mod tests {
         assert!(matches!(transition, PreloadTransition::Scheduled(_)));
         assert_eq!(source.stream_position_ms, 12_000);
         assert_eq!(*secondary_trim_frames, 0);
+        assert_eq!(player.secondary_generation, previous_generation);
+    }
+
+    #[test]
+    fn same_track_plan_position_change_reloads_secondary_without_blocking_current() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts.clone(), stops.clone());
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(800));
+        let next_track_id = next_track_uri();
+        set_ready_secondary(
+            &mut player,
+            next_track_id.clone(),
+            scripted_source(next_track_id.clone(), 0, Box::new(PanicDecoder)),
+        );
+        let previous_generation = player.secondary_generation;
+
+        let _guard = runtime.enter();
+        player.handle_command_preload(
+            next_track_id.clone(),
+            PreloadTransition::Scheduled(scheduled_test_plan()),
+        );
+
+        assert!(matches!(
+            &player.preload,
+            PlayerPreload::Loading {
+                track_id,
+                transition: PreloadTransition::Scheduled(_),
+                ..
+            } if track_id == &next_track_id
+        ));
+        assert_ne!(player.secondary_generation, previous_generation);
+        assert_eq!(player.transition.state(), TransitionState::Idle);
+        assert_eq!(player.sink_status, SinkStatus::Running);
+        assert_eq!(stops.load(Ordering::Acquire), 0);
+        assert_eq!(starts.load(Ordering::Acquire), 0);
     }
 
     #[test]
