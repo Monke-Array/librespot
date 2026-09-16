@@ -1,0 +1,227 @@
+{
+  "format": "spotify-live-recipe-evidence-v1",
+  "clientVersion": "1.3.0.277.g5441bb3e",
+  "experiment": "E3 saved Blended, official endpoint controlled by phone",
+  "probe": {
+    "requestStartedAt": "2026-09-15T14:55:04.019Z",
+    "responseReceivedAt": "2026-09-15T14:55:04.020Z",
+    "source": "explicit diagnostic MetadataService.Fetch; cache/network origin not distinguished",
+    "service": "spotify.mdata_esperanto.proto.MetadataService",
+    "method": "Fetch",
+    "extensionKind": 244,
+    "typeUrl": "type.googleapis.com/spotify.playlistmixing.mixtransition.TransitionData",
+    "status": 200,
+    "transitionUri": "spotify:transition:77XHoqQ5xJMsKf5HHXeY7a:1789483453786",
+    "latestTransitionUri": "spotify:transition:77XHoqQ5xJMsKf5HHXeY7a:1789483453786",
+    "playlistUri": "spotify:playlist:5tz0Ioe9JTJyPB4Sd2ewT8",
+    "trackAUri": "spotify:track:3eekarcy7kvN4yt5ZFzltW",
+    "trackBUri": "spotify:track:7ycWLEP1GsNjVvcjawXz3z",
+    "recipeBase64": "CrgCChAzMjQ0ODdiZjI4MDA3YTE3EhAwYTBiZTg2YTliMjUyY2E2GLSYCSDELCi4YjUAAIA/PUrPcz9ABEgBUiRzcG90aWZ5OnRyYWNrOjNlZWthcmN5N2t2TjR5dDVaRnpsdFdaJHNwb3RpZnk6dHJhY2s6N3ljV0xFUDFHc05qVnZjamF3WHozemIkc3BvdGlmeTp0cmFjazozZWVrYXJjeTdrdk40eXQ1WkZ6bHRXaiRzcG90aWZ5OnRyYWNrOjd5Y1dMRVAxR3NOalZ2Y2phd1h6M3pyIDliOGZhZDg0YmI2MzczYTE3MjczOTZkMTdiM2I5ODlheiBmMTMwYzg3YTQ3ZWRmYWQzZjVlZDZmNmM0NTZmMThlYoUBhmGYQo0BhmGYQpEBAAAAAAAA8D+ZAQAAAAAAAPA/EgIIAiAB",
+    "codecModules": {
+      "metadataId": "48004",
+      "transportId": "24475",
+      "decoderId": "89610"
+    },
+    "recipeSha256": "0737c7d15fb3ca913d4e49853d9b883e572b1921ff575f2cad0ece3e4c2b9d2f",
+    "recipeBytes": 321
+  },
+  "nativeQueue": {
+    "sourceSha256": "c8cbe9d06fa2e85edb10bc33effc94a2e1995205558b0f4be0062ecd68e740ea",
+    "observations": [
+      {
+        "utc": "2026-09-15T14:51:44.114Z",
+        "stage": "context-player-queue-stream",
+        "key": "automix.auto_transition_recipe",
+        "outgoing_uri": "spotify:track:3eekarcy7kvN4yt5ZFzltW",
+        "incoming_uri": "spotify:track:7ycWLEP1GsNjVvcjawXz3z",
+        "transition_uri": "spotify:transition:77XHoqQ5xJMsKf5HHXeY7a:1789483453786"
+      }
+    ],
+    "inventory": [
+      {
+        "field": 1,
+        "name": "overlap",
+        "type": "message",
+        "wire": 2,
+        "value": [
+          {
+            "field": 1,
+            "name": "track_a_row_id",
+            "type": "string",
+            "wire": 2,
+            "value": "324487bf28007a17"
+          },
+          {
+            "field": 2,
+            "name": "track_b_row_id",
+            "type": "string",
+            "wire": 2,
+            "value": "0a0be86a9b252ca6"
+          },
+          {
+            "field": 3,
+            "name": "start_a_ms",
+            "type": "int32",
+            "wire": 0,
+            "value": 150580
+          },
+          {
+            "field": 4,
+            "name": "start_b_ms",
+            "type": "int32",
+            "wire": 0,
+            "value": 5700
+          },
+          {
+            "field": 5,
+            "name": "duration_ms",
+            "type": "int32",
+            "wire": 0,
+            "value": 12600
+          },
+          {
+            "field": 6,
+            "name": "speed_a",
+            "type": "float",
+            "wire": 5,
+            "value": 1
+          },
+          {
+            "field": 7,
+            "name": "speed_b",
+            "type": "float",
+            "wire": 5,
+            "value": 0.9523817300796509
+          },
+          {
+            "field": 8,
+            "name": "duration_bars",
+            "type": "int32",
+            "wire": 0,
+            "value": 4
+          },
+          {
+            "field": 9,
+            "name": "is_beatmatched",
+            "type": "bool",
+            "wire": 0,
+            "value": true
+          },
+          {
+            "field": 10,
+            "name": "track_a_uri",
+            "type": "string",
+            "wire": 2,
+            "value": "spotify:track:3eekarcy7kvN4yt5ZFzltW"
+          },
+          {
+            "field": 11,
+            "name": "track_b_uri",
+            "type": "string",
+            "wire": 2,
+            "value": "spotify:track:7ycWLEP1GsNjVvcjawXz3z"
+          },
+          {
+            "field": 12,
+            "name": "track_a_playable_uri",
+            "type": "string",
+            "wire": 2,
+            "value": "spotify:track:3eekarcy7kvN4yt5ZFzltW"
+          },
+          {
+            "field": 13,
+            "name": "track_b_playable_uri",
+            "type": "string",
+            "wire": 2,
+            "value": "spotify:track:7ycWLEP1GsNjVvcjawXz3z"
+          },
+          {
+            "field": 14,
+            "name": "track_a_playable_beats_hash",
+            "type": "string",
+            "wire": 2,
+            "value": "9b8fad84bb6373a1727396d17b3b989a"
+          },
+          {
+            "field": 15,
+            "name": "track_b_playable_beats_hash",
+            "type": "string",
+            "wire": 2,
+            "value": "f130c87a47edfad3f5ed6f6c456f18eb"
+          },
+          {
+            "field": 16,
+            "name": "bpm_a",
+            "type": "float",
+            "wire": 5,
+            "value": 76.19047546386719
+          },
+          {
+            "field": 17,
+            "name": "bpm_b",
+            "type": "float",
+            "wire": 5,
+            "value": 76.19047546386719
+          },
+          {
+            "field": 18,
+            "name": "item_speed_a",
+            "type": "double",
+            "wire": 1,
+            "value": 1
+          },
+          {
+            "field": 19,
+            "name": "item_speed_b",
+            "type": "double",
+            "wire": 1,
+            "value": 1
+          }
+        ]
+      },
+      {
+        "field": 2,
+        "name": "preset",
+        "type": "message",
+        "wire": 2,
+        "value": [
+          {
+            "field": 1,
+            "name": "id",
+            "type": "int32",
+            "wire": 0,
+            "value": 2
+          }
+        ]
+      },
+      {
+        "field": 4,
+        "name": "is_preset_id_override",
+        "type": "bool",
+        "wire": 0,
+        "value": true
+      }
+    ]
+  },
+  "rpi": {
+    "commit": "b63949c",
+    "observationUtc": "2026-09-15T14:48:45.926Z",
+    "evidence": "rpi-e2.jsonl",
+    "rawHashAvailable": false,
+    "decoded": {
+      "start_a_ms": 150580,
+      "start_b_ms": 5700,
+      "duration_ms": 12600,
+      "preset_id": 2,
+      "speed_a": 1,
+      "speed_b": 0.95238173,
+      "duration_bars": 4,
+      "beatmatched": true,
+      "bpm_a": 76.190475,
+      "bpm_b": 76.190475,
+      "item_speed_a": 1,
+      "item_speed_b": 1
+    },
+    "result": "UnsupportedPresetStyle(2); existing TRANSITION_DATA hydration also succeeded"
+  }
+}
