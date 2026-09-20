@@ -226,6 +226,7 @@ pub(crate) struct ResolvedSpotifyStyle {
     pub fx_out_overrides: Option<FxCurveOverrides>,
     pub fx_in_overrides: Option<FxCurveOverrides>,
     pub volume_override_ignored: bool,
+    pub optional_curve_overrides_ignored: bool,
     pub unsupported: Vec<SpotifyRenderCapability>,
 }
 
@@ -270,6 +271,12 @@ pub(crate) fn resolve_spotify_style(
         resolve_volume_style(styles.volume, effective_num_bars)?;
     let has_volume_override =
         preset.volume_out_curve_override.is_some() || preset.volume_in_curve_override.is_some();
+    let has_optional_curve_override = preset.eq_out_curve_overrides.is_some()
+        || preset.eq_in_curve_overrides.is_some()
+        || preset.filter_out_curve_overrides.is_some()
+        || preset.filter_in_curve_overrides.is_some()
+        || preset.fx_out_curve_overrides.is_some()
+        || preset.fx_in_curve_overrides.is_some();
     if use_curve_overrides {
         if let Some(curves) = preset.volume_out_curve_override.as_ref() {
             outgoing_volume = curves.clone();
@@ -355,6 +362,7 @@ pub(crate) fn resolve_spotify_style(
             .then(|| preset.fx_in_curve_overrides.as_ref().cloned())
             .flatten(),
         volume_override_ignored: has_volume_override && !use_curve_overrides,
+        optional_curve_overrides_ignored: has_optional_curve_override && !use_curve_overrides,
         unsupported,
     })
 }
@@ -651,6 +659,22 @@ mod tests {
         assert_eq!(enabled.outgoing_volume, line(0.8, 0.1));
         assert_eq!(enabled.incoming_volume, line(0.2, 0.9));
         assert!(!enabled.volume_override_ignored);
+    }
+
+    #[test]
+    fn disabled_optional_curve_overrides_remain_explicitly_unresolved() {
+        let mut value = preset(11);
+        value.eq_out_curve_overrides = MessageField::some(EqCurveOverrides::default());
+
+        let disabled = resolve_spotify_style(&value, &overlap(4), false).unwrap();
+        assert!(disabled.optional_curve_overrides_ignored);
+
+        let enabled = resolve_spotify_style(&value, &overlap(4), true).unwrap();
+        assert!(!enabled.optional_curve_overrides_ignored);
+        assert!(matches!(
+            enabled.unsupported.as_slice(),
+            [SpotifyRenderCapability::EqPhysicalMapping { style_id: 0 }]
+        ));
     }
 
     #[test]

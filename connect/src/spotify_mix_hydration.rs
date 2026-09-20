@@ -28,23 +28,14 @@ pub(crate) struct TransitionHydrationKey {
 }
 
 impl TransitionHydrationKey {
-    pub(crate) fn matches_pair(
-        &self,
-        playlist_uri: &str,
-        row_uid: &str,
-        transition_uri: &str,
-        outgoing_uri: &str,
-        incoming_uri: &str,
-        session_id: &str,
-        generation: u64,
-    ) -> bool {
-        self.playlist_uri == playlist_uri
-            && self.row_uid.eq_ignore_ascii_case(row_uid)
-            && self.transition_uri == transition_uri
-            && self.outgoing_uri == outgoing_uri
-            && self.incoming_uri == incoming_uri
-            && self.session_id == session_id
-            && self.generation == generation
+    pub(crate) fn matches_pair(&self, active: &Self) -> bool {
+        self.playlist_uri == active.playlist_uri
+            && self.row_uid.eq_ignore_ascii_case(&active.row_uid)
+            && self.transition_uri == active.transition_uri
+            && self.outgoing_uri == active.outgoing_uri
+            && self.incoming_uri == active.incoming_uri
+            && self.session_id == active.session_id
+            && self.generation == active.generation
     }
 }
 
@@ -328,6 +319,7 @@ mod tests {
     const TRANSITION_URI: &str = "spotify:transition:2vwr8lGr3wloJKe3bqUSRf:1786638792016";
     const TRACK_A: &str = "spotify:track:2BMRUAA1oTc7e9JPlr6xbZ";
     const TRACK_B: &str = "spotify:track:5g9lS8deSIxItFBmZRC4vN";
+    type TransitionMutation = (&'static str, Box<dyn Fn(&mut TransitionData)>);
 
     fn key() -> TransitionHydrationKey {
         TransitionHydrationKey {
@@ -533,7 +525,7 @@ mod tests {
 
     #[test]
     fn envelope_mismatches_are_rejected() {
-        let cases: Vec<(&str, Box<dyn Fn(&mut TransitionData)>)> = vec![
+        let cases: Vec<TransitionMutation> = vec![
             (
                 "transition URI",
                 Box::new(|data| data.transition_uri = "spotify:transition:other".into()),
@@ -618,51 +610,23 @@ mod tests {
     #[test]
     fn stale_context_or_pair_does_not_match_hydration_key() {
         let key = key();
-        assert!(key.matches_pair(
-            PLAYLIST,
-            ROW_UID,
-            TRANSITION_URI,
-            TRACK_A,
-            TRACK_B,
-            "session-1",
-            7
-        ));
-        assert!(!key.matches_pair(
-            "spotify:playlist:other",
-            ROW_UID,
-            TRANSITION_URI,
-            TRACK_A,
-            TRACK_B,
-            "session-1",
-            7
-        ));
-        assert!(!key.matches_pair(
-            PLAYLIST,
-            ROW_UID,
-            "spotify:transition:other",
-            TRACK_A,
-            TRACK_B,
-            "session-1",
-            7
-        ));
-        assert!(!key.matches_pair(
-            PLAYLIST,
-            ROW_UID,
-            TRANSITION_URI,
-            TRACK_A,
-            TRACK_B,
-            "session-2",
-            7
-        ));
-        assert!(!key.matches_pair(
-            PLAYLIST,
-            ROW_UID,
-            TRANSITION_URI,
-            TRACK_A,
-            TRACK_B,
-            "session-1",
-            8
-        ));
+        assert!(key.matches_pair(&key));
+
+        let mut stale = key.clone();
+        stale.playlist_uri = "spotify:playlist:other".to_owned();
+        assert!(!key.matches_pair(&stale));
+
+        stale = key.clone();
+        stale.transition_uri = "spotify:transition:other".to_owned();
+        assert!(!key.matches_pair(&stale));
+
+        stale = key.clone();
+        stale.session_id = "session-2".to_owned();
+        assert!(!key.matches_pair(&stale));
+
+        stale = key.clone();
+        stale.generation = 8;
+        assert!(!key.matches_pair(&stale));
     }
 
     #[test]

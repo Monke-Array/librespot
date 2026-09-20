@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, time::Duration};
+use std::time::Duration;
+
+#[cfg(test)]
+use std::collections::BTreeSet;
 
 use data_encoding::BASE64;
 use librespot_playback::{
@@ -35,26 +38,35 @@ pub(crate) enum SpotifyTransitionError {
     InvalidDuration,
     #[error("recipe overlap contains a non-finite analysis value")]
     InvalidAnalysisValue,
+    #[cfg(test)]
     #[error("recipe outgoing URI does not match the playlist item")]
     TrackAMismatch,
+    #[cfg(test)]
     #[error("recipe incoming URI does not match the next playlist item")]
     TrackBMismatch,
+    #[cfg(test)]
     #[error("recipe outgoing item speed does not match the playlist item")]
     ItemSpeedAMismatch,
+    #[cfg(test)]
     #[error("recipe incoming item speed does not match the playlist item")]
     ItemSpeedBMismatch,
+    #[cfg(test)]
     #[error("recipe has no preset")]
     MissingPreset,
+    #[cfg(test)]
     #[error("recipe has no outgoing volume curve override")]
     MissingOutgoingVolumeCurve,
+    #[cfg(test)]
     #[error("recipe has no incoming volume curve override")]
     MissingIncomingVolumeCurve,
     #[error("preset/style resolution required (preset={0})")]
     UnsupportedPresetStyle(i32),
     #[error("tempo handling required ({0}={1})")]
     UnsupportedTempo(&'static str, f32),
+    #[cfg(test)]
     #[error("EQ/filter/FX rendering required")]
     UnsupportedEffects,
+    #[cfg(test)]
     #[error("inline volume automation is required")]
     UnsupportedVolumeAutomation,
     #[error(transparent)]
@@ -73,7 +85,6 @@ pub(crate) enum SpotifyTransitionSource {
     Saved,
     BackendAuto,
     LocalAuto,
-    TerminalNone,
     DeterministicFallback,
 }
 
@@ -149,10 +160,8 @@ pub(crate) enum SpotifyTransitionResolution {
         provenance: SpotifyTransitionProvenance,
         edge: SpotifyTransitionEdge,
     },
+    #[cfg(test)]
     LocalAuto {
-        rejections: Vec<SpotifyTransitionAttempt>,
-    },
-    DeterministicFallback {
         rejections: Vec<SpotifyTransitionAttempt>,
     },
 }
@@ -161,7 +170,7 @@ pub(crate) enum SpotifyTransitionResolution {
 pub(crate) enum SpotifyTransitionPlanResolution {
     Selected {
         transition: ResolvedSpotifyTransition,
-        style: ResolvedSpotifyStyle,
+        style: Box<ResolvedSpotifyStyle>,
         plan: TransitionPlan,
         rejections: Vec<SpotifyTransitionAttempt>,
     },
@@ -172,9 +181,6 @@ pub(crate) enum SpotifyTransitionPlanResolution {
         rejections: Vec<SpotifyTransitionAttempt>,
     },
     LocalAuto {
-        rejections: Vec<SpotifyTransitionAttempt>,
-    },
-    DeterministicFallback {
         rejections: Vec<SpotifyTransitionAttempt>,
     },
 }
@@ -288,6 +294,7 @@ fn evaluate_recipe_candidate(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_recipe_sources(
     active_edge: &SpotifyTransitionEdge,
     saved: Option<SpotifyTransitionCandidate>,
@@ -339,7 +346,7 @@ pub(crate) fn resolve_transition_plan_sources(
                     Ok((style, plan)) => {
                         return SpotifyTransitionPlanResolution::Selected {
                             transition,
-                            style,
+                            style: Box::new(style),
                             plan,
                             rejections,
                         };
@@ -383,7 +390,10 @@ pub(crate) fn resolve_transition_plan_sources(
                     rejections,
                 };
             }
-            Ok(_) => unreachable!("candidate evaluation only selects a recipe or terminal NONE"),
+            #[cfg(test)]
+            Ok(SpotifyTransitionResolution::LocalAuto { .. }) => {
+                unreachable!("candidate evaluation only selects a recipe or terminal NONE")
+            }
             Err(rejection) => rejections.push(rejection),
         }
     }
@@ -402,7 +412,10 @@ fn transition_plan_for_resolved_recipe(
         .expect("selected recipes retain a validated preset");
     let style =
         resolve_spotify_style(preset, overlap, false).map_err(SpotifyRecipePlanError::Style)?;
-    if !style.unsupported.is_empty() || style.volume_override_ignored {
+    if !style.unsupported.is_empty()
+        || style.volume_override_ignored
+        || style.optional_curve_overrides_ignored
+    {
         return Err(SpotifyRecipePlanError::UnsupportedRenderer);
     }
 
@@ -478,6 +491,7 @@ impl SpotifyTransitionRecipe {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_local_auto(
         outgoing: &ProvidedTrack,
         incoming: &ProvidedTrack,
@@ -565,6 +579,7 @@ impl SpotifyTransitionRecipe {
         Ok(())
     }
 
+    #[cfg(test)]
     fn validate_pair(
         &self,
         outgoing_uri: &str,
@@ -592,6 +607,7 @@ impl SpotifyTransitionRecipe {
         Ok(())
     }
 
+    #[cfg(test)]
     fn to_plan(&self) -> Result<TransitionPlan, SpotifyTransitionError> {
         let overlap = self.overlap()?;
         let preset = self
@@ -618,6 +634,7 @@ impl SpotifyTransitionRecipe {
         .map_err(Into::into)
     }
 
+    #[cfg(test)]
     fn ensure_renderable(&self) -> Result<(), SpotifyTransitionError> {
         let overlap = self.overlap()?;
         let preset = self
@@ -662,6 +679,7 @@ impl SpotifyTransitionRecipe {
         Ok(())
     }
 
+    #[cfg(test)]
     fn decoded_summary(&self) -> Result<String, SpotifyTransitionError> {
         let overlap = self.overlap()?;
         Ok(format!(
@@ -711,6 +729,7 @@ pub(crate) fn provided_item_speed_or_default(track: &ProvidedTrack) -> f32 {
         .unwrap_or(1.0)
 }
 
+#[cfg(test)]
 fn provided_metadata_keys(track: &ProvidedTrack) -> Vec<&str> {
     track
         .metadata
@@ -721,6 +740,7 @@ fn provided_metadata_keys(track: &ProvidedTrack) -> Vec<&str> {
         .collect()
 }
 
+#[cfg(test)]
 fn log_transition_track(label: &str, track: &ProvidedTrack) {
     if !log::log_enabled!(log::Level::Debug) {
         return;
@@ -763,6 +783,7 @@ fn adapt_curve_set(curve_set: &CurveSet) -> Result<GainCurve, TransitionPlanErro
     GainCurve::new(segments)
 }
 
+#[cfg(test)]
 fn has_unsupported_effects(preset: &Preset) -> bool {
     preset.eq_style_override.is_some()
         || preset.filter_fx_style_override.is_some()
@@ -777,6 +798,7 @@ fn has_unsupported_effects(preset: &Preset) -> bool {
         || preset.looping_style_override.is_some()
 }
 
+#[cfg(test)]
 pub(crate) fn transition_plan_for_pair(
     outgoing: &ProvidedTrack,
     incoming: &ProvidedTrack,
@@ -821,6 +843,7 @@ pub(crate) fn transition_plan_for_pair(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn transition_plan_for_recipe_pair(
     outgoing: &ProvidedTrack,
     incoming: &ProvidedTrack,
@@ -835,6 +858,7 @@ pub(crate) fn transition_plan_for_recipe_pair(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn transition_plan_for_decoded_pair(
     outgoing: &ProvidedTrack,
     incoming: &ProvidedTrack,
@@ -883,6 +907,7 @@ pub(crate) fn transition_plan_for_local_auto_transition(
     Ok((plan, style))
 }
 
+#[cfg(test)]
 fn transition_plan_for_decoded_pair_with_origin(
     outgoing: &ProvidedTrack,
     incoming: &ProvidedTrack,
@@ -959,7 +984,7 @@ fn transition_plan_for_decoded_pair_with_origin(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use librespot_protocol::automix_transition::{Curve, CurvePoint, PresetType};
+    use librespot_protocol::automix_transition::{Curve, CurvePoint, EqCurveOverrides, PresetType};
     use protobuf::{EnumOrUnknown, MessageField};
     use serde_json::Value;
 
@@ -1190,7 +1215,7 @@ mod tests {
                 speed_b: 0.903_120_4,
                 is_beatmatched: true,
             },
-            computed_score: 3.755_000_1,
+            computed_score: 3.755,
             components: None,
             pareto_layer: Some(0),
             ranked_presets: vec![crate::spotify_auto_mix::AutoRankedPreset {
@@ -1812,6 +1837,25 @@ mod tests {
             resolve_transition_plan_sources(&active, Some(saved), None, true)
         else {
             panic!("unverified curve override must continue fallback");
+        };
+        assert_eq!(
+            rejections[0].reason,
+            SpotifyTransitionRejection::UnsupportedRenderer { preset_id: 11 }
+        );
+
+        let mut value = volume_only_transition();
+        value.preset.as_mut().unwrap().eq_out_curve_overrides =
+            MessageField::some(EqCurveOverrides::default());
+        let saved = resolver_candidate(
+            SpotifyTransitionSource::Saved,
+            SpotifyTransitionProvenance::InlineMetadata,
+            value,
+            7,
+        );
+        let SpotifyTransitionPlanResolution::LocalAuto { rejections } =
+            resolve_transition_plan_sources(&active, Some(saved), None, true)
+        else {
+            panic!("unverified optional curve override must continue fallback");
         };
         assert_eq!(
             rejections[0].reason,
