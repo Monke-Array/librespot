@@ -1,108 +1,131 @@
 # Current objective
 
-Spotify Mixer protocol handoff is checkpointed in
-`docs/SPOTIFY_LIVE_RECIPE_PROTOCOL.md` and `docs/SPOTIFY_STYLE_CONTRACT.md`.
-No production playback integration was changed. Full audible Spotify DSP parity
-is not established; explicit release gates remain for physical EQ/filter/FX
-mappings, some speed/override configuration, and outer crossfade policy.
+Spotify Mixer source resolution, recipe hydration, deterministic style lookup,
+and `TransitionPlan` adaptation are implemented locally. The exact committed
+candidate still needs deployment and one bounded live validation on RPI-01.
 
-# Branch and work
+# Branch and commits
 
-- Branch `codex/m3a-live-auto-metadata`; investigation baseline `e9585c9`.
-- This documentation/evidence change records September15-19 captures and native
-  code findings for official Windows1.3.0.277, updated September20.
-- Native DLL SHA256:
-  `65c131dc7f9dcce90eb3874033e6e22ef422a493f0877e3f031805198839b7c4`.
-- Clean protocol/docs/evidence commit is intended for origin on this branch.
-  Use Git for its final commit identity; do not infer runtime deployment from it.
+- Branch: `codex/m3a-live-auto-metadata`.
+- Protocol baseline: `a104334`.
+- Typed source/edge resolver: `a40b588`.
+- Extension-244 envelope hardening: `fd24cf4`.
+- Deterministic preset/style resolver: `00739b4`.
+- Live SPIRC integration: `01cf0ad`.
+- Edge ownership and fallback hardening: `3f6985b`.
+- The state-document commit after these entries is part of the exact candidate.
 
-# Architecture and invariants
+# Production architecture
 
-- Connect owns what plays. Recipe/Auto/style data controls only how authoritative
-  A becomes authoritative B. It cannot choose B or advance the queue.
-- Validate context/rows/canonical and playable identity, revision, item speeds,
-  session and edge generation. Stale async results cannot regain ownership.
-- Mixer/Auto and normal configurable crossfade remain separate runtime routes.
-- Current source, secondary PCM/decoder, rendering and promotion retain their
-  existing generation/ownership rules; deterministic fallback remains available.
+Connect remains authoritative for what plays. Mixer transition data controls
+only how the already-authoritative outgoing track becomes the already-
+authoritative incoming track. Recipes never choose or advance the queue.
 
-# Verified protocol findings
+The Mixer source order is now:
 
-- Saved `automix.auto_transition_recipe` can contain Blended content despite its
-  name. Extension244 hydration already works; tested preset2 failed specifically
-  because preset/style rendering is unsupported, not because metadata was absent.
-- Native candidate loops order saved recipe, enabled nonempty backend recipe,
-  then empty-input local Auto. A local computed-preset marker keeps a result
-  provisional while later candidates are tried; accepted stored content stops.
-- Known preset0 NONE returns no Automix result and stops a nonempty candidate.
-  Unknown/mismatched recipe falls through to local Auto; these are different.
-- Backend enablement is conditional. No backend field was observed in the
-  captured60 official row observations or236 RPI inventories. This is not proof
-  about account entitlement or global availability. No backend fetch is invented.
-- Saved/local results converge on native materializer1040aa4; serializers1049874
-  and104a158 and node writers810f90/8110ec produce downstream `audio.*` metadata.
-  XPUI queue output is not evidence that these attributes came from a backend.
-- Complete current lookup wire schemas, preset0..22 mappings, style IDs and
- 69 numeric diagnostic request/response fixtures are durable under
-  `tools/runtime-diagnostics/evidence/2026-09-19-*.json`.
-- FX request fields are IDs1/BPM2/bars3. Materializer clamps bars2..32. Curves
-  can depend on bars; sampled FX wet/dry envelopes do not establish BPM-independent
-  effect timing. Native curve conversion ignores envelope minimum/maximum.
-- Curve-override gate is `core-automix/auto_transition_use_curve_overrides`;
-  current accessor defaults false. Effective account override remains unknown.
-- Standard preset mappings use no jogwheel/looping; explicit nonzero overrides
-  should initially be rejected as unsupported, not silently ignored.
+1. valid inline saved recipe;
+2. saved transition-URI hydration when available;
+3. present backend Auto metadata (presence is the current guarded enablement
+   signal; no backend fetch or entitlement inference was invented);
+4. locally calculated Auto;
+5. existing deterministic Mixer safety fallback.
 
-# Evidence limits and safe handoff
+Known preset `NONE` (ID 0) is terminal for the edge and suppresses backend and
+local Auto. Missing, malformed, mismatched, unknown, or unrenderable recipes
+continue to the next source. Preview provenance cannot authorize live playback.
+Non-Mixer contexts retain the independent configurable normal-crossfade route.
 
-- Native source ordering is code-derived; no live backend collision experiment
-  exists. The strongest live result is same-pair saved recipe ingress on RPI
-  versus downstream materialization on official Windows.
-- September15 snapshots overlap cumulatively. September19 user preview activity
-  is a separate multi-pair session, not a controlled natural live transition.
-- Desktop was restarted with local diagnostics September19; native log persisted.
-  Large stage export hit ENOBUFS; no successful new full stage export is claimed.
-  Debug port subsequently became unavailable; no further restart was performed.
-- Safe Sol start: typed source/outcome/ownership contract, ingress hardening,
-  deterministic fixture-backed style resolver, lossless render-plan representation.
-- Physical EQ/filter/FX mappings remain unknown; do not claim preset2 audible
-  compatibility or ignore its EQ. Partial overrides and speed ramp details need
-  explicit capability checks. Outer fallback uncertainty is documented, not guessed.
+The live path consumes the semantic `Transition` recipe. Downstream `audio.*`
+materialization remains diagnostic/legacy test coverage and is no longer a
+primary live protocol source in SPIRC.
 
-# Retained runtime stabilization state (separate workstream)
+# Ownership and ingress validation
 
-- Last verified deployed playback candidate: `b63949c10895735f0acd78252aef7d406e14dbf4`.
-- Snapshot `/home/amogus/.cache/spotifyd-runtime-build-b63949c`, snapshot-local
-  `target/release/spotifyd`; deployed `/usr/local/bin/spotifyd` SHA256:
+- Every candidate is bound to context URI, authentic outgoing/incoming rows,
+  canonical A/B, known playable A/B, item-speed bits, session ID, and edge
+  generation.
+- Canonical, playable, row, item-speed, session, generation, and exact active
+  edge mismatches reject without queue mutation.
+- Local Auto jobs and prepared results carry the same ownership. Newly resolved
+  playable identities are explicitly bound into that owned edge before work
+  starts. Session replacement adopts retained deterministic work into a new
+  generation; cancelled/stale async results cannot regain ownership.
+- Extension 244 requires one TRANSITION_DATA array/entity, zero provider/entity
+  status, exact entity URI, exact Any type URL, and exact playlist/row/A/B data.
+  `latest_transition_uri` is informational and cannot replace the requested
+  revision.
+
+# Style and plan resolution
+
+- Preset IDs 0..22 map to the pinned six style families from the sanitized
+  numeric evidence. Explicit style-ID overrides, including zero, take priority.
+- Effective bars clamp to 2..32. Positive BPM is retained; otherwise BPM derives
+  from overlap duration/bars when possible, then falls back to 120. Per-side
+  item speed is applied once.
+- Captured volume families are generated deterministically, including sampled
+  bar-dependent Cut/edge geometry. Volume style 8 remains explicitly
+  unsupported because its complete algorithm is not proven.
+- Official saved/backend plans require every requested family to be renderable.
+  Unknown EQ/filter/FX physical mappings, jogwheel, looping, unsupported volume,
+  and custom curve overrides while the effective native override gate is unknown
+  reject the candidate and continue source fallback.
+- Local Auto applies the selected preset's proven volume curve and bounded
+  incoming source-clock speed automation. Unsupported optional EQ/filter/FX
+  families are retained in the resolved style and logged as omitted; no physical
+  DSP mapping was invented.
+- Non-unity outgoing overlap speed remains unsupported. Non-unity incoming speed
+  is represented by `SpeedAutomation` ending at the exact overlap source-time
+  boundary. Existing player generation, PCM readiness, rendering, promotion,
+  and queue ownership remain unchanged.
+
+# Observability
+
+Structured debug records include authoritative A/B, source, provenance, preset,
+resolved style IDs, bars/BPM, timing/speed, rejection/fallback reasons, omitted
+DSP capabilities, session, and transition edge generation. Existing player
+runtime traces retain secondary generation and promotion results. Logs contain
+no recipe payloads, credentials, account data, or raw audio.
+
+# Verified local gate (2026-09-20)
+
+- `cargo fmt --check`: passed.
+- `cargo check --workspace`: passed.
+- `cargo test -p librespot-playback`: 99 passed.
+- `cargo test -p librespot-connect`: 138 unit + 5 integration + 1 doctest passed.
+- `cargo clippy -p librespot-playback --all-targets`: passed with the established
+  `int_plus_one`, large-enum, and argument-count warnings.
+- `cargo clippy -p librespot-connect --all-targets`: passed with established
+  Auto `if_same_then_else`/test float warnings plus inherited playback warnings;
+  no new resolver/style/hydration warning remains.
+- `node tools/spotify-automix-oracle/validate_input_fixtures.js`: 9/9 beat hashes,
+  107/107 presets, 105/107 geometry, 22/107 exact speed bits; known score status
+  remains `not-yet-exact`.
+- Runtime diagnostics unit tests: 4 passed.
+- Spotify Mixer harness tests: 28 passed.
+- `git diff --check`: passed.
+
+# Explicit compatibility limit
+
+Full saved Blended preset-2 DSP is not claimed: preset 2 requires the still-
+unknown EQ physical mapping. It is decoded, validated, style-resolved, reported
+as unsupported, and safely falls through. This is the maximum evidence-backed
+production behavior until a physical mapping and its renderer validation gate
+exist. The same rule applies to unresolved filter/FX, custom curves, blocks, and
+outgoing speed semantics.
+
+# RPI-01 baseline and next action
+
+- Last verified deployed candidate remains `b63949c10895735f0acd78252aef7d406e14dbf4`.
+- Snapshot: `/home/amogus/.cache/spotifyd-runtime-build-b63949c`.
+- Known-good rollback binary:
+  `/usr/local/bin/spotifyd.rollback-90e1628-pre-b63949c`.
+- Deployed known-good SHA256:
   `32e6d39c07aeb2a55bfa5fb247f99e5d155a95aeb7e5143541248bc8d00d4af3`.
-- Rollback `/usr/local/bin/spotifyd.rollback-90e1628-pre-b63949c`, SHA256:
+- Rollback SHA256:
   `54a8c36d487c5cbc39239fac1dd9f19fa9a50a5fc82695259b2e315d3edd2e9c`.
-- Changes retain sink-stop-before-seek, async changed-position Load/preload,
-  edge-change invalidation and hard-link audio-cache publication with copy fallback.
-- Storage incident `/var/lib/spotifyd-diagnostics/manual/1789384890613886092-xrun`:
-  cached current decode stalled3.336s amid doubled preload writes. `40b713c`
-  fixes cache write amplification; runtime writeback proof remains pending.
-- Stale-edge skip `/var/lib/spotifyd-diagnostics/manual/1789308023769543909-skip`
-  is fixed by `b78e849`; post-fix natural edge-replacement evidence still pending.
-- M5 remains open. This protocol work did not deploy, rebuild, or validate audible
-  runtime fixes. September19 SSH confirmed user spotifyd service active; a system
-  service query reported inactive because the runtime is a user service.
 
-# Verification
-
-- Prior production gate at b63949c: fmt/workspace check passed, playback99/99,
-  Connect116/116, oracle5/5, doctest1/1; documented-allowance Clippy passed.
-- Current change is docs and sanitized data only; no Rust or tooling code changed.
-- Numeric style export validated recursively as numeric/boolean/null objects,
-  with no string values, credentials, account/device IDs or client source.
-- Final checks:4 evidence JSON files valid;69 style calls exactly match sources;
-  preset2/FX sample checks,10 doc links, credential scan and diff check passed.
-- Existing oracle consistency script completed:9/9 beats hashes,107/107 presets,
- 105/107 geometry,22/107 speed bits; max speed delta7.6294e-6 and score still
-  `not-yet-exact`. This does not establish full Auto parity.
-
-# NEXT ACTION
-
-Use the exact Sol High sequence in `docs/SPOTIFY_LIVE_RECIPE_PROTOCOL.md`, starting
-with the capability-gated semantic resolver; keep unresolved DSP compatibility
-claims disabled until their documented validation gates pass.
+NEXT ACTION: push the clean final commit, deploy that exact revision to RPI-01
+without replacing the rollback binary, start bounded diagnostics, then request
+one user playback reproduction and correlate saved/Blended rejection/fallback,
+local Auto selection, deterministic fallback, queue/promotion ownership, and
+ALSA/XRUN evidence.
