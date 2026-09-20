@@ -182,9 +182,9 @@ fn decode_transition_data_response(
     let provider_status = data_array
         .header
         .as_ref()
-        .map(|header| header.provider_error_status)
-        .unwrap_or_default();
-    if provider_status != 0 {
+        .ok_or_else(|| "TRANSITION_DATA response contained no provider header".to_owned())?
+        .provider_error_status;
+    if provider_status != 200 {
         return Err(format!(
             "TRANSITION_DATA provider status was {provider_status}"
         ));
@@ -202,9 +202,9 @@ fn decode_transition_data_response(
     let entity_status = entity
         .header
         .as_ref()
-        .map(|header| header.status_code)
-        .unwrap_or_default();
-    if entity_status != 0 {
+        .ok_or_else(|| "TRANSITION_DATA response contained no entity header".to_owned())?
+        .status_code;
+    if entity_status != 200 {
         return Err(format!("TRANSITION_DATA entity status was {entity_status}"));
     }
     let payload = entity
@@ -396,11 +396,17 @@ mod tests {
     fn response(data: TransitionData) -> BatchedExtensionResponse {
         BatchedExtensionResponse {
             extended_metadata: vec![EntityExtensionDataArray {
-                header: MessageField::some(EntityExtensionDataArrayHeader::default()),
+                header: MessageField::some(EntityExtensionDataArrayHeader {
+                    provider_error_status: 200,
+                    ..Default::default()
+                }),
                 extension_kind: EnumOrUnknown::new(ExtensionKind::TRANSITION_DATA),
                 extension_data: vec![
                     librespot_protocol::entity_extension_data::EntityExtensionData {
-                        header: MessageField::some(EntityExtensionDataHeader::default()),
+                        header: MessageField::some(EntityExtensionDataHeader {
+                            status_code: 200,
+                            ..Default::default()
+                        }),
                         entity_uri: TRANSITION_URI.to_owned(),
                         extension_data: MessageField::some(Any {
                             type_url: TRANSITION_DATA_TYPE_URL.to_owned(),
@@ -468,6 +474,14 @@ mod tests {
 
     #[test]
     fn response_status_and_any_type_are_validated() {
+        let mut missing_provider_header = response(data());
+        missing_provider_header.extended_metadata[0].header = MessageField::none();
+        assert!(
+            decode_transition_data_response(TRANSITION_URI, missing_provider_header)
+                .unwrap_err()
+                .contains("provider header")
+        );
+
         let mut provider_failure = response(data());
         provider_failure.extended_metadata[0]
             .header
@@ -478,6 +492,14 @@ mod tests {
             decode_transition_data_response(TRANSITION_URI, provider_failure)
                 .unwrap_err()
                 .contains("provider status")
+        );
+
+        let mut missing_entity_header = response(data());
+        missing_entity_header.extended_metadata[0].extension_data[0].header = MessageField::none();
+        assert!(
+            decode_transition_data_response(TRANSITION_URI, missing_entity_header)
+                .unwrap_err()
+                .contains("entity header")
         );
 
         let mut entity_failure = response(data());

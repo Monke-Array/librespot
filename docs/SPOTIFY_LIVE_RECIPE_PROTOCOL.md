@@ -90,8 +90,10 @@ is available, retain existing `spotify_mix_hydration.rs`:
 - Validate requested URI/revision, playlist, outgoing row bytes and A/B. A newer
   `latest_transition_uri` does not authorize silently replacing the requested
   revision. Discard stale asynchronous results after edge/session replacement.
-- Existing decoder checks kind/entity and protobuf, but should additionally
-  validate response status/Any type rather than accepting arbitrary Any bytes.
+- Require the provider and entity headers and HTTP-style status `200`, then
+  validate the Any type rather than accepting arbitrary Any bytes. Live
+  extension-244 and the sanitized extended-metadata corpus both use `200` for
+  success; proto3's absent-field default `0` is not success evidence.
 
 **PROVEN, live:** the tested recipe is startA=150580ms, startB=5700ms,
 D=12600ms, bars=4, speedA=1, speedB=0.95238173, BPM A/B=76.190475,

@@ -1,8 +1,9 @@
 # Current objective
 
 Spotify Mixer source resolution, recipe hydration, deterministic style lookup,
-and `TransitionPlan` adaptation are implemented locally. The exact committed
-candidate still needs deployment and one bounded live validation on RPI-01.
+and `TransitionPlan` adaptation are implemented. Initial RPI validation found
+and reproduced one extension-244 status-gate defect; the evidence-backed fix is
+under local verification before rebuilding the exact candidate.
 
 # Branch and commits
 
@@ -13,7 +14,7 @@ candidate still needs deployment and one bounded live validation on RPI-01.
 - Deterministic preset/style resolver: `00739b4`.
 - Live SPIRC integration: `01cf0ad`.
 - Edge ownership and fallback hardening: `3f6985b`.
-- The state-document commit after these entries is part of the exact candidate.
+- Initial implementation state: `aad0456`.
 
 # Production architecture
 
@@ -50,10 +51,11 @@ primary live protocol source in SPIRC.
   playable identities are explicitly bound into that owned edge before work
   starts. Session replacement adopts retained deterministic work into a new
   generation; cancelled/stale async results cannot regain ownership.
-- Extension 244 requires one TRANSITION_DATA array/entity, zero provider/entity
-  status, exact entity URI, exact Any type URL, and exact playlist/row/A/B data.
-  `latest_transition_uri` is informational and cannot replace the requested
-  revision.
+- Extension 244 requires one TRANSITION_DATA array/entity, present provider and
+  entity headers with HTTP-style status 200, exact entity URI, exact Any type
+  URL, and exact playlist/row/A/B data. `latest_transition_uri` is informational
+  and cannot replace the requested revision. Missing proto3 headers/default-zero
+  fields are not accepted as success.
 
 # Style and plan resolution
 
@@ -113,19 +115,26 @@ production behavior until a physical mapping and its renderer validation gate
 exist. The same rule applies to unresolved filter/FX, custom curves, blocks, and
 outgoing speed semantics.
 
-# RPI-01 baseline and next action
+# RPI-01 live evidence and next action
 
-- Last verified deployed candidate remains `b63949c10895735f0acd78252aef7d406e14dbf4`.
-- Snapshot: `/home/amogus/.cache/spotifyd-runtime-build-b63949c`.
+- Deployed initial candidate: `aad0456a13159728cdb521e3ff36a7f54693f7e8`;
+  binary SHA256 `04d3855b2a702c845cf8e713276744c850bb7ba5c2a1787f6de9f9809a623a31`.
+- Snapshot: `/home/amogus/.cache/spotifyd-runtime-build-aad0456`.
 - Known-good rollback binary:
   `/usr/local/bin/spotifyd.rollback-90e1628-pre-b63949c`.
-- Deployed known-good SHA256:
-  `32e6d39c07aeb2a55bfa5fb247f99e5d155a95aeb7e5143541248bc8d00d4af3`.
 - Rollback SHA256:
   `54a8c36d487c5cbc39239fac1dd9f19fa9a50a5fc82695259b2e315d3edd2e9c`.
+- Playback on 2026-09-20 completed three scheduled local-Auto transitions and
+  matching promotions (player generations 4, 7, and 8). Each promotion advanced
+  the authoritative queue exactly once; one edge retained distinct canonical
+  and relinked playable identities. No XRUN, underrun, EPIPE, panic, or stale
+  promotion was logged.
+- Saved hydration started for the exact owned edge, but the response's live
+  provider status 200 exposed an incorrect zero-success check added during
+  envelope hardening. Sanitized extension captures and the saved-recipe probe
+  independently confirm status 200. Local tests now require present headers and
+  status 200; the corrected binary has not yet been deployed.
 
-NEXT ACTION: push the clean final commit, deploy that exact revision to RPI-01
-without replacing the rollback binary, start bounded diagnostics, then request
-one user playback reproduction and correlate saved/Blended rejection/fallback,
-local Auto selection, deterministic fallback, queue/promotion ownership, and
-ALSA/XRUN evidence.
+NEXT ACTION: complete the local gate, commit and push the status fix, rebuild and
+deploy that exact revision without replacing the rollback binary, then confirm
+extension-244 hydration reaches recipe validation and safe preset-2 fallback.
