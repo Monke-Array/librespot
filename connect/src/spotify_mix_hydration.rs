@@ -13,6 +13,8 @@ use protobuf::{EnumOrUnknown, Message};
 use crate::spotify_mix::{SpotifyTransitionError, SpotifyTransitionRecipe};
 
 pub(crate) const TRANSITION_URI_ATTRIBUTE: &str = "automix.transition_uri";
+const TRANSITION_DATA_TYPE_URL: &str =
+    "type.googleapis.com/spotify.playlistmixing.mixtransition.TransitionData";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct TransitionHydrationKey {
@@ -171,26 +173,53 @@ fn decode_transition_data_response(
     requested_uri: &str,
     response: BatchedExtensionResponse,
 ) -> Result<TransitionData, String> {
-    let data_array = response
-        .extended_metadata
-        .into_iter()
-        .next()
-        .ok_or_else(|| "TRANSITION_DATA response contained no extension data".to_owned())?;
-    if data_array.extension_kind.enum_value().ok() != Some(ExtensionKind::TRANSITION_DATA) {
-        return Err("extended-metadata response kind was not TRANSITION_DATA".to_owned());
+    let mut matching = response.extended_metadata.into_iter().filter(|array| {
+        array.extension_kind.enum_value().ok() == Some(ExtensionKind::TRANSITION_DATA)
+    });
+    let data_array = matching.next().ok_or_else(|| {
+        "TRANSITION_DATA response contained no matching extension data".to_owned()
+    })?;
+    if matching.next().is_some() {
+        return Err("TRANSITION_DATA response contained duplicate extension data".to_owned());
     }
-    let mut entity = data_array
-        .extension_data
-        .into_iter()
+    let provider_status = data_array
+        .header
+        .as_ref()
+        .map(|header| header.provider_error_status)
+        .unwrap_or_default();
+    if provider_status != 0 {
+        return Err(format!(
+            "TRANSITION_DATA provider status was {provider_status}"
+        ));
+    }
+    let mut entities = data_array.extension_data.into_iter();
+    let mut entity = entities
         .next()
         .ok_or_else(|| "TRANSITION_DATA response contained no entity".to_owned())?;
+    if entities.next().is_some() {
+        return Err("TRANSITION_DATA response contained duplicate entities".to_owned());
+    }
     if entity.entity_uri != requested_uri {
         return Err("extended-metadata entity URI did not match the request".to_owned());
+    }
+    let entity_status = entity
+        .header
+        .as_ref()
+        .map(|header| header.status_code)
+        .unwrap_or_default();
+    if entity_status != 0 {
+        return Err(format!("TRANSITION_DATA entity status was {entity_status}"));
     }
     let payload = entity
         .extension_data
         .take()
         .ok_or_else(|| "TRANSITION_DATA response contained no payload".to_owned())?;
+    if payload.type_url != TRANSITION_DATA_TYPE_URL {
+        return Err(format!(
+            "TRANSITION_DATA Any type was {:?}, expected {TRANSITION_DATA_TYPE_URL:?}",
+            payload.type_url
+        ));
+    }
     TransitionData::parse_from_bytes(&payload.value)
         .map_err(|_| "TRANSITION_DATA payload was not a valid protobuf".to_owned())
 }
@@ -280,7 +309,10 @@ mod tests {
     use data_encoding::BASE64;
     use librespot_protocol::{
         automix_transition::{Curve, CurvePoint, CurveSet, Overlap, Preset, Transition},
-        extended_metadata::{EntityExtensionDataArray, EntityRequest},
+        entity_extension_data::EntityExtensionDataHeader,
+        extended_metadata::{
+            EntityExtensionDataArray, EntityExtensionDataArrayHeader, EntityRequest,
+        },
         player::ProvidedTrack,
     };
     use protobuf::{MessageField, well_known_types::any::Any};
@@ -361,6 +393,29 @@ mod tests {
         }
     }
 
+    fn response(data: TransitionData) -> BatchedExtensionResponse {
+        BatchedExtensionResponse {
+            extended_metadata: vec![EntityExtensionDataArray {
+                header: MessageField::some(EntityExtensionDataArrayHeader::default()),
+                extension_kind: EnumOrUnknown::new(ExtensionKind::TRANSITION_DATA),
+                extension_data: vec![
+                    librespot_protocol::entity_extension_data::EntityExtensionData {
+                        header: MessageField::some(EntityExtensionDataHeader::default()),
+                        entity_uri: TRANSITION_URI.to_owned(),
+                        extension_data: MessageField::some(Any {
+                            type_url: TRANSITION_DATA_TYPE_URL.to_owned(),
+                            value: data.write_to_bytes().unwrap(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn transition_uri_is_discovered_from_outgoing_metadata() {
         let mut track = ProvidedTrack::new();
@@ -403,29 +458,69 @@ mod tests {
 
     #[test]
     fn extended_metadata_response_decodes_transition_data() {
-        let response = BatchedExtensionResponse {
-            extended_metadata: vec![EntityExtensionDataArray {
-                extension_kind: EnumOrUnknown::new(ExtensionKind::TRANSITION_DATA),
-                extension_data: vec![
-                    librespot_protocol::entity_extension_data::EntityExtensionData {
-                        entity_uri: TRANSITION_URI.to_owned(),
-                        extension_data: MessageField::some(Any {
-                            value: data().write_to_bytes().unwrap(),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
         assert_eq!(
-            decode_transition_data_response(TRANSITION_URI, response)
+            decode_transition_data_response(TRANSITION_URI, response(data()))
                 .unwrap()
                 .playlist_uri,
             PLAYLIST
         );
+    }
+
+    #[test]
+    fn response_status_and_any_type_are_validated() {
+        let mut provider_failure = response(data());
+        provider_failure.extended_metadata[0]
+            .header
+            .as_mut()
+            .unwrap()
+            .provider_error_status = 503;
+        assert!(
+            decode_transition_data_response(TRANSITION_URI, provider_failure)
+                .unwrap_err()
+                .contains("provider status")
+        );
+
+        let mut entity_failure = response(data());
+        entity_failure.extended_metadata[0].extension_data[0]
+            .header
+            .as_mut()
+            .unwrap()
+            .status_code = 404;
+        assert!(
+            decode_transition_data_response(TRANSITION_URI, entity_failure)
+                .unwrap_err()
+                .contains("entity status")
+        );
+
+        let mut wrong_type = response(data());
+        wrong_type.extended_metadata[0].extension_data[0]
+            .extension_data
+            .as_mut()
+            .unwrap()
+            .type_url = "type.googleapis.com/unrelated.Payload".to_owned();
+        assert!(
+            decode_transition_data_response(TRANSITION_URI, wrong_type)
+                .unwrap_err()
+                .contains("Any type")
+        );
+    }
+
+    #[test]
+    fn latest_revision_is_informational_and_cannot_replace_requested_revision() {
+        let mut newer = data();
+        newer.latest_transition_uri =
+            "spotify:transition:2vwr8lGr3wloJKe3bqUSRf:1786638792017".to_owned();
+        assert_eq!(
+            decode_transition_data_response(TRANSITION_URI, response(newer))
+                .unwrap()
+                .transition_uri,
+            TRANSITION_URI
+        );
+
+        let mut conflicting = data();
+        conflicting.transition_uri =
+            "spotify:transition:2vwr8lGr3wloJKe3bqUSRf:1786638792017".to_owned();
+        assert!(validate_transition_data(&key(), &conflicting).is_err());
     }
 
     #[test]
