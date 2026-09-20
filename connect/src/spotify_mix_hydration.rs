@@ -23,6 +23,8 @@ pub(crate) struct TransitionHydrationKey {
     pub transition_uri: String,
     pub outgoing_uri: String,
     pub incoming_uri: String,
+    pub session_id: String,
+    pub generation: u64,
 }
 
 impl TransitionHydrationKey {
@@ -33,12 +35,16 @@ impl TransitionHydrationKey {
         transition_uri: &str,
         outgoing_uri: &str,
         incoming_uri: &str,
+        session_id: &str,
+        generation: u64,
     ) -> bool {
         self.playlist_uri == playlist_uri
             && self.row_uid.eq_ignore_ascii_case(row_uid)
             && self.transition_uri == transition_uri
             && self.outgoing_uri == outgoing_uri
             && self.incoming_uri == incoming_uri
+            && self.session_id == session_id
+            && self.generation == generation
     }
 }
 
@@ -330,6 +336,8 @@ mod tests {
             transition_uri: TRANSITION_URI.to_owned(),
             outgoing_uri: TRACK_A.to_owned(),
             incoming_uri: TRACK_B.to_owned(),
+            session_id: "session-1".to_owned(),
+            generation: 7,
         }
     }
 
@@ -610,20 +618,50 @@ mod tests {
     #[test]
     fn stale_context_or_pair_does_not_match_hydration_key() {
         let key = key();
-        assert!(key.matches_pair(PLAYLIST, ROW_UID, TRANSITION_URI, TRACK_A, TRACK_B));
+        assert!(key.matches_pair(
+            PLAYLIST,
+            ROW_UID,
+            TRANSITION_URI,
+            TRACK_A,
+            TRACK_B,
+            "session-1",
+            7
+        ));
         assert!(!key.matches_pair(
             "spotify:playlist:other",
             ROW_UID,
             TRANSITION_URI,
             TRACK_A,
-            TRACK_B
+            TRACK_B,
+            "session-1",
+            7
         ));
         assert!(!key.matches_pair(
             PLAYLIST,
             ROW_UID,
             "spotify:transition:other",
             TRACK_A,
-            TRACK_B
+            TRACK_B,
+            "session-1",
+            7
+        ));
+        assert!(!key.matches_pair(
+            PLAYLIST,
+            ROW_UID,
+            TRANSITION_URI,
+            TRACK_A,
+            TRACK_B,
+            "session-2",
+            7
+        ));
+        assert!(!key.matches_pair(
+            PLAYLIST,
+            ROW_UID,
+            TRANSITION_URI,
+            TRACK_A,
+            TRACK_B,
+            "session-1",
+            8
         ));
     }
 

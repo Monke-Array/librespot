@@ -12,6 +12,10 @@ use librespot_protocol::{
 use protobuf::Message;
 use thiserror::Error;
 
+use crate::spotify_mix_style::{
+    ResolvedSpotifyStyle, SpotifyStyleResolutionError, resolve_spotify_style,
+};
+
 pub(crate) const RECIPE_ATTRIBUTE: &str = "automix.auto_transition_recipe";
 pub(crate) const BACKEND_RECIPE_ATTRIBUTE: &str = "automix.backend_auto_transition";
 const ITEM_SPEED_ATTRIBUTE: &str = "item.speed";
@@ -94,7 +98,9 @@ pub(crate) struct SpotifyTransitionEdge {
     pub canonical_b_uri: String,
     pub playable_a_uri: Option<String>,
     pub playable_b_uri: Option<String>,
-    pub session_id: u64,
+    pub item_speed_a_bits: Option<u64>,
+    pub item_speed_b_bits: Option<u64>,
+    pub session_id: String,
     pub generation: u64,
 }
 
@@ -121,9 +127,11 @@ pub(crate) enum SpotifyTransitionRejection {
     StaleEdge,
     CanonicalMismatch,
     PlayableMismatch,
+    ItemSpeedMismatch,
     RowMismatch,
     MissingPreset,
     UnknownPreset(i32),
+    UnsupportedRenderer { preset_id: i32 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,6 +155,33 @@ pub(crate) enum SpotifyTransitionResolution {
     DeterministicFallback {
         rejections: Vec<SpotifyTransitionAttempt>,
     },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum SpotifyTransitionPlanResolution {
+    Selected {
+        transition: ResolvedSpotifyTransition,
+        style: ResolvedSpotifyStyle,
+        plan: TransitionPlan,
+        rejections: Vec<SpotifyTransitionAttempt>,
+    },
+    TerminalNone {
+        source: SpotifyTransitionSource,
+        provenance: SpotifyTransitionProvenance,
+        edge: SpotifyTransitionEdge,
+        rejections: Vec<SpotifyTransitionAttempt>,
+    },
+    LocalAuto {
+        rejections: Vec<SpotifyTransitionAttempt>,
+    },
+    DeterministicFallback {
+        rejections: Vec<SpotifyTransitionAttempt>,
+    },
+}
+
+enum SpotifyRecipePlanError {
+    Style(SpotifyStyleResolutionError),
+    UnsupportedRenderer,
 }
 
 fn reject_candidate(
@@ -209,6 +244,18 @@ fn evaluate_recipe_candidate(
             SpotifyTransitionRejection::PlayableMismatch,
         ));
     }
+    if active_edge
+        .item_speed_a_bits
+        .is_some_and(|bits| !item_speeds_match(overlap.item_speed_a(), f64::from_bits(bits)))
+        || active_edge
+            .item_speed_b_bits
+            .is_some_and(|bits| !item_speeds_match(overlap.item_speed_b(), f64::from_bits(bits)))
+    {
+        return Err(reject_candidate(
+            &candidate,
+            SpotifyTransitionRejection::ItemSpeedMismatch,
+        ));
+    }
 
     let Some(preset) = candidate.recipe.preset() else {
         return Err(reject_candidate(
@@ -268,6 +315,154 @@ pub(crate) fn resolve_recipe_sources(
         }
     }
     SpotifyTransitionResolution::LocalAuto { rejections }
+}
+
+pub(crate) fn resolve_transition_plan_sources(
+    active_edge: &SpotifyTransitionEdge,
+    saved: Option<SpotifyTransitionCandidate>,
+    backend: Option<SpotifyTransitionCandidate>,
+    backend_enabled: bool,
+) -> SpotifyTransitionPlanResolution {
+    let mut rejections = Vec::new();
+    for candidate in [saved, backend].into_iter().flatten() {
+        if candidate.source == SpotifyTransitionSource::BackendAuto && !backend_enabled {
+            rejections.push(reject_candidate(
+                &candidate,
+                SpotifyTransitionRejection::BackendDisabled,
+            ));
+            continue;
+        }
+
+        match evaluate_recipe_candidate(active_edge, candidate) {
+            Ok(SpotifyTransitionResolution::Selected(transition)) => {
+                match transition_plan_for_resolved_recipe(&transition.recipe) {
+                    Ok((style, plan)) => {
+                        return SpotifyTransitionPlanResolution::Selected {
+                            transition,
+                            style,
+                            plan,
+                            rejections,
+                        };
+                    }
+                    Err(SpotifyRecipePlanError::Style(
+                        SpotifyStyleResolutionError::UnknownPreset(preset_id),
+                    )) => {
+                        rejections.push(SpotifyTransitionAttempt {
+                            source: transition.source,
+                            provenance: transition.provenance,
+                            reason: SpotifyTransitionRejection::UnknownPreset(preset_id),
+                        });
+                    }
+                    Err(SpotifyRecipePlanError::Style(
+                        SpotifyStyleResolutionError::UnsupportedVolumeStyle(_),
+                    ))
+                    | Err(SpotifyRecipePlanError::UnsupportedRenderer) => {
+                        rejections.push(SpotifyTransitionAttempt {
+                            source: transition.source,
+                            provenance: transition.provenance,
+                            reason: SpotifyTransitionRejection::UnsupportedRenderer {
+                                preset_id: transition
+                                    .recipe
+                                    .preset()
+                                    .map(Preset::id)
+                                    .unwrap_or_default(),
+                            },
+                        });
+                    }
+                }
+            }
+            Ok(SpotifyTransitionResolution::TerminalNone {
+                source,
+                provenance,
+                edge,
+            }) => {
+                return SpotifyTransitionPlanResolution::TerminalNone {
+                    source,
+                    provenance,
+                    edge,
+                    rejections,
+                };
+            }
+            Ok(_) => unreachable!("candidate evaluation only selects a recipe or terminal NONE"),
+            Err(rejection) => rejections.push(rejection),
+        }
+    }
+
+    SpotifyTransitionPlanResolution::LocalAuto { rejections }
+}
+
+fn transition_plan_for_resolved_recipe(
+    recipe: &SpotifyTransitionRecipe,
+) -> Result<(ResolvedSpotifyStyle, TransitionPlan), SpotifyRecipePlanError> {
+    let overlap = recipe
+        .overlap()
+        .expect("decoded recipes retain a validated overlap");
+    let preset = recipe
+        .preset()
+        .expect("selected recipes retain a validated preset");
+    let style =
+        resolve_spotify_style(preset, overlap, false).map_err(SpotifyRecipePlanError::Style)?;
+    if !style.unsupported.is_empty() || style.volume_override_ignored {
+        return Err(SpotifyRecipePlanError::UnsupportedRenderer);
+    }
+
+    let plan = materialize_volume_plan(overlap, &style)
+        .map_err(|_| SpotifyRecipePlanError::UnsupportedRenderer)?;
+    Ok((style, plan))
+}
+
+fn materialize_volume_plan(
+    overlap: &Overlap,
+    style: &ResolvedSpotifyStyle,
+) -> Result<TransitionPlan, SpotifyTransitionError> {
+    let speed_a = overlap.speed_a.unwrap_or(1.0);
+    let speed_b = overlap.speed_b.unwrap_or(1.0);
+    if !speed_a.is_finite()
+        || !speed_b.is_finite()
+        || speed_a <= 0.0
+        || speed_b <= 0.0
+        || (speed_a - 1.0).abs() > ITEM_SPEED_TOLERANCE as f32
+    {
+        return Err(SpotifyTransitionError::UnsupportedTempo("speedA", speed_a));
+    }
+
+    let outgoing_gain =
+        adapt_curve_set(&style.outgoing_volume).map_err(SpotifyTransitionError::InvalidPlan)?;
+    let incoming_gain =
+        adapt_curve_set(&style.incoming_volume).map_err(SpotifyTransitionError::InvalidPlan)?;
+    let mut plan = TransitionPlan::new(
+        Duration::from_millis(overlap.start_a_ms() as u64),
+        Duration::from_millis(overlap.start_b_ms() as u64),
+        Duration::from_millis(overlap.duration_ms() as u64),
+        outgoing_gain,
+        incoming_gain,
+    )
+    .map_err(SpotifyTransitionError::InvalidPlan)?;
+
+    if (speed_b - 1.0).abs() > ITEM_SPEED_TOLERANCE as f32 {
+        let start_b = plan.next_start();
+        let transition_speed = f64::from(speed_b);
+        let unbounded_speed = SpeedAutomation::new(vec![SpeedPoint {
+            from_position: start_b,
+            speed: transition_speed,
+        }])
+        .map_err(|_| SpotifyTransitionError::UnsupportedTempo("speedB", speed_b))?;
+        let unity_position =
+            start_b + unbounded_speed.source_duration_for_wall_time(start_b, plan.duration());
+        let speed = SpeedAutomation::new(vec![
+            SpeedPoint {
+                from_position: start_b,
+                speed: transition_speed,
+            },
+            SpeedPoint {
+                from_position: unity_position,
+                speed: 1.0,
+            },
+        ])
+        .map_err(|_| SpotifyTransitionError::UnsupportedTempo("speedB", speed_b))?;
+        plan = plan.with_next_speed_automation(speed);
+    }
+    Ok(plan)
 }
 
 impl SpotifyTransitionRecipe {
@@ -505,6 +700,10 @@ fn provided_item_speed(track: &ProvidedTrack) -> Option<f64> {
         .filter(|speed| speed.is_finite() && *speed > 0.0)
 }
 
+pub(crate) fn provided_item_speed_bits(track: &ProvidedTrack) -> Option<u64> {
+    provided_item_speed(track).map(f64::to_bits)
+}
+
 pub(crate) fn provided_item_speed_or_default(track: &ProvidedTrack) -> f32 {
     provided_item_speed(track)
         .map(|speed| speed as f32)
@@ -646,64 +845,42 @@ pub(crate) fn transition_plan_for_decoded_pair(
 
 pub(crate) fn transition_plan_for_local_auto_transition(
     transition: &crate::spotify_auto_mix::AutoRankedTransition,
-) -> Result<TransitionPlan, SpotifyTransitionError> {
+    preset_id: u8,
+) -> Result<(TransitionPlan, ResolvedSpotifyStyle), SpotifyTransitionError> {
     let overlap = transition.overlap;
     if overlap.duration_ms <= 0 || overlap.start_a_ms < 0 || overlap.start_b_ms < 0 {
         return Err(SpotifyTransitionError::InvalidDuration);
     }
-    if !overlap.speed_a.is_finite()
-        || !overlap.speed_b.is_finite()
-        || overlap.speed_a <= 0.0
-        || overlap.speed_b <= 0.0
-    {
-        return Err(SpotifyTransitionError::InvalidAnalysisValue);
-    }
-    if (overlap.speed_a - 1.0).abs() > ITEM_SPEED_TOLERANCE as f32 {
-        return Err(SpotifyTransitionError::UnsupportedTempo(
-            "speedA",
-            overlap.speed_a,
-        ));
-    }
-
-    let mut plan = TransitionPlan::new(
-        Duration::from_millis(u64::try_from(overlap.start_a_ms).unwrap()),
-        Duration::from_millis(u64::try_from(overlap.start_b_ms).unwrap()),
-        Duration::from_millis(u64::try_from(overlap.duration_ms).unwrap()),
-        linear_gain_curve(1.0, 0.0)?,
-        linear_gain_curve(0.0, 1.0)?,
-    )?;
-    if (overlap.speed_b - 1.0).abs() > ITEM_SPEED_TOLERANCE as f32 {
-        let start_b = Duration::from_millis(u64::try_from(overlap.start_b_ms).unwrap());
-        let transition_speed = f64::from(overlap.speed_b);
-        let unbounded_speed = SpeedAutomation::new(vec![SpeedPoint {
-            from_position: start_b,
-            speed: transition_speed,
-        }])
-        .map_err(|_| SpotifyTransitionError::UnsupportedTempo("speedB", overlap.speed_b))?;
-        let unity_position =
-            start_b + unbounded_speed.source_duration_for_wall_time(start_b, plan.duration());
-        let speed = SpeedAutomation::new(vec![
-            SpeedPoint {
-                from_position: start_b,
-                speed: transition_speed,
-            },
-            SpeedPoint {
-                from_position: unity_position,
-                speed: 1.0,
-            },
-        ])
-        .map_err(|_| SpotifyTransitionError::UnsupportedTempo("speedB", overlap.speed_b))?;
-        plan = plan.with_next_speed_automation(speed);
-    }
-    Ok(plan)
-}
-
-fn linear_gain_curve(from: f64, to: f64) -> Result<GainCurve, TransitionPlanError> {
-    GainCurve::new(vec![GainCurveSegment {
-        start: 0.0,
-        end: 1.0,
-        points: vec![GainPoint { x: 0.0, y: from }, GainPoint { x: 1.0, y: to }],
-    }])
+    let overlap = Overlap {
+        start_a_ms: Some(
+            i32::try_from(overlap.start_a_ms)
+                .map_err(|_| SpotifyTransitionError::InvalidDuration)?,
+        ),
+        start_b_ms: Some(
+            i32::try_from(overlap.start_b_ms)
+                .map_err(|_| SpotifyTransitionError::InvalidDuration)?,
+        ),
+        duration_ms: Some(
+            i32::try_from(overlap.duration_ms)
+                .map_err(|_| SpotifyTransitionError::InvalidDuration)?,
+        ),
+        speed_a: Some(overlap.speed_a),
+        speed_b: Some(overlap.speed_b),
+        duration_bars: Some(
+            i32::try_from(overlap.duration_bars)
+                .map_err(|_| SpotifyTransitionError::InvalidDuration)?,
+        ),
+        is_beatmatched: Some(overlap.is_beatmatched),
+        ..Default::default()
+    };
+    let preset = Preset {
+        id: Some(i32::from(preset_id)),
+        ..Default::default()
+    };
+    let style = resolve_spotify_style(&preset, &overlap, false)
+        .map_err(|_| SpotifyTransitionError::UnsupportedPresetStyle(i32::from(preset_id)))?;
+    let plan = materialize_volume_plan(&overlap, &style)?;
+    Ok((plan, style))
 }
 
 fn transition_plan_for_decoded_pair_with_origin(
@@ -1022,9 +1199,11 @@ mod tests {
             }],
         };
 
-        let plan = transition_plan_for_local_auto_transition(&transition)
+        let (plan, style) = transition_plan_for_local_auto_transition(&transition, 1)
             .expect("oracle local Auto transition should materialize");
 
+        assert_eq!(style.preset_id, 1);
+        assert_eq!(style.styles.volume, 6);
         assert_eq!(plan.current_start(), Duration::from_millis(208_960));
         assert_eq!(plan.next_start(), Duration::from_millis(2_763));
         assert_eq!(plan.duration(), Duration::from_millis(6_090));
@@ -1074,6 +1253,10 @@ mod tests {
             let start_b_ms = fixture_i64(overlap, "startBMs");
             let duration_ms = fixture_i64(overlap, "durationMs");
             let speed_b = fixture_f32(overlap, "speedB");
+            let preset_id = fixture_i64(
+                required(&required(ranked, "rankedPresets")[0], "preset"),
+                "id",
+            ) as u8;
             let transition = crate::spotify_auto_mix::AutoRankedTransition {
                 overlap: crate::spotify_auto_mix::AutoTransitionOverlap {
                     start_a_ms,
@@ -1088,16 +1271,14 @@ mod tests {
                 components: None,
                 pareto_layer: Some(0),
                 ranked_presets: vec![crate::spotify_auto_mix::AutoRankedPreset {
-                    preset_id: fixture_i64(
-                        required(&required(ranked, "rankedPresets")[0], "preset"),
-                        "id",
-                    ) as u8,
+                    preset_id,
                     computed_score: 1.0,
                 }],
             };
 
-            let plan = transition_plan_for_local_auto_transition(&transition)
+            let (plan, style) = transition_plan_for_local_auto_transition(&transition, preset_id)
                 .expect("top-ranked oracle beatmatch should materialize");
+            assert_eq!(style.preset_id, i32::from(preset_id));
             assert_eq!(
                 plan.current_start(),
                 Duration::from_millis(start_a_ms as u64)
@@ -1264,7 +1445,9 @@ mod tests {
             canonical_b_uri: TRACK_B.into(),
             playable_a_uri: Some(TRACK_A.into()),
             playable_b_uri: Some(TRACK_B.into()),
-            session_id: 41,
+            item_speed_a_bits: None,
+            item_speed_b_bits: None,
+            session_id: "session-41".into(),
             generation,
         }
     }
@@ -1286,12 +1469,13 @@ mod tests {
     #[test]
     fn resolver_saved_recipe_precedes_backend() {
         let active = resolver_edge(7);
-        let saved = resolver_candidate(
+        let mut saved = resolver_candidate(
             SpotifyTransitionSource::Saved,
             SpotifyTransitionProvenance::InlineMetadata,
             transition(),
             7,
         );
+        saved.edge = active.clone();
         let backend = resolver_candidate(
             SpotifyTransitionSource::BackendAuto,
             SpotifyTransitionProvenance::BackendMetadata,
@@ -1435,6 +1619,25 @@ mod tests {
             rejections[0].reason,
             SpotifyTransitionRejection::PlayableMismatch
         );
+
+        let mut active = resolver_edge(7);
+        active.item_speed_a_bits = Some(1.25_f64.to_bits());
+        let mut saved = resolver_candidate(
+            SpotifyTransitionSource::Saved,
+            SpotifyTransitionProvenance::InlineMetadata,
+            transition(),
+            7,
+        );
+        saved.edge = active.clone();
+        let SpotifyTransitionResolution::LocalAuto { rejections } =
+            resolve_recipe_sources(&active, Some(saved), None, true)
+        else {
+            panic!("item-speed mismatch must continue fallback");
+        };
+        assert_eq!(
+            rejections[0].reason,
+            SpotifyTransitionRejection::ItemSpeedMismatch
+        );
     }
 
     #[test]
@@ -1455,6 +1658,164 @@ mod tests {
         assert_eq!(
             rejections[0].reason,
             SpotifyTransitionRejection::PreviewOnly
+        );
+    }
+
+    fn volume_only_transition() -> Transition {
+        let mut value = transition();
+        let preset = value.preset.as_mut().unwrap();
+        preset.id = Some(11);
+        preset.volume_out_curve_override.clear();
+        preset.volume_in_curve_override.clear();
+        value
+    }
+
+    #[test]
+    fn adapter_materializes_resolved_volume_style_without_inline_curves() {
+        let active = resolver_edge(7);
+        let saved = resolver_candidate(
+            SpotifyTransitionSource::Saved,
+            SpotifyTransitionProvenance::InlineMetadata,
+            volume_only_transition(),
+            7,
+        );
+
+        let SpotifyTransitionPlanResolution::Selected { plan, style, .. } =
+            resolve_transition_plan_sources(&active, Some(saved), None, true)
+        else {
+            panic!("volume-only preset should materialize");
+        };
+        assert_eq!(style.preset_id, 11);
+        assert_eq!(style.styles.volume, 1);
+        assert_eq!(plan.current_start(), Duration::from_millis(175_000));
+        assert_eq!(plan.next_start(), Duration::from_millis(12_000));
+        assert_eq!(plan.duration(), Duration::from_millis(8_000));
+    }
+
+    #[test]
+    fn adapter_unsupported_saved_style_continues_to_backend() {
+        let active = resolver_edge(7);
+        let mut unsupported = transition();
+        unsupported.preset.as_mut().unwrap().id = Some(2);
+        let saved = resolver_candidate(
+            SpotifyTransitionSource::Saved,
+            SpotifyTransitionProvenance::InlineMetadata,
+            unsupported,
+            7,
+        );
+        let backend = resolver_candidate(
+            SpotifyTransitionSource::BackendAuto,
+            SpotifyTransitionProvenance::BackendMetadata,
+            volume_only_transition(),
+            7,
+        );
+
+        let SpotifyTransitionPlanResolution::Selected {
+            transition,
+            rejections,
+            ..
+        } = resolve_transition_plan_sources(&active, Some(saved), Some(backend), true)
+        else {
+            panic!("backend should follow unsupported saved style");
+        };
+        assert_eq!(transition.source, SpotifyTransitionSource::BackendAuto);
+        assert!(matches!(
+            rejections[0].reason,
+            SpotifyTransitionRejection::UnsupportedRenderer { preset_id: 2 }
+        ));
+    }
+
+    #[test]
+    fn adapter_none_is_terminal_before_backend() {
+        let active = resolver_edge(7);
+        let mut none = volume_only_transition();
+        none.preset.as_mut().unwrap().id = Some(0);
+        let saved = resolver_candidate(
+            SpotifyTransitionSource::Saved,
+            SpotifyTransitionProvenance::InlineMetadata,
+            none,
+            7,
+        );
+        let backend = resolver_candidate(
+            SpotifyTransitionSource::BackendAuto,
+            SpotifyTransitionProvenance::BackendMetadata,
+            volume_only_transition(),
+            7,
+        );
+
+        assert!(matches!(
+            resolve_transition_plan_sources(&active, Some(saved), Some(backend), true),
+            SpotifyTransitionPlanResolution::TerminalNone {
+                source: SpotifyTransitionSource::Saved,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn adapter_preserves_supported_incoming_speed_automation() {
+        let active = resolver_edge(7);
+        let mut value = volume_only_transition();
+        value.overlap.as_mut().unwrap().speed_b = Some(0.9);
+        let saved = resolver_candidate(
+            SpotifyTransitionSource::Saved,
+            SpotifyTransitionProvenance::InlineMetadata,
+            value,
+            7,
+        );
+
+        let SpotifyTransitionPlanResolution::Selected { plan, .. } =
+            resolve_transition_plan_sources(&active, Some(saved), None, true)
+        else {
+            panic!("supported incoming speed should materialize");
+        };
+        let speed = plan.next_speed_automation().unwrap();
+        assert_eq!(
+            speed.points()[0].from_position,
+            Duration::from_millis(12_000)
+        );
+        assert!((speed.points()[0].speed - 0.9).abs() < 1e-6);
+        assert_eq!(speed.points()[1].speed, 1.0);
+    }
+
+    #[test]
+    fn adapter_backend_failure_continues_to_local_auto() {
+        let active = resolver_edge(7);
+        let mut unknown = volume_only_transition();
+        unknown.preset.as_mut().unwrap().id = Some(999);
+        let backend = resolver_candidate(
+            SpotifyTransitionSource::BackendAuto,
+            SpotifyTransitionProvenance::BackendMetadata,
+            unknown,
+            7,
+        );
+
+        assert!(matches!(
+            resolve_transition_plan_sources(&active, None, Some(backend), true),
+            SpotifyTransitionPlanResolution::LocalAuto { .. }
+        ));
+    }
+
+    #[test]
+    fn adapter_rejects_curve_overrides_while_effective_gate_is_unknown() {
+        let active = resolver_edge(7);
+        let mut value = transition();
+        value.preset.as_mut().unwrap().id = Some(11);
+        let saved = resolver_candidate(
+            SpotifyTransitionSource::Saved,
+            SpotifyTransitionProvenance::InlineMetadata,
+            value,
+            7,
+        );
+
+        let SpotifyTransitionPlanResolution::LocalAuto { rejections } =
+            resolve_transition_plan_sources(&active, Some(saved), None, true)
+        else {
+            panic!("unverified curve override must continue fallback");
+        };
+        assert_eq!(
+            rejections[0].reason,
+            SpotifyTransitionRejection::UnsupportedRenderer { preset_id: 11 }
         );
     }
 }
