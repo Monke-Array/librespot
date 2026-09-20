@@ -1,9 +1,9 @@
 # Current objective
 
 Spotify Mixer source resolution, recipe hydration, deterministic style lookup,
-and `TransitionPlan` adaptation are implemented. Initial RPI validation found
-and reproduced one extension-244 status-gate defect; the evidence-backed fix is
-under local verification before rebuilding the exact candidate.
+and `TransitionPlan` adaptation are implemented, locally verified, and deployed
+on RPI-01. Live validation covers saved transition hydration, capability-gated
+fallback to local Auto, scheduled rendering, promotion, and queue ownership.
 
 # Branch and commits
 
@@ -15,6 +15,7 @@ under local verification before rebuilding the exact candidate.
 - Live SPIRC integration: `01cf0ad`.
 - Edge ownership and fallback hardening: `3f6985b`.
 - Initial implementation state: `aad0456`.
+- Live hydration status correction: `94b4a69`.
 
 # Production architecture
 
@@ -115,11 +116,13 @@ production behavior until a physical mapping and its renderer validation gate
 exist. The same rule applies to unresolved filter/FX, custom curves, blocks, and
 outgoing speed semantics.
 
-# RPI-01 live evidence and next action
+# RPI-01 live evidence
 
-- Deployed initial candidate: `aad0456a13159728cdb521e3ff36a7f54693f7e8`;
-  binary SHA256 `04d3855b2a702c845cf8e713276744c850bb7ba5c2a1787f6de9f9809a623a31`.
-- Snapshot: `/home/amogus/.cache/spotifyd-runtime-build-aad0456`.
+- Deployed implementation commit:
+  `94b4a69b435a0e413f93d7a8f993cfdfc87a3db2`.
+- Deployed binary SHA256:
+  `b148f34d2cd0e84d33625c1ef5ba0096f9428420318c4ea33427b690e4f460b5`.
+- Exact build snapshot: `/home/amogus/.cache/spotifyd-runtime-build-94b4a69`.
 - Known-good rollback binary:
   `/usr/local/bin/spotifyd.rollback-90e1628-pre-b63949c`.
 - Rollback SHA256:
@@ -129,12 +132,25 @@ outgoing speed semantics.
   the authoritative queue exactly once; one edge retained distinct canonical
   and relinked playable identities. No XRUN, underrun, EPIPE, panic, or stale
   promotion was logged.
-- Saved hydration started for the exact owned edge, but the response's live
-  provider status 200 exposed an incorrect zero-success check added during
-  envelope hardening. Sanitized extension captures and the saved-recipe probe
-  independently confirm status 200. Local tests now require present headers and
-  status 200; the corrected binary has not yet been deployed.
+- The corrected build hydrated and validated extension 244 for the exact saved
+  Blended edge `3eekarcy7kvN4yt5ZFzltW` -> `7ycWLEP1GsNjVvcjawXz3z`
+  under session `c6e64d6b7aae493dbb6d8466245290b0`, edge generation 7.
+- Saved transition URI
+  `spotify:transition:77XHoqQ5xJMsKf5HHXeY7a:1789483453786` decoded as preset
+  2. The unsupported EQ physical mapping rejected only that source; local Auto
+  then selected preset 1 (`startA=173210`, `startB=9589`, `duration=5000`) and
+  logged EQ style 4 as omitted rather than inventing DSP.
+- The scheduled plan started and completed, player generation 11 promoted the
+  exact incoming playable track at 12122 ms, and SPIRC advanced the authoritative
+  queue once from A to B. The subsequent current/next edge was B to the original
+  following context row. There were zero XRUN, underrun, EPIPE, panic, audio/sink
+  error, or stale-promotion matches in the bounded run.
+- Separate live mismatched-edge probes decoded saved data but rejected it because
+  returned B did not match the authoritative incoming row, then selected local
+  Auto without changing queue ownership.
+- RPI-01 remains active with 2.0 GiB swap (1.7 GiB free after the build). Root
+  filesystem had 531 MiB free after deployment; build snapshots were retained.
 
-NEXT ACTION: complete the local gate, commit and push the status fix, rebuild and
-deploy that exact revision without replacing the rollback binary, then confirm
-extension-244 hydration reaches recipe validation and safe preset-2 fallback.
+NEXT ACTION: implement an evidence-backed physical EQ mapping and renderer
+validation before enabling saved preset-2 DSP; until then retain the verified
+capability-gated local-Auto fallback.
