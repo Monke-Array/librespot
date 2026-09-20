@@ -63,6 +63,213 @@ pub(crate) struct SpotifyTransitionRecipe {
     transition: Transition,
 }
 
+/// Semantic source selected for an authoritative Mixer edge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SpotifyTransitionSource {
+    Saved,
+    BackendAuto,
+    LocalAuto,
+    TerminalNone,
+    DeterministicFallback,
+}
+
+/// Where a transition candidate entered the live resolver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SpotifyTransitionProvenance {
+    InlineMetadata,
+    TransitionUriHydration,
+    BackendMetadata,
+    LocalCalculation,
+    PreviewSignal,
+    DeterministicPolicy,
+}
+
+/// Complete Connect ownership for one authoritative outgoing-to-incoming edge.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SpotifyTransitionEdge {
+    pub context_uri: String,
+    pub outgoing_row_uid: String,
+    pub incoming_row_uid: String,
+    pub canonical_a_uri: String,
+    pub canonical_b_uri: String,
+    pub playable_a_uri: Option<String>,
+    pub playable_b_uri: Option<String>,
+    pub session_id: u64,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SpotifyTransitionCandidate {
+    pub source: SpotifyTransitionSource,
+    pub provenance: SpotifyTransitionProvenance,
+    pub edge: SpotifyTransitionEdge,
+    pub recipe: SpotifyTransitionRecipe,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedSpotifyTransition {
+    pub source: SpotifyTransitionSource,
+    pub provenance: SpotifyTransitionProvenance,
+    pub edge: SpotifyTransitionEdge,
+    pub recipe: SpotifyTransitionRecipe,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SpotifyTransitionRejection {
+    BackendDisabled,
+    PreviewOnly,
+    StaleEdge,
+    CanonicalMismatch,
+    PlayableMismatch,
+    RowMismatch,
+    MissingPreset,
+    UnknownPreset(i32),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SpotifyTransitionAttempt {
+    pub source: SpotifyTransitionSource,
+    pub provenance: SpotifyTransitionProvenance,
+    pub reason: SpotifyTransitionRejection,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum SpotifyTransitionResolution {
+    Selected(ResolvedSpotifyTransition),
+    TerminalNone {
+        source: SpotifyTransitionSource,
+        provenance: SpotifyTransitionProvenance,
+        edge: SpotifyTransitionEdge,
+    },
+    LocalAuto {
+        rejections: Vec<SpotifyTransitionAttempt>,
+    },
+    DeterministicFallback {
+        rejections: Vec<SpotifyTransitionAttempt>,
+    },
+}
+
+fn reject_candidate(
+    candidate: &SpotifyTransitionCandidate,
+    reason: SpotifyTransitionRejection,
+) -> SpotifyTransitionAttempt {
+    SpotifyTransitionAttempt {
+        source: candidate.source,
+        provenance: candidate.provenance,
+        reason,
+    }
+}
+
+fn evaluate_recipe_candidate(
+    active_edge: &SpotifyTransitionEdge,
+    candidate: SpotifyTransitionCandidate,
+) -> Result<SpotifyTransitionResolution, SpotifyTransitionAttempt> {
+    if candidate.provenance == SpotifyTransitionProvenance::PreviewSignal {
+        return Err(reject_candidate(
+            &candidate,
+            SpotifyTransitionRejection::PreviewOnly,
+        ));
+    }
+    if candidate.edge != *active_edge {
+        return Err(reject_candidate(
+            &candidate,
+            SpotifyTransitionRejection::StaleEdge,
+        ));
+    }
+
+    let overlap = candidate
+        .recipe
+        .overlap()
+        .expect("decoded recipes retain a validated overlap");
+    if overlap.track_a_uri() != active_edge.canonical_a_uri
+        || overlap.track_b_uri() != active_edge.canonical_b_uri
+    {
+        return Err(reject_candidate(
+            &candidate,
+            SpotifyTransitionRejection::CanonicalMismatch,
+        ));
+    }
+    if (!overlap.track_a_row_id().is_empty()
+        && overlap.track_a_row_id() != active_edge.outgoing_row_uid)
+        || (!overlap.track_b_row_id().is_empty()
+            && overlap.track_b_row_id() != active_edge.incoming_row_uid)
+    {
+        return Err(reject_candidate(
+            &candidate,
+            SpotifyTransitionRejection::RowMismatch,
+        ));
+    }
+    if active_edge.playable_a_uri.as_deref().is_some_and(|active| {
+        !overlap.track_a_playable_uri().is_empty() && overlap.track_a_playable_uri() != active
+    }) || active_edge.playable_b_uri.as_deref().is_some_and(|active| {
+        !overlap.track_b_playable_uri().is_empty() && overlap.track_b_playable_uri() != active
+    }) {
+        return Err(reject_candidate(
+            &candidate,
+            SpotifyTransitionRejection::PlayableMismatch,
+        ));
+    }
+
+    let Some(preset) = candidate.recipe.preset() else {
+        return Err(reject_candidate(
+            &candidate,
+            SpotifyTransitionRejection::MissingPreset,
+        ));
+    };
+    let preset_id = preset.id();
+    if preset_id == 0 {
+        return Ok(SpotifyTransitionResolution::TerminalNone {
+            source: candidate.source,
+            provenance: candidate.provenance,
+            edge: candidate.edge,
+        });
+    }
+    if !(0..=22).contains(&preset_id) {
+        return Err(reject_candidate(
+            &candidate,
+            SpotifyTransitionRejection::UnknownPreset(preset_id),
+        ));
+    }
+
+    Ok(SpotifyTransitionResolution::Selected(
+        ResolvedSpotifyTransition {
+            source: candidate.source,
+            provenance: candidate.provenance,
+            edge: candidate.edge,
+            recipe: candidate.recipe,
+        },
+    ))
+}
+
+pub(crate) fn resolve_recipe_sources(
+    active_edge: &SpotifyTransitionEdge,
+    saved: Option<SpotifyTransitionCandidate>,
+    backend: Option<SpotifyTransitionCandidate>,
+    backend_enabled: bool,
+) -> SpotifyTransitionResolution {
+    let mut rejections = Vec::new();
+    if let Some(saved) = saved {
+        match evaluate_recipe_candidate(active_edge, saved) {
+            Ok(resolution) => return resolution,
+            Err(rejection) => rejections.push(rejection),
+        }
+    }
+    if let Some(backend) = backend {
+        if backend_enabled {
+            match evaluate_recipe_candidate(active_edge, backend) {
+                Ok(resolution) => return resolution,
+                Err(rejection) => rejections.push(rejection),
+            }
+        } else {
+            rejections.push(reject_candidate(
+                &backend,
+                SpotifyTransitionRejection::BackendDisabled,
+            ));
+        }
+    }
+    SpotifyTransitionResolution::LocalAuto { rejections }
+}
+
 impl SpotifyTransitionRecipe {
     pub(crate) fn from_base64(encoded: &str) -> Result<Self, SpotifyTransitionError> {
         let bytes = BASE64
@@ -1046,5 +1253,208 @@ mod tests {
         track.metadata.insert("a-first".into(), "secret-a".into());
 
         assert_eq!(provided_metadata_keys(&track), ["a-first", "z-last"]);
+    }
+
+    fn resolver_edge(generation: u64) -> SpotifyTransitionEdge {
+        SpotifyTransitionEdge {
+            context_uri: "spotify:playlist:mixer".into(),
+            outgoing_row_uid: "row-a".into(),
+            incoming_row_uid: "row-b".into(),
+            canonical_a_uri: TRACK_A.into(),
+            canonical_b_uri: TRACK_B.into(),
+            playable_a_uri: Some(TRACK_A.into()),
+            playable_b_uri: Some(TRACK_B.into()),
+            session_id: 41,
+            generation,
+        }
+    }
+
+    fn resolver_candidate(
+        source: SpotifyTransitionSource,
+        provenance: SpotifyTransitionProvenance,
+        recipe: Transition,
+        generation: u64,
+    ) -> SpotifyTransitionCandidate {
+        SpotifyTransitionCandidate {
+            source,
+            provenance,
+            edge: resolver_edge(generation),
+            recipe: SpotifyTransitionRecipe::from_base64(&encoded(&recipe)).unwrap(),
+        }
+    }
+
+    #[test]
+    fn resolver_saved_recipe_precedes_backend() {
+        let active = resolver_edge(7);
+        let saved = resolver_candidate(
+            SpotifyTransitionSource::Saved,
+            SpotifyTransitionProvenance::InlineMetadata,
+            transition(),
+            7,
+        );
+        let backend = resolver_candidate(
+            SpotifyTransitionSource::BackendAuto,
+            SpotifyTransitionProvenance::BackendMetadata,
+            transition(),
+            7,
+        );
+
+        let resolved = resolve_recipe_sources(&active, Some(saved), Some(backend), true);
+        assert!(matches!(
+            resolved,
+            SpotifyTransitionResolution::Selected(ResolvedSpotifyTransition {
+                source: SpotifyTransitionSource::Saved,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn resolver_backend_is_selected_when_enabled_and_saved_is_absent() {
+        let active = resolver_edge(7);
+        let backend = resolver_candidate(
+            SpotifyTransitionSource::BackendAuto,
+            SpotifyTransitionProvenance::BackendMetadata,
+            transition(),
+            7,
+        );
+
+        let resolved = resolve_recipe_sources(&active, None, Some(backend), true);
+        assert!(matches!(
+            resolved,
+            SpotifyTransitionResolution::Selected(ResolvedSpotifyTransition {
+                source: SpotifyTransitionSource::BackendAuto,
+                ..
+            })
+        ));
+        assert!(matches!(
+            resolve_recipe_sources(&active, None, None, true),
+            SpotifyTransitionResolution::LocalAuto { .. }
+        ));
+    }
+
+    #[test]
+    fn resolver_known_none_is_terminal_even_with_overrides() {
+        let active = resolver_edge(7);
+        let mut none = transition();
+        let preset = none.preset.as_mut().unwrap();
+        preset.id = Some(0);
+        preset.eq_style_override = MessageField::some(Default::default());
+        let saved = resolver_candidate(
+            SpotifyTransitionSource::Saved,
+            SpotifyTransitionProvenance::InlineMetadata,
+            none,
+            7,
+        );
+
+        assert!(matches!(
+            resolve_recipe_sources(&active, Some(saved), None, true),
+            SpotifyTransitionResolution::TerminalNone {
+                source: SpotifyTransitionSource::Saved,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn resolver_unknown_preset_continues_to_local_auto() {
+        let active = resolver_edge(7);
+        let mut unknown = transition();
+        unknown.preset.as_mut().unwrap().id = Some(999);
+        let saved = resolver_candidate(
+            SpotifyTransitionSource::Saved,
+            SpotifyTransitionProvenance::InlineMetadata,
+            unknown,
+            7,
+        );
+
+        let resolved = resolve_recipe_sources(&active, Some(saved), None, true);
+        let SpotifyTransitionResolution::LocalAuto { rejections } = resolved else {
+            panic!("unknown preset must continue fallback");
+        };
+        assert_eq!(
+            rejections[0].reason,
+            SpotifyTransitionRejection::UnknownPreset(999)
+        );
+    }
+
+    #[test]
+    fn resolver_stale_edge_continues_to_local_auto() {
+        let active = resolver_edge(8);
+        let stale = resolver_candidate(
+            SpotifyTransitionSource::Saved,
+            SpotifyTransitionProvenance::TransitionUriHydration,
+            transition(),
+            7,
+        );
+
+        let resolved = resolve_recipe_sources(&active, Some(stale), None, true);
+        let SpotifyTransitionResolution::LocalAuto { rejections } = resolved else {
+            panic!("stale saved candidate must continue fallback");
+        };
+        assert_eq!(rejections[0].reason, SpotifyTransitionRejection::StaleEdge);
+    }
+
+    #[test]
+    fn resolver_canonical_and_playable_mismatches_are_rejected() {
+        let active = resolver_edge(7);
+        let mut canonical_mismatch = transition();
+        canonical_mismatch.overlap.as_mut().unwrap().track_b_uri = Some(TRACK_A.into());
+        let saved = resolver_candidate(
+            SpotifyTransitionSource::Saved,
+            SpotifyTransitionProvenance::InlineMetadata,
+            canonical_mismatch,
+            7,
+        );
+        let SpotifyTransitionResolution::LocalAuto { rejections } =
+            resolve_recipe_sources(&active, Some(saved), None, true)
+        else {
+            panic!("canonical mismatch must continue fallback");
+        };
+        assert_eq!(
+            rejections[0].reason,
+            SpotifyTransitionRejection::CanonicalMismatch
+        );
+
+        let mut playable_mismatch = transition();
+        let overlap = playable_mismatch.overlap.as_mut().unwrap();
+        overlap.track_a_playable_uri = Some(TRACK_B.into());
+        overlap.track_b_playable_uri = Some(TRACK_B.into());
+        let saved = resolver_candidate(
+            SpotifyTransitionSource::Saved,
+            SpotifyTransitionProvenance::InlineMetadata,
+            playable_mismatch,
+            7,
+        );
+        let SpotifyTransitionResolution::LocalAuto { rejections } =
+            resolve_recipe_sources(&active, Some(saved), None, true)
+        else {
+            panic!("playable mismatch must continue fallback");
+        };
+        assert_eq!(
+            rejections[0].reason,
+            SpotifyTransitionRejection::PlayableMismatch
+        );
+    }
+
+    #[test]
+    fn resolver_preview_payload_cannot_authorize_live_playback() {
+        let active = resolver_edge(7);
+        let preview = resolver_candidate(
+            SpotifyTransitionSource::Saved,
+            SpotifyTransitionProvenance::PreviewSignal,
+            transition(),
+            7,
+        );
+
+        let SpotifyTransitionResolution::LocalAuto { rejections } =
+            resolve_recipe_sources(&active, Some(preview), None, true)
+        else {
+            panic!("preview candidate must continue fallback");
+        };
+        assert_eq!(
+            rejections[0].reason,
+            SpotifyTransitionRejection::PreviewOnly
+        );
     }
 }
