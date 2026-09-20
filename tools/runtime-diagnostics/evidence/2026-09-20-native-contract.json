@@ -1,0 +1,158 @@
+{
+  "format": "spotify-native-contract-index-v1",
+  "client_version": "1.3.0.277.g5441bb3e",
+  "dll_sha256": "65c131dc7f9dcce90eb3874033e6e22ef422a493f0877e3f031805198839b7c4",
+  "scope": "Semantic reference index only; no extracted code. See protocol document for confidence and unresolved DSP details.",
+  "functions": [
+    {
+      "rva": "0x000310c4",
+      "role": "saved metadata key initializer",
+      "private_analysis_sha256": "141fb14c6fbb7b2c195ee3797239a9d6dc047270a842a84a5b6bed0581e7f8da"
+    },
+    {
+      "rva": "0x00031124",
+      "role": "backend metadata key initializer",
+      "private_analysis_sha256": "719593beecccb527eb45c3c221395e3af04f9095e0ff78ddb70f7dbfb63ac5bc"
+    },
+    {
+      "rva": "0x007f9b5c",
+      "role": "Automix node constructor and recipe slots",
+      "private_analysis_sha256": "1a697ded48d0989d874b236503a94062b830ceb1e5cb243a4cdf26c76e0e87e3"
+    },
+    {
+      "rva": "0x00806274",
+      "role": "current/next source candidate loops",
+      "private_analysis_sha256": "06ddf16f46d20a3757138095a45037e43a1e7f9ae75944dfaa9bff187989f06e"
+    },
+    {
+      "rva": "0x00812aa4",
+      "role": "Automix virtual node update",
+      "private_analysis_sha256": "71e7856e63c370151a305b9367f694dc91a0ce094fc17bd0f9644a3ae96632e1"
+    },
+    {
+      "rva": "0x00481e70",
+      "role": "configuration field assembly",
+      "private_analysis_sha256": "a00cfce8d5a11c35908ac3e3fbe7414d581e86f8dc7038c496a8262f951aa7da"
+    },
+    {
+      "rva": "0x00481df8",
+      "role": "backend gate accessor",
+      "private_analysis_sha256": "9006cc4708b28106e2f288928c542a133d5eba8b81ab827c3183649e93783e73"
+    },
+    {
+      "rva": "0x0048163c",
+      "role": "curve override gate accessor",
+      "private_analysis_sha256": "22cec966db9bec33d0706fcd4724466510d64bfda867b0f67d5f1fe4ee6e77d6"
+    },
+    {
+      "rva": "0x0103f614",
+      "role": "stored recipe validation and local Auto resolution",
+      "private_analysis_sha256": "24e8bbcf96c1404ece0aa959b349ea5131cbc7df97384de38f801a3dc6794265"
+    },
+    {
+      "rva": "0x01043b9c",
+      "role": "preset validation, NONE, style/curve override application",
+      "private_analysis_sha256": "bcbf0bf93f8d444adbb2d8681e1d7aac83a007700c1c2115769f61ad661edfc1"
+    },
+    {
+      "rva": "0x01040aa4",
+      "role": "shared directional materialization",
+      "private_analysis_sha256": "1694b17fef5e7d1caa672f25c0af09d286faa2bee5857f6c520956e0cac4562d"
+    },
+    {
+      "rva": "0x0103be8c",
+      "role": "ranked Auto and fallback selection",
+      "private_analysis_sha256": "47e81a2e6452bd25c928233990185bb431774356386a6fc99772ff35ecbde81e"
+    },
+    {
+      "rva": "0x0103b6f0",
+      "role": "Auto-internal cuepoint or end/start fade",
+      "private_analysis_sha256": "05e34a4f3b9b1d975f3284e999c217cf2a06d5ec067bab324430c7ce21745b63"
+    },
+    {
+      "rva": "0x0103f0dc",
+      "role": "item speed adjustment",
+      "private_analysis_sha256": "35db1fa239acf830a3dd2b4ddbf380b4cf0e1a92549a3cf4e17aabade02e2dfe"
+    },
+    {
+      "rva": "0x00810f90",
+      "role": "directional materialization writer",
+      "private_analysis_sha256": "7b9322a4f66261a88cfd213874c4582a9764786915a6265d6b9b4eed52c420ea"
+    },
+    {
+      "rva": "0x008110ec",
+      "role": "directional materialization and auto_preset_id writer",
+      "private_analysis_sha256": "153727e29b1050c163d9b73fbcc7149a491df0c6917a02dd41d4950300cd447c"
+    },
+    {
+      "rva": "0x00808ea0",
+      "role": "metadata insertion",
+      "private_analysis_sha256": "c0404df6a1d5fe185d09d10077732b22027a624be54105a25681e563e6273f95"
+    },
+    {
+      "rva": "0x01049874",
+      "role": "incoming serializer",
+      "private_analysis_sha256": "21c34f2c68230b05633b1fd0d555a5252c1be3c3367e8ce398096093c8ca3057"
+    },
+    {
+      "rva": "0x0104a158",
+      "role": "outgoing serializer",
+      "private_analysis_sha256": "6a050af0749ad034c9ad84d087fde47faefe41b16a9a38d1326dc78792697c26"
+    },
+    {
+      "rva": "0x01047af8",
+      "role": "incoming speed events",
+      "private_analysis_sha256": "9b80e1c9cb2327f81de71aad7e18b54d1e667d59fda37866f7ab5c6c8932b53a"
+    },
+    {
+      "rva": "0x01047a98",
+      "role": "speed event JSON fields",
+      "private_analysis_sha256": "f6b6baa87f2a875a49f5e49f34be8fbc3fa4276507cc214d587d1712bbcdc949"
+    }
+  ],
+  "source_order": {
+    "basis": "code-derived",
+    "candidates": [
+      "nonempty saved recipe",
+      "nonempty backend recipe when enabled",
+      "empty input for local Auto"
+    ],
+    "continue_on": "materialized result with optional computed-preset marker",
+    "stop_on": [
+      "materialized recipe result without computed-preset marker",
+      "no result for a nonempty candidate"
+    ],
+    "computed_marker": "automix.auto_preset_id",
+    "backend_live_delivery": "not observed in captured account windows"
+  },
+  "config": {
+    "namespace": "core-automix",
+    "backend": {
+      "key": "use_backend_auto_transition",
+      "default": false,
+      "offset": "0xa3",
+      "node_offset": "0x4b3",
+      "effective_override": "UNKNOWN"
+    },
+    "curve_overrides": {
+      "key": "auto_transition_use_curve_overrides",
+      "default": false,
+      "offset": "0xa0",
+      "effective_override": "UNKNOWN"
+    }
+  },
+  "materialization": {
+    "saved": "0x0103f614 -> 0x01043b9c -> 0x01040aa4",
+    "local": "0x0103f614 -> 0x01040aa4",
+    "serializers": [
+      "0x01049874",
+      "0x0104a158"
+    ],
+    "writers": [
+      "0x00810f90",
+      "0x008110ec"
+    ],
+    "insert": "0x00808ea0",
+    "status": "downstream native player representation, not evidence of backend audio attributes"
+  }
+}

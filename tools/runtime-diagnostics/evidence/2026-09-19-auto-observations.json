@@ -1,0 +1,81 @@
+{
+  "format": "spotify-auto-observations-v1",
+  "createdOn": "2026-09-19",
+  "sanitized": true,
+  "scope": "offline counts and pair-relative observations; all account, device, playlist, row, transition, and track identifiers omitted",
+  "officialQueue": {
+    "boundary": "official native ContextPlayer.GetQueue stream to XPUI",
+    "deduplicatedFinalSnapshots": [
+      "official-e1-blended-complete.json",
+      "official-e4-requested-auto.json"
+    ],
+    "snapshotRelations": {
+      "official-e1.json": "exact record prefix of official-e1-blended.json",
+      "official-e1-blended.json": "exact record prefix of official-e1-blended-complete.json",
+      "official-e3-blended.json": "exact record prefix of official-e4-requested-auto.json"
+    },
+    "queueRecords": 30,
+    "currentOrNextTrackObservations": 60,
+    "savedRecipeAttributeObservations": 15,
+    "backendRecipeAttributeObservations": 0,
+    "queueRecordsWithMaterializedTiming": 22,
+    "backendDeliveryConclusion": "not observed in these capture windows"
+  },
+  "controlledPair": {
+    "sameExactPairAcrossE1E3E4AndRpi": true,
+    "officialSavedGeometryMs": {
+      "outgoingStart": 150580,
+      "incomingStart": 5700,
+      "duration": 12600
+    },
+    "officialSavedIncomingSpeed": 0.95238173,
+    "officialMaterializedClassesObserved": [
+      "volume+speed+eq",
+      "volume+speed+eq+filter",
+      "preset-1 volume+eq"
+    ],
+    "rpiLoggedPairInspections": 4,
+    "rpiTargetPairInspections": 3,
+    "rpiLocalAutoSelections": 3,
+    "rpiTargetPairLocalAutoSelections": 2,
+    "rpiDistinctLocalAutoPairs": 2,
+    "rpiTargetLocalPlanMs": {
+      "outgoingStart": 173210,
+      "incomingStart": 9589,
+      "duration": 5000,
+      "preset": 1
+    },
+    "audibleExecutionProved": false
+  },
+  "rpiIngress": {
+    "rawContextTrackInventoryObservations": 236,
+    "savedRecipePresent": 2,
+    "backendRecipePresent": 0,
+    "transitionDataHydration": "succeeded and pair/context/row validated",
+    "materializedAudioFieldsForControlledPair": "not observed"
+  },
+  "nativeLogs": {
+    "2026-09-15": {
+      "calculations": 16,
+      "explicitCuepointFallbacks": 12,
+      "calculationsWithoutFallbackBeforeNextCalculation": 4,
+      "distinctPairsWithoutFallback": 2,
+      "interpretation": "non-cuepoint calculator path observed; render and audible execution not proved"
+    },
+    "2026-09-19-preview-session": {
+      "windowLocalTime": "10:10:42-10:14:51",
+      "calculations": 31,
+      "explicitCuepointFallbacks": 29,
+      "calculationsWithoutFallbackBeforeNextCalculation": 2,
+      "distinctCalculationPairLabels": 22,
+      "interpretation": "separate multi-pair preview observation; not same-pair experimental evidence"
+    }
+  },
+  "confidence": {
+    "backendAttributeAbsentFromCapturedQueueTracks": "high",
+    "librespotLocalPlanSelectedAndScheduled": "high",
+    "nativeNonCuepointCalculationPath": "medium",
+    "audibleLocalAutoExecution": "not established",
+    "upstreamProducerOfMaterializedFields": "not established"
+  }
+}

@@ -1,151 +1,108 @@
 # Current objective
 
-Live-validate the exact `b63949c` runtime candidate while the bounded recorder
-collects evidence. Keep M5 open until the storage/XRUN and playback lifecycle
-fixes have meaningful active-playback evidence.
+Spotify Mixer protocol handoff is checkpointed in
+`docs/SPOTIFY_LIVE_RECIPE_PROTOCOL.md` and `docs/SPOTIFY_STYLE_CONTRACT.md`.
+No production playback integration was changed. Full audible Spotify DSP parity
+is not established; explicit release gates remain for physical EQ/filter/FX
+mappings, some speed/override configuration, and outer crossfade policy.
 
-# Branch and deployment
+# Branch and work
 
-- Branch: `codex/m3a-live-auto-metadata`; current/pushed HEAD:
-  `b63949c10895735f0acd78252aef7d406e14dbf4`.
-- ARM snapshot: `/home/amogus/.cache/spotifyd-runtime-build-b63949c`; all eight
-  librespot manifest pins and all eight lockfile sources use exact `b63949c`.
-- Build unit `spotifyd-arm-build-b63949c.service` succeeded with
-  `--release --locked -j 2`, Nice 15, and idle I/O priority. Cargo reported
-  63m24s wall time and systemd reported 40m56s CPU time.
-- Built/deployed artifact:
-  `/home/amogus/.cache/spotifyd-runtime-build-b63949c/target/release/spotifyd`.
-  SHA256 of both artifact and `/usr/local/bin/spotifyd`:
-  `32e6d39c07aeb2a55bfa5fb247f99e5d155a95aeb7e5143541248bc8d00d4af3`.
-- Rollback `/usr/local/bin/spotifyd.rollback-90e1628-pre-b63949c` SHA256:
-  `54a8c36d487c5cbc39239fac1dd9f19fa9a50a5fc82695259b2e315d3edd2e9c`.
-  Older rollback `/usr/local/bin/spotifyd.rollback-09369c86-pre-90e1628`
-  remains available with SHA256
-  `c2f208c471ced9e2675f5f48fe32b06c0d6d41c0b42cd718b49025ca92edac5d`.
-- The intended reused target directory still contains the old artifact; it was
-  rejected by SHA verification. The successful unit wrote the recorded artifact
-  to the snapshot-local target. No stale artifact was deployed.
-- Post-deploy startup self-identifies as `librespot-b63949c1`, authenticated,
-  connected to the AP and dealer, and left spotifyd plus the system diagnostic
-  recorder active with zero restarts. Automatic incident count remains three.
+- Branch `codex/m3a-live-auto-metadata`; investigation baseline `e9585c9`.
+- This documentation/evidence change records September15-19 captures and native
+  code findings for official Windows1.3.0.277, updated September20.
+- Native DLL SHA256:
+  `65c131dc7f9dcce90eb3874033e6e22ef422a493f0877e3f031805198839b7c4`.
+- Clean protocol/docs/evidence commit is intended for origin on this branch.
+  Use Git for its final commit identity; do not infer runtime deployment from it.
 
 # Architecture and invariants
 
-- Spotify/Connect chooses what plays. Transition logic may choose only how the
-  authoritative outgoing/incoming pair is handed off.
-- A playing-source seek closes a Running sink before decoder seek/read-ahead,
-  cancels secondary/transition ownership, and leaves restart to the normal poll
-  path after PCM exists.
-- A changed-position same-track Load uses a fresh loader instead of synchronously
-  seeking a current or ready decoder. With no current PCM producer, the sink is
-  temporarily closed until the loader succeeds.
-- A changed-position plan for a dormant direct secondary retires its generation
-  and reloads asynchronously. The current producer and sink continue running.
-  A same-position update preserves decoder identity and generation without churn.
-- Ready/loading secondary state belongs to its session, target, and generation.
-  Cancellation retires runnable worker/transition DSP state; stale generations
-  cannot provide PCM or promote.
-- Resolved context replacement compares the active `(current, next)` edge. A
-  changed authoritative edge invalidates the old transition and preloads the new
-  next; an unchanged edge does not churn ownership.
-- Promotion is single-owner, preserves the incoming source clock, and retires
-  transition DSP before ordinary playback owns the source.
+- Connect owns what plays. Recipe/Auto/style data controls only how authoritative
+  A becomes authoritative B. It cannot choose B or advance the queue.
+- Validate context/rows/canonical and playable identity, revision, item speeds,
+  session and edge generation. Stale async results cannot regain ownership.
+- Mixer/Auto and normal configurable crossfade remain separate runtime routes.
+- Current source, secondary PCM/decoder, rendering and promotion retain their
+  existing generation/ownership rules; deterministic fallback remains available.
 
-# Confirmed fixes
+# Verified protocol findings
 
-- `f51a26b`: stop the sink before blocking playing-source seek/read-ahead.
-- `09369c8`: raise `slow_operation=sink_write` from 100 ms to 250 ms; ordinary
-  ALSA writes around 118-129 ms are no longer false slow events.
-- `eab442a` and `477c2c9`: recorder telemetry timeout handling and persistent
-  journal cursors prevent crashes and replayed XRUN incidents.
-- `b78e849`: refresh preload/transition ownership when a resolved context changes
-  the authoritative active edge.
-- `40b713c`: publish a completed same-filesystem audio download into cache by
-  hard link, with copy fallback, eliminating a second full-file SD-card write.
-- `064037d`: reject promotion of a ready direct source at the wrong requested
-  position; the normal fresh loader owns the request instead.
-- `b63949c`: eliminate synchronous changed-position seeks from same-track Load
-  reuse and ready-secondary plan retargeting.
+- Saved `automix.auto_transition_recipe` can contain Blended content despite its
+  name. Extension244 hydration already works; tested preset2 failed specifically
+  because preset/style rendering is unsupported, not because metadata was absent.
+- Native candidate loops order saved recipe, enabled nonempty backend recipe,
+  then empty-input local Auto. A local computed-preset marker keeps a result
+  provisional while later candidates are tried; accepted stored content stops.
+- Known preset0 NONE returns no Automix result and stops a nonempty candidate.
+  Unknown/mismatched recipe falls through to local Auto; these are different.
+- Backend enablement is conditional. No backend field was observed in the
+  captured60 official row observations or236 RPI inventories. This is not proof
+  about account entitlement or global availability. No backend fetch is invented.
+- Saved/local results converge on native materializer1040aa4; serializers1049874
+  and104a158 and node writers810f90/8110ec produce downstream `audio.*` metadata.
+  XPUI queue output is not evidence that these attributes came from a backend.
+- Complete current lookup wire schemas, preset0..22 mappings, style IDs and
+ 69 numeric diagnostic request/response fixtures are durable under
+  `tools/runtime-diagnostics/evidence/2026-09-19-*.json`.
+- FX request fields are IDs1/BPM2/bars3. Materializer clamps bars2..32. Curves
+  can depend on bars; sampled FX wet/dry envelopes do not establish BPM-independent
+  effect timing. Native curve conversion ignores envelope minimum/maximum.
+- Curve-override gate is `core-automix/auto_transition_use_curve_overrides`;
+  current accessor defaults false. Effective account override remains unknown.
+- Standard preset mappings use no jogwheel/looping; explicit nonzero overrides
+  should initially be rejected as unsupported, not silently ignored.
 
-# Regression and local verification
+# Evidence limits and safe handoff
 
-- Cache regressions prove same-filesystem inode reuse and copy fallback.
-- `different_position_load_retires_ready_fallback_and_starts_fresh_loader`
-  proves a mismatched ready source cannot be synchronously sought/promoted.
-- `different_position_load_reopens_playing_source_without_blocking_seek` proves
-  changed-position current Load cancels transition ownership, closes the sink,
-  and enters the fresh loader without touching a panic-on-seek decoder.
-- `same_track_plan_position_change_reloads_secondary_without_blocking_current`
-  failed before `b63949c` at a panic-on-seek decoder and now proves replacement
-  loader/generation ownership while the current sink stays Running.
-- The paired same-position regression proves a changed plan can retain the same
-  ready decoder and generation when its incoming start position is unchanged.
-- Final gate at `b63949c`: fmt passed; workspace check passed; playback 99/99;
-  Connect 116/116; Spotify Auto oracle 5/5; doctest 1/1; playback/connect
-  all-target Clippy passed with the six established pre-existing allowances;
-  diff check passed.
+- Native source ordering is code-derived; no live backend collision experiment
+  exists. The strongest live result is same-pair saved recipe ingress on RPI
+  versus downstream materialization on official Windows.
+- September15 snapshots overlap cumulatively. September19 user preview activity
+  is a separate multi-pair session, not a controlled natural live transition.
+- Desktop was restarted with local diagnostics September19; native log persisted.
+  Large stage export hit ENOBUFS; no successful new full stage export is claimed.
+  Debug port subsequently became unavailable; no further restart was performed.
+- Safe Sol start: typed source/outcome/ownership contract, ingress hardening,
+  deterministic fixture-backed style resolver, lossless render-plan representation.
+- Physical EQ/filter/FX mappings remain unknown; do not claim preset2 audible
+  compatibility or ignore its EQ. Partial overrides and speed ramp details need
+  explicit capability checks. Outer fallback uncertainty is documented, not guessed.
 
-# Runtime evidence
+# Retained runtime stabilization state (separate workstream)
 
-- Preserved XRUN `1789384890613886092`, ALSA trigger
-  2026-09-14 13:21:30.117011+02, is at
-  `/var/lib/spotifyd-diagnostics/manual/1789384890613886092-xrun`.
-- First divergence was `current_decoder_next_packet` blocking 3.336338s while
-  ALSA stayed Running, followed by EPIPE. Queue, context, preload, promotion, and
-  CPU/memory state were coherent; no nearby dealer/context command existed.
-- A completed 12,002,028-byte preload had been copied to a second cache inode.
-  Delayed writeback was about 24.1 MiB, SD waits reached 3.7s, and the current
-  cached-source read waited 3.466s. A clean 9,302,932-byte comparison download
-  later produced about 18.9 MiB delayed writes, confirming approximately 2x
-  cache write amplification. `40b713c` removes that duplicated same-filesystem
-  data write; live post-fix writeback measurement is pending.
-- The older audible stop incident `1789301128310568290` occurred while an ARM
-  build saturated SD I/O: current decode stalled 4.486s and 1.447s, with 60-66%
-  I/O wait and healthy memory. It is build-induced storage starvation, not
-  memory exhaustion. Duplicate `1789301558842656438` was recorder cursor replay.
-- User-reported Hypa Hypa -> brief Y.K.P -> Nash Gimn skip is preserved at
-  `/var/lib/spotifyd-diagnostics/manual/1789308023769543909-skip`. It had no
-  XRUN/network/load error; resolved context changed A -> B to A -> C after B was
-  ready, and stale B promoted before C loaded. `b78e849` fixes that ownership bug.
-- Pre-fix 100 ms sink-write tracing produced 67 events in eight active seconds
-  (about 502/min). A later 2,181-second active window at 250 ms produced zero
-  sink-write events and about 23.2 KiB/min total journal traffic. Genuine writes
-  above 250 ms remain observable.
-- Runtime traces before `b63949c` showed same-target plan retarget commands block
-  for 157.380 ms and 95.209 ms in the synchronous secondary seek. This reachable
-  hazard is fixed, but is not attributed to an older XRUN without matching
-  preserved evidence.
+- Last verified deployed playback candidate: `b63949c10895735f0acd78252aef7d406e14dbf4`.
+- Snapshot `/home/amogus/.cache/spotifyd-runtime-build-b63949c`, snapshot-local
+  `target/release/spotifyd`; deployed `/usr/local/bin/spotifyd` SHA256:
+  `32e6d39c07aeb2a55bfa5fb247f99e5d155a95aeb7e5143541248bc8d00d4af3`.
+- Rollback `/usr/local/bin/spotifyd.rollback-90e1628-pre-b63949c`, SHA256:
+  `54a8c36d487c5cbc39239fac1dd9f19fa9a50a5fc82695259b2e315d3edd2e9c`.
+- Changes retain sink-stop-before-seek, async changed-position Load/preload,
+  edge-change invalidation and hard-link audio-cache publication with copy fallback.
+- Storage incident `/var/lib/spotifyd-diagnostics/manual/1789384890613886092-xrun`:
+  cached current decode stalled3.336s amid doubled preload writes. `40b713c`
+  fixes cache write amplification; runtime writeback proof remains pending.
+- Stale-edge skip `/var/lib/spotifyd-diagnostics/manual/1789308023769543909-skip`
+  is fixed by `b78e849`; post-fix natural edge-replacement evidence still pending.
+- M5 remains open. This protocol work did not deploy, rebuild, or validate audible
+  runtime fixes. September19 SSH confirmed user spotifyd service active; a system
+  service query reported inactive because the runtime is a user service.
 
-# Targeted audit and recovery findings
+# Verification
 
-- Transition generation, cancellation, EOF/promotion exclusivity, queue/context
-  replacement, session replacement, and DSP retirement are coherent under the
-  current regressions. No further demonstrated transition defect is open.
-- Preload TransientService cancels its secondary/transition state, emits a
-  preload LoadFailed event, and preserves the Connect queue. It does not advance
-  or poison the authoritative next track.
-- Current-source transient failure latches recovery to the same URI, position,
-  request, and play intent; starved recovery closes the sink. Success resumes
-  once, repeated transient failure stays in bounded/slow latched retry, permanent
-  failure becomes Unavailable, and SessionInvalid waits for replacement.
-- New Load/seek/stop commands invalidate recovery generations. Session replacement
-  restarts current recovery and in-flight/ready preload against the new session;
-  stale completions cannot regain ownership.
-
-# Unresolved issues
-
-- The deployed cache publication, Load/preload lifecycle changes, and existing
-  seek fix need active live validation. No manual/natural seek has yet been
-  observed in this validation window.
-- No natural A -> B to A -> C resolved-context edge replacement has yet occurred
-  after the edge fix; startup and ordinary edges do not prove that live boundary.
-- Earlier context-adjacent XRUNs lack preserved timelines and remain individually
-  unclassified. Context activity is not assumed causal.
-- M5 remains open until active playback shows no unexplained XRUN and the new
-  cache path demonstrates reduced writeback without destabilizing transitions.
+- Prior production gate at b63949c: fmt/workspace check passed, playback99/99,
+  Connect116/116, oracle5/5, doctest1/1; documented-allowance Clippy passed.
+- Current change is docs and sanitized data only; no Rust or tooling code changed.
+- Numeric style export validated recursively as numeric/boolean/null objects,
+  with no string values, credentials, account/device IDs or client source.
+- Final checks:4 evidence JSON files valid;69 style calls exactly match sources;
+  preset2/FX sample checks,10 doc links, credential scan and diff check passed.
+- Existing oracle consistency script completed:9/9 beats hashes,107/107 presets,
+ 105/107 geometry,22/107 speed bits; max speed delta7.6294e-6 and score still
+  `not-yet-exact`. This does not establish full Auto parity.
 
 # NEXT ACTION
 
-Continue passive cursor-bounded monitoring during normal playback; on the next
-completed uncached preload, verify hard-link publication/writeback volume and
-preserve any audible incident or XRUN before changing priorities.
+Use the exact Sol High sequence in `docs/SPOTIFY_LIVE_RECIPE_PROTOCOL.md`, starting
+with the capability-gated semantic resolver; keep unresolved DSP compatibility
+claims disabled until their documented validation gates pass.
