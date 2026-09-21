@@ -2,7 +2,7 @@
 
 Date: 2026-09-21
 
-Status: approved conversational design, formal specification awaiting human review
+Status: approved 2026-09-22; normative implementation contract
 
 ## 1. Purpose and scope
 
