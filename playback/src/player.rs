@@ -35,6 +35,10 @@ use crate::{
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
+    preview::{
+        PreviewAuthority, PreviewCancelReason, PreviewFailure, PreviewPlaybackRequest,
+        PreviewRestoreOutcome, PreviewToken, RetainedPlaybackDisposition,
+    },
     secondary::{
         Decoder, SECONDARY_PCM_CHANNEL_CAPACITY, SECONDARY_PCM_CHUNK_FRAMES, SecondaryPcmBlock,
         SecondaryPcmReadiness, SecondaryRead, SourceDecoder,
@@ -223,7 +227,10 @@ struct PlayerInternal {
     converter: Converter,
     transition_policy: Box<dyn TransitionPolicy + Send>,
     transition: TransitionEngine,
+    transition_owner: Option<SourceOwner>,
     crossfade_load_ack: Option<CrossfadeLoadAck>,
+    preview_authority: Option<PreviewAuthority>,
+    preview: Option<PreviewOwner>,
 
     // The dynamic limiter is one global output-stage processor after transition mixing.
     normalisation_integrators: [f64; 2],
@@ -275,6 +282,16 @@ enum PlayerCommand {
     Stop,
     Seek(u32),
     SetSession(Session),
+    SetPreviewAuthority {
+        authority: PreviewAuthority,
+        retained: RetainedPlaybackDisposition,
+        reason: PreviewCancelReason,
+    },
+    StartPreview(PreviewPlaybackRequest),
+    CancelPreview {
+        token: PreviewToken,
+        reason: PreviewCancelReason,
+    },
     AddEventSender(mpsc::UnboundedSender<PlayerEvent>),
     SetSinkEventCallback(Option<SinkEventCallback>),
     EmitVolumeChangedEvent(u16),
@@ -304,6 +321,23 @@ enum PlayerCommand {
 
 #[derive(Debug, Clone)]
 pub enum PlayerEvent {
+    PreviewStarted {
+        token: PreviewToken,
+    },
+    PreviewCompleted {
+        token: PreviewToken,
+        restore: PreviewRestoreOutcome,
+    },
+    PreviewCancelled {
+        token: PreviewToken,
+        reason: PreviewCancelReason,
+        restore: PreviewRestoreOutcome,
+    },
+    PreviewFailed {
+        token: PreviewToken,
+        reason: PreviewFailure,
+        restore: PreviewRestoreOutcome,
+    },
     // Play request id changed
     PlayRequestIdChanged {
         play_request_id: u64,
@@ -709,7 +743,10 @@ impl Player {
                 converter,
                 transition_policy: Box::new(FixedDurationTransitionPolicy::default()),
                 transition: TransitionEngine::new(SAMPLE_RATE, NUM_CHANNELS as usize),
+                transition_owner: None,
                 crossfade_load_ack: None,
+                preview_authority: None,
+                preview: None,
 
                 normalisation_peaks: [0.0; 2],
                 normalisation_integrators: [0.0; 2],
@@ -813,6 +850,27 @@ impl Player {
         // the session restarts that same URI/position under a newer generation without requiring
         // the caller to reconstruct the Player.
         self.command(PlayerCommand::SetSession(session));
+    }
+
+    pub fn set_preview_authority(
+        &self,
+        authority: PreviewAuthority,
+        retained: RetainedPlaybackDisposition,
+        reason: PreviewCancelReason,
+    ) {
+        self.command(PlayerCommand::SetPreviewAuthority {
+            authority,
+            retained,
+            reason,
+        });
+    }
+
+    pub fn start_preview(&self, request: PreviewPlaybackRequest) {
+        self.command(PlayerCommand::StartPreview(request));
+    }
+
+    pub fn cancel_preview(&self, token: PreviewToken, reason: PreviewCancelReason) {
+        self.command(PlayerCommand::CancelPreview { token, reason });
     }
 
     pub fn get_player_event_channel(&self) -> PlayerEventChannel {
@@ -942,6 +1000,76 @@ impl PlaybackSource {
 type TrackLoaderFuture =
     Pin<Box<dyn FusedFuture<Output = Result<PlaybackSource, PlayerLoadError>> + Send>>;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SourceOwner {
+    Normal,
+    Preview(PreviewToken),
+}
+
+struct OwnedLoadResult {
+    owner: SourceOwner,
+    result: Result<PlaybackSource, PlayerLoadError>,
+}
+
+struct OwnedTrackLoader {
+    owner: SourceOwner,
+    inner: TrackLoaderFuture,
+}
+
+impl OwnedTrackLoader {
+    fn normal(inner: TrackLoaderFuture) -> Self {
+        Self {
+            owner: SourceOwner::Normal,
+            inner,
+        }
+    }
+
+    fn preview(token: PreviewToken, inner: TrackLoaderFuture) -> Self {
+        Self {
+            owner: SourceOwner::Preview(token),
+            inner,
+        }
+    }
+}
+
+impl Future for OwnedTrackLoader {
+    type Output = OwnedLoadResult;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.inner.as_mut().poll(cx) {
+            Poll::Ready(result) => Poll::Ready(OwnedLoadResult {
+                owner: self.owner.clone(),
+                result,
+            }),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl FusedFuture for OwnedTrackLoader {
+    fn is_terminated(&self) -> bool {
+        self.inner.is_terminated()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreviewPhase {
+    Loading,
+}
+
+struct RetainedPlayback {
+    state: PlayerState,
+    recovery: Option<PlayerRecovery>,
+    sink_was_running: bool,
+}
+
+struct PreviewOwner {
+    request: PreviewPlaybackRequest,
+    retained: RetainedPlayback,
+    phase: PreviewPhase,
+    started: bool,
+}
+
 struct CancellableTrackLoader {
     receiver: oneshot::Receiver<Result<PlaybackSource, PlayerLoadError>>,
     cancelled: Arc<AtomicBool>,
@@ -1001,12 +1129,13 @@ enum PlayerPreload {
     Loading {
         track_id: SpotifyUri,
         transition: PreloadTransition,
-        loader: TrackLoaderFuture,
+        loader: OwnedTrackLoader,
     },
     Ready {
         track_id: SpotifyUri,
         transition: PreloadTransition,
         secondary_trim_frames: usize,
+        owner: SourceOwner,
         // Remains dormant until transition policy arms; it then advances only on its bounded
         // worker and is still movable into current ownership.
         source: Box<PlaybackSource>,
@@ -1125,22 +1254,26 @@ enum PlayerState {
         play_request_id: u64,
         start_playback: bool,
         position_ms: u32,
-        loader: TrackLoaderFuture,
+        loader: OwnedTrackLoader,
+        owner: SourceOwner,
     },
     Paused {
         track_id: SpotifyUri,
         play_request_id: u64,
         source: PlaybackSource,
+        owner: SourceOwner,
     },
     Playing {
         track_id: SpotifyUri,
         play_request_id: u64,
         source: PlaybackSource,
+        owner: SourceOwner,
     },
     EndOfTrack {
         track_id: SpotifyUri,
         play_request_id: u64,
         source: PlaybackSource,
+        owner: SourceOwner,
     },
     Invalid,
 }
@@ -1190,11 +1323,13 @@ impl PlayerState {
                 track_id,
                 play_request_id,
                 source,
+                owner,
             } => {
                 *self = EndOfTrack {
                     track_id,
                     play_request_id,
                     source,
+                    owner,
                 };
             }
             _ => {
@@ -1212,6 +1347,7 @@ impl PlayerState {
                 track_id,
                 play_request_id,
                 mut source,
+                owner,
             } => {
                 source.reported_nominal_start_time = Instant::now()
                     .checked_sub(Duration::from_millis(u64::from(source.stream_position_ms)));
@@ -1219,6 +1355,7 @@ impl PlayerState {
                     track_id,
                     play_request_id,
                     source,
+                    owner,
                 };
             }
             _ => {
@@ -1236,12 +1373,14 @@ impl PlayerState {
                 track_id,
                 play_request_id,
                 mut source,
+                owner,
             } => {
                 source.reported_nominal_start_time = None;
                 *self = Paused {
                     track_id,
                     play_request_id,
                     source,
+                    owner,
                 };
             }
             _ => {
@@ -2018,81 +2157,43 @@ impl Future for PlayerInternal {
             }
 
             // Handle loading of a new track to play.
-            let mut current_load_failure = None;
+            let mut current_load_result = None;
             if let PlayerState::Loading {
                 ref mut loader,
                 ref track_id,
                 start_playback,
                 play_request_id,
                 position_ms,
+                ..
             } = self.state
             {
                 // The loader may be terminated if we are trying to load the same track
                 // as before, and that track failed to open before.
                 let track_id = track_id.clone();
 
-                if !loader.as_mut().is_terminated() {
-                    match loader.as_mut().poll(cx) {
-                        Poll::Ready(Ok(loaded_track)) => {
-                            self.start_playback(
-                                track_id,
-                                play_request_id,
-                                loaded_track,
-                                start_playback,
-                            );
-                            if let PlayerState::Loading { .. } = self.state {
-                                error!("The state wasn't changed by start_playback()");
-                                exit(1);
-                            }
-                        }
-                        Poll::Ready(Err(e)) => {
-                            debug!(
-                                "Current load failed for <{track_id}> at {position_ms} ms as {:?}",
-                                e.kind
-                            );
-                            current_load_failure = Some((
-                                track_id,
-                                play_request_id,
-                                position_ms,
-                                start_playback,
-                                e.kind,
-                            ));
-                        }
-                        Poll::Pending => (),
+                if !loader.is_terminated() {
+                    if let Poll::Ready(owned) = Pin::new(loader).poll(cx) {
+                        current_load_result = Some((
+                            track_id,
+                            play_request_id,
+                            position_ms,
+                            start_playback,
+                            owned,
+                        ));
                     }
                 }
             }
 
-            if let Some((track_id, play_request_id, position_ms, start_playback, kind)) =
-                current_load_failure
+            if let Some((track_id, play_request_id, position_ms, start_playback, owned)) =
+                current_load_result
             {
-                match kind {
-                    PlayerLoadErrorKind::PermanentTrack => {
-                        self.state = PlayerState::Stopped;
-                        self.send_event(PlayerEvent::Unavailable {
-                            track_id,
-                            play_request_id,
-                        });
-                    }
-                    PlayerLoadErrorKind::Cancelled => {
-                        self.state = PlayerState::Stopped;
-                        self.send_event(PlayerEvent::LoadFailed {
-                            track_id,
-                            play_request_id,
-                            error: kind,
-                            is_preload: false,
-                        });
-                    }
-                    _ => self.begin_recovery(RecoveryRequest {
-                        track_id,
-                        play_request_id,
-                        position_ms,
-                        start_playback,
-                        kind,
-                        failed_attempts: 1,
-                        buffer_starved: false,
-                    }),
-                }
+                self.handle_current_load_result(
+                    track_id,
+                    play_request_id,
+                    position_ms,
+                    start_playback,
+                    owned,
+                );
             }
 
             if self.poll_recovery(cx) {
@@ -2100,6 +2201,7 @@ impl Future for PlayerInternal {
             }
 
             // handle pending preload requests.
+            let mut preload_result = None;
             if let PlayerPreload::Loading {
                 ref mut loader,
                 ref track_id,
@@ -2108,46 +2210,12 @@ impl Future for PlayerInternal {
             {
                 let track_id = track_id.clone();
                 let transition = transition.clone();
-                match loader.as_mut().poll(cx) {
-                    Poll::Ready(Ok(source)) => {
-                        let secondary_trim_frames = Self::secondary_trim_frames_for_plan(
-                            transition.scheduled_plan(),
-                            source.stream_position_ms,
-                        );
-                        self.send_event(PlayerEvent::Preloading {
-                            track_id: track_id.clone(),
-                            playable_uri: source.audio_item.uri.clone(),
-                            canonical_duration_ms: source.canonical_duration_ms,
-                        });
-                        debug!("Secondary playback source ready for <{track_id}>");
-                        self.preload = PlayerPreload::Ready {
-                            track_id,
-                            transition,
-                            secondary_trim_frames,
-                            source: Box::new(source),
-                        };
-                        self.arm_transition_if_selected();
-                    }
-                    Poll::Ready(Err(e)) => {
-                        debug!("Unable to preload {track_id:?}: {e}");
-                        self.cancel_secondary_source("secondary source load failed");
-                        if let PlayerState::Playing {
-                            play_request_id, ..
-                        }
-                        | PlayerState::Paused {
-                            play_request_id, ..
-                        } = self.state
-                        {
-                            self.send_event(load_error_event(
-                                track_id,
-                                play_request_id,
-                                e.kind,
-                                true,
-                            ));
-                        }
-                    }
-                    Poll::Pending => (),
+                if let Poll::Ready(owned) = Pin::new(loader).poll(cx) {
+                    preload_result = Some((track_id, transition, owned));
                 }
+            }
+            if let Some((track_id, transition, owned)) = preload_result {
+                self.handle_preload_load_result(track_id, transition, owned);
             }
 
             if self.network_health != RecoveryHealth::Recovering {
@@ -2198,6 +2266,7 @@ impl Future for PlayerInternal {
                     ref track_id,
                     play_request_id,
                     ref mut source,
+                    ..
                 } = self.state
                 {
                     let track_id = track_id.clone();
@@ -2356,11 +2425,13 @@ impl Future for PlayerInternal {
                 ref track_id,
                 play_request_id,
                 ref mut source,
+                ..
             }
             | PlayerState::Paused {
                 ref track_id,
                 play_request_id,
                 ref mut source,
+                ..
             } = self.state
             {
                 let track_id = track_id.clone();
@@ -2387,6 +2458,157 @@ impl Future for PlayerInternal {
 }
 
 impl PlayerInternal {
+    fn handle_current_load_result(
+        &mut self,
+        track_id: SpotifyUri,
+        play_request_id: u64,
+        position_ms: u32,
+        start_playback: bool,
+        owned: OwnedLoadResult,
+    ) {
+        match (owned.owner, owned.result) {
+            (SourceOwner::Normal, Ok(loaded_track)) => {
+                self.start_playback(track_id, play_request_id, loaded_track, start_playback);
+            }
+            (SourceOwner::Normal, Err(error)) => {
+                let kind = error.kind;
+                debug!("Current load failed for <{track_id}> at {position_ms} ms as {kind:?}");
+                match kind {
+                    PlayerLoadErrorKind::PermanentTrack => {
+                        self.state = PlayerState::Stopped;
+                        self.send_event(PlayerEvent::Unavailable {
+                            track_id,
+                            play_request_id,
+                        });
+                    }
+                    PlayerLoadErrorKind::Cancelled => {
+                        self.state = PlayerState::Stopped;
+                        self.send_event(PlayerEvent::LoadFailed {
+                            track_id,
+                            play_request_id,
+                            error: kind,
+                            is_preload: false,
+                        });
+                    }
+                    _ => self.begin_recovery(RecoveryRequest {
+                        track_id,
+                        play_request_id,
+                        position_ms,
+                        start_playback,
+                        kind,
+                        failed_attempts: 1,
+                        buffer_starved: false,
+                    }),
+                }
+            }
+            (SourceOwner::Preview(token), Ok(mut source)) => {
+                let expected = self.preview.as_ref().and_then(|preview| {
+                    (preview.request.token == token)
+                        .then(|| preview.request.outgoing.expected_playable.to_string())
+                });
+                match expected {
+                    None => debug!("Discarding stale preview outgoing load for {token:?}"),
+                    Some(expected) if source.audio_item.uri != expected => {
+                        self.fail_preview(token, PreviewFailure::PlayableMismatch);
+                    }
+                    Some(_) => {
+                        let config = self.effective_normalisation_config();
+                        source.normalisation_factor =
+                            NormalisationData::get_factor(&config, source.normalisation_data);
+                        source.reported_nominal_start_time = Instant::now().checked_sub(
+                            Duration::from_millis(u64::from(source.stream_position_ms)),
+                        );
+                        self.ensure_sink_running();
+                        self.state = PlayerState::Playing {
+                            track_id,
+                            play_request_id: 0,
+                            source,
+                            owner: SourceOwner::Preview(token.clone()),
+                        };
+                        if let Some(preview) = self.preview.as_mut() {
+                            preview.started = true;
+                        }
+                        self.send_event(PlayerEvent::PreviewStarted { token });
+                    }
+                }
+            }
+            (SourceOwner::Preview(token), Err(_)) => {
+                self.fail_preview(token, PreviewFailure::OutgoingLoad);
+            }
+        }
+    }
+
+    fn handle_preload_load_result(
+        &mut self,
+        track_id: SpotifyUri,
+        transition: PreloadTransition,
+        owned: OwnedLoadResult,
+    ) {
+        match (owned.owner, owned.result) {
+            (SourceOwner::Normal, Ok(source)) => {
+                let secondary_trim_frames = Self::secondary_trim_frames_for_plan(
+                    transition.scheduled_plan(),
+                    source.stream_position_ms,
+                );
+                self.send_event(PlayerEvent::Preloading {
+                    track_id: track_id.clone(),
+                    playable_uri: source.audio_item.uri.clone(),
+                    canonical_duration_ms: source.canonical_duration_ms,
+                });
+                debug!("Secondary playback source ready for <{track_id}>");
+                self.preload = PlayerPreload::Ready {
+                    track_id,
+                    transition,
+                    secondary_trim_frames,
+                    source: Box::new(source),
+                    owner: SourceOwner::Normal,
+                };
+                self.arm_transition_if_selected();
+            }
+            (SourceOwner::Normal, Err(e)) => {
+                debug!("Unable to preload {track_id:?}: {e}");
+                self.cancel_secondary_source("secondary source load failed");
+                if let PlayerState::Playing {
+                    play_request_id, ..
+                }
+                | PlayerState::Paused {
+                    play_request_id, ..
+                } = self.state
+                {
+                    self.send_event(load_error_event(track_id, play_request_id, e.kind, true));
+                }
+            }
+            (SourceOwner::Preview(token), Ok(source)) => {
+                let expected = self.preview.as_ref().and_then(|preview| {
+                    (preview.request.token == token)
+                        .then(|| preview.request.incoming.expected_playable.to_string())
+                });
+                match expected {
+                    None => debug!("Discarding stale preview incoming load for {token:?}"),
+                    Some(expected) if source.audio_item.uri != expected => {
+                        self.fail_preview(token, PreviewFailure::PlayableMismatch);
+                    }
+                    Some(_) => {
+                        let secondary_trim_frames = Self::secondary_trim_frames_for_plan(
+                            transition.scheduled_plan(),
+                            source.stream_position_ms,
+                        );
+                        self.preload = PlayerPreload::Ready {
+                            track_id,
+                            transition,
+                            secondary_trim_frames,
+                            source: Box::new(source),
+                            owner: SourceOwner::Preview(token),
+                        };
+                    }
+                }
+            }
+            (SourceOwner::Preview(token), Err(_)) => {
+                self.fail_preview(token, PreviewFailure::IncomingLoad);
+            }
+        }
+    }
+
     fn next_secondary_generation(&mut self) -> u64 {
         self.secondary_generation = self.secondary_generation.wrapping_add(1);
         self.secondary_generation
@@ -2649,6 +2871,7 @@ impl PlayerInternal {
             transition: current_transition,
             secondary_trim_frames,
             source,
+            ..
         } = &mut self.preload
         else {
             return false;
@@ -2693,7 +2916,10 @@ impl PlayerInternal {
         let _timing =
             crate::core::runtime_trace::SlowOperation::new("promote_preloaded_source", 10);
         let PlayerPreload::Ready {
-            track_id, source, ..
+            track_id,
+            source,
+            owner: SourceOwner::Normal,
+            ..
         } = &self.preload
         else {
             return Ok(false);
@@ -2708,7 +2934,10 @@ impl PlayerInternal {
         }
 
         let PlayerPreload::Ready {
-            track_id, source, ..
+            track_id,
+            source,
+            owner: SourceOwner::Normal,
+            ..
         } = mem::replace(&mut self.preload, PlayerPreload::None)
         else {
             unreachable!("ready preload changed while being promoted");
@@ -3404,6 +3633,7 @@ impl PlayerInternal {
             track_id: old_track_id,
             play_request_id: old_play_request_id,
             source: old_source,
+            owner: SourceOwner::Normal,
         } = mem::replace(&mut self.state, PlayerState::Invalid)
         else {
             unreachable!("playing source was validated before promotion");
@@ -3443,6 +3673,7 @@ impl PlayerInternal {
             track_id: track_id.clone(),
             play_request_id,
             source: *source,
+            owner: SourceOwner::Normal,
         };
         self.crossfade_load_ack = Some(CrossfadeLoadAck {
             track_id: track_id.clone(),
@@ -3524,6 +3755,7 @@ impl PlayerInternal {
                 track_id,
                 play_request_id,
                 source,
+                owner: SourceOwner::Normal,
             };
         } else {
             source.reported_nominal_start_time = None;
@@ -3533,6 +3765,7 @@ impl PlayerInternal {
                 track_id: track_id.clone(),
                 play_request_id,
                 source,
+                owner: SourceOwner::Normal,
             };
 
             self.send_event(PlayerEvent::Paused {
@@ -3738,7 +3971,15 @@ impl PlayerInternal {
             if (track_id == *loaded_track_id) && (position_ms == 0) {
                 let mut preload = PlayerPreload::None;
                 std::mem::swap(&mut preload, &mut self.preload);
-                if let PlayerPreload::Loading { loader, .. } = preload {
+                if let PlayerPreload::Loading {
+                    loader:
+                        loader @ OwnedTrackLoader {
+                            owner: SourceOwner::Normal,
+                            ..
+                        },
+                    ..
+                } = preload
+                {
                     Some(loader)
                 } else {
                     None
@@ -3754,7 +3995,12 @@ impl PlayerInternal {
 
         // If we don't have a loader yet, create one from scratch.
         let loader = loader.unwrap_or_else(|| {
-            Box::pin(self.load_track(track_id.clone(), position_ms, true, "current"))
+            OwnedTrackLoader::normal(Box::pin(self.load_track(
+                track_id.clone(),
+                position_ms,
+                true,
+                "current",
+            )))
         });
 
         // No source can produce PCM while this loader is pending. Drain/close the
@@ -3769,6 +4015,7 @@ impl PlayerInternal {
             start_playback: play,
             position_ms,
             loader,
+            owner: SourceOwner::Normal,
         };
 
         Ok(())
@@ -3843,7 +4090,7 @@ impl PlayerInternal {
             self.preload = PlayerPreload::Loading {
                 track_id,
                 transition,
-                loader: Box::pin(loader),
+                loader: OwnedTrackLoader::normal(Box::pin(loader)),
             }
         }
     }
@@ -4050,18 +4297,19 @@ impl PlayerInternal {
                 debug!(
                     "Restarting in-flight load for <{track_id}> at {position_ms} ms on replacement session"
                 );
-                let loader = Box::pin(self.load_track(
+                let loader = OwnedTrackLoader::normal(Box::pin(self.load_track(
                     track_id.clone(),
                     position_ms,
                     true,
                     "session_current",
-                ));
+                )));
                 self.state = PlayerState::Loading {
                     track_id,
                     play_request_id,
                     start_playback,
                     position_ms,
                     loader,
+                    owner: SourceOwner::Normal,
                 };
             }
 
@@ -4084,12 +4332,12 @@ impl PlayerInternal {
                 debug!(
                     "Restarting in-flight secondary preload for <{track_id}> at {position_ms} ms on replacement session"
                 );
-                let loader = Box::pin(self.load_track(
+                let loader = OwnedTrackLoader::normal(Box::pin(self.load_track(
                     track_id.clone(),
                     position_ms,
                     true,
                     "session_secondary",
-                ));
+                )));
                 self.preload = PlayerPreload::Loading {
                     track_id,
                     transition,
@@ -4097,6 +4345,165 @@ impl PlayerInternal {
                 };
             }
         }
+    }
+
+    fn handle_set_preview_authority(
+        &mut self,
+        authority: PreviewAuthority,
+        retained: RetainedPlaybackDisposition,
+        reason: PreviewCancelReason,
+    ) {
+        let invalidates_active = self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.request.token.authority != authority);
+        if invalidates_active {
+            let token = self
+                .preview
+                .as_ref()
+                .expect("active preview checked above")
+                .request
+                .token
+                .clone();
+            self.cancel_preview_owned(&token, reason, retained);
+        }
+        self.preview_authority = Some(authority);
+    }
+
+    fn handle_start_preview(&mut self, request: PreviewPlaybackRequest) -> PlayerResult {
+        if self.preview_authority.as_ref() != Some(&request.token.authority) {
+            return Err(Error::failed_precondition(
+                "preview request does not match current Connect authority",
+            ));
+        }
+
+        let retained = if let Some(previous) = self.preview.take() {
+            let previous_token = previous.request.token.clone();
+            self.state = PlayerState::Stopped;
+            self.cancel_secondary_source("preview replaced");
+            self.transition_owner = None;
+            self.send_event(PlayerEvent::PreviewCancelled {
+                token: previous_token,
+                reason: PreviewCancelReason::Replaced,
+                restore: PreviewRestoreOutcome::NotOwned,
+            });
+            previous.retained
+        } else {
+            self.cancel_secondary_source("preview ownership began");
+            self.transition_owner = None;
+            self.crossfade_load_ack = None;
+            let sink_was_running = self.sink_status == SinkStatus::Running;
+            self.ensure_sink_stopped(true);
+            RetainedPlayback {
+                state: mem::replace(&mut self.state, PlayerState::Stopped),
+                recovery: self.recovery.take(),
+                sink_was_running,
+            }
+        };
+
+        let outgoing_track_id = request.outgoing.canonical.clone();
+        let incoming_track_id = request.incoming.canonical.clone();
+        let outgoing_loader = Box::pin(self.load_track(
+            outgoing_track_id.clone(),
+            request.outgoing_load_position_ms,
+            true,
+            "preview_outgoing",
+        ));
+        let incoming_loader = Box::pin(self.load_track(
+            incoming_track_id.clone(),
+            request.incoming_load_position_ms,
+            true,
+            "preview_incoming",
+        ));
+        let owner = SourceOwner::Preview(request.token.clone());
+
+        self.state = PlayerState::Loading {
+            track_id: outgoing_track_id,
+            play_request_id: 0,
+            start_playback: true,
+            position_ms: request.outgoing_load_position_ms,
+            loader: OwnedTrackLoader::preview(request.token.clone(), outgoing_loader),
+            owner: owner.clone(),
+        };
+        self.preload = PlayerPreload::Loading {
+            track_id: incoming_track_id,
+            transition: PreloadTransition::Scheduled(request.plan.clone()),
+            loader: OwnedTrackLoader::preview(request.token.clone(), incoming_loader),
+        };
+        self.preview = Some(PreviewOwner {
+            request,
+            retained,
+            phase: PreviewPhase::Loading,
+            started: false,
+        });
+        Ok(())
+    }
+
+    fn cancel_preview_owned(
+        &mut self,
+        token: &PreviewToken,
+        reason: PreviewCancelReason,
+        _retained: RetainedPlaybackDisposition,
+    ) {
+        let matches = self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| &preview.request.token == token);
+        if !matches {
+            return;
+        }
+        self.preview.take();
+        self.state = PlayerState::Stopped;
+        self.cancel_secondary_source("preview cancelled");
+        self.transition_owner = None;
+        self.ensure_sink_stopped(true);
+        self.send_event(PlayerEvent::PreviewCancelled {
+            token: token.clone(),
+            reason,
+            restore: PreviewRestoreOutcome::NotOwned,
+        });
+    }
+
+    fn fail_preview(&mut self, token: PreviewToken, reason: PreviewFailure) {
+        if !self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.request.token == token)
+        {
+            return;
+        }
+        self.preview.take();
+        self.state = PlayerState::Stopped;
+        self.cancel_secondary_source("preview source load failed");
+        self.transition_owner = None;
+        self.ensure_sink_stopped(true);
+        self.send_event(PlayerEvent::PreviewFailed {
+            token,
+            reason,
+            restore: PreviewRestoreOutcome::NotOwned,
+        });
+    }
+
+    #[cfg(test)]
+    fn retained_position_for_test(&self) -> Option<u32> {
+        let retained = &self.preview.as_ref()?.retained.state;
+        match retained {
+            PlayerState::Loading { position_ms, .. } => Some(*position_ms),
+            PlayerState::Paused { source, .. }
+            | PlayerState::Playing { source, .. }
+            | PlayerState::EndOfTrack { source, .. } => Some(source.stream_position_ms),
+            PlayerState::Stopped | PlayerState::Invalid => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn preview_load_positions_for_test(&self) -> Option<(u32, u32)> {
+        self.preview.as_ref().map(|preview| {
+            (
+                preview.request.outgoing_load_position_ms,
+                preview.request.incoming_load_position_ms,
+            )
+        })
     }
 
     fn handle_command(&mut self, cmd: PlayerCommand) -> PlayerResult {
@@ -4130,6 +4537,18 @@ impl PlayerInternal {
             PlayerCommand::Stop => self.handle_player_stop(),
 
             PlayerCommand::SetSession(session) => self.handle_set_session(session),
+
+            PlayerCommand::SetPreviewAuthority {
+                authority,
+                retained,
+                reason,
+            } => self.handle_set_preview_authority(authority, retained, reason),
+
+            PlayerCommand::StartPreview(request) => self.handle_start_preview(request)?,
+
+            PlayerCommand::CancelPreview { token, reason } => {
+                self.cancel_preview_owned(&token, reason, RetainedPlaybackDisposition::Restore)
+            }
 
             PlayerCommand::AddEventSender(sender) => self.event_senders.push(sender),
 
@@ -4191,11 +4610,13 @@ impl PlayerInternal {
                         ref track_id,
                         play_request_id,
                         ref source,
+                        ..
                     }
                     | PlayerState::Paused {
                         ref track_id,
                         play_request_id,
                         ref source,
+                        ..
                     } = self.state
                     {
                         let track_id = track_id.clone();
@@ -4448,6 +4869,18 @@ impl fmt::Debug for PlayerCommand {
             PlayerCommand::Stop => f.debug_tuple("Stop").finish(),
             PlayerCommand::Seek(position) => f.debug_tuple("Seek").field(&position).finish(),
             PlayerCommand::SetSession(_) => f.debug_tuple("SetSession").finish(),
+            PlayerCommand::SetPreviewAuthority { authority, .. } => f
+                .debug_tuple("SetPreviewAuthority")
+                .field(authority)
+                .finish(),
+            PlayerCommand::StartPreview(request) => {
+                f.debug_tuple("StartPreview").field(&request.token).finish()
+            }
+            PlayerCommand::CancelPreview { token, reason } => f
+                .debug_tuple("CancelPreview")
+                .field(token)
+                .field(reason)
+                .finish(),
             PlayerCommand::AddEventSender(_) => f.debug_tuple("AddEventSender").finish(),
             PlayerCommand::SetSinkEventCallback(_) => {
                 f.debug_tuple("SetSinkEventCallback").finish()
@@ -4618,6 +5051,8 @@ where
 mod tests {
     use super::*;
     use crate::{
+        PreviewAuthority, PreviewCancelReason, PreviewGeneration, PreviewPlaybackRequest,
+        PreviewToken, PreviewTrack, RetainedPlaybackDisposition,
         audio_backend::SinkResult,
         core::config::SessionConfig,
         local_file::LocalFileLookup,
@@ -5042,6 +5477,7 @@ mod tests {
             track_id,
             play_request_id: 7,
             source,
+            owner: SourceOwner::Normal,
         };
     }
 
@@ -5055,6 +5491,7 @@ mod tests {
             transition: PreloadTransition::SafetyFallback,
             secondary_trim_frames: 0,
             source: Box::new(source),
+            owner: SourceOwner::Normal,
         };
     }
 
@@ -5075,6 +5512,324 @@ mod tests {
             gain(0.0, 1.0),
         )
         .expect("test plan should validate")
+    }
+
+    fn preview_authority(normal_generation: u64) -> PreviewAuthority {
+        PreviewAuthority {
+            connect_session_id: "connect-session".to_owned(),
+            normal_ownership_generation: normal_generation,
+        }
+    }
+
+    fn preview_token(preview_generation: u64, normal_generation: u64) -> PreviewToken {
+        PreviewToken {
+            authority: preview_authority(normal_generation),
+            generation: PreviewGeneration(preview_generation),
+        }
+    }
+
+    fn preview_request(token: PreviewToken) -> PreviewPlaybackRequest {
+        let gain = |from, to| {
+            GainCurve::new(vec![GainCurveSegment {
+                start: 0.0,
+                end: 1.0,
+                points: vec![GainPoint { x: 0.0, y: from }, GainPoint { x: 1.0, y: to }],
+            }])
+            .expect("preview test curve")
+        };
+        PreviewPlaybackRequest {
+            token,
+            outgoing: PreviewTrack {
+                canonical: track_uri(),
+                expected_playable: track_uri(),
+            },
+            incoming: PreviewTrack {
+                canonical: next_track_uri(),
+                expected_playable: next_track_uri(),
+            },
+            outgoing_load_position_ms: 181_812,
+            incoming_load_position_ms: 944,
+            post_roll: Duration::from_millis(3_000),
+            plan: TransitionPlan::new(
+                Duration::from_millis(184_812),
+                Duration::from_millis(944),
+                Duration::from_millis(7_385),
+                gain(1.0, 0.0),
+                gain(0.0, 1.0),
+            )
+            .expect("preview test plan"),
+        }
+    }
+
+    fn playing_test_player_at(position_ms: u32) -> PlayerInternal {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(position_ms));
+        player
+    }
+
+    fn install_ready_normal_preload(player: &mut PlayerInternal) {
+        set_ready_secondary(
+            player,
+            next_track_uri(),
+            scripted_source(next_track_uri(), 0, Box::new(PanicDecoder)),
+        );
+        arm_test_transition(player);
+    }
+
+    fn begin_preview_for_test(player: &mut PlayerInternal, request: PreviewPlaybackRequest) {
+        player
+            .handle_command(PlayerCommand::SetPreviewAuthority {
+                authority: request.token.authority.clone(),
+                retained: RetainedPlaybackDisposition::Discard,
+                reason: PreviewCancelReason::SessionChanged,
+            })
+            .expect("preview authority command");
+        player
+            .handle_command(PlayerCommand::StartPreview(request))
+            .expect("preview start command");
+    }
+
+    fn preview_event_channel(player: &mut PlayerInternal) -> PlayerEventChannel {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        player.event_senders.push(sender);
+        receiver
+    }
+
+    fn sink_instance_id_for_test(player: &PlayerInternal) -> usize {
+        (&*player.sink as *const dyn Sink as *const ()) as usize
+    }
+
+    fn inject_outgoing_for_test(
+        player: &mut PlayerInternal,
+        token: PreviewToken,
+        result: Result<PlaybackSource, PlayerLoadError>,
+    ) {
+        player.handle_current_load_result(
+            track_uri(),
+            0,
+            181_812,
+            true,
+            OwnedLoadResult {
+                owner: SourceOwner::Preview(token),
+                result,
+            },
+        );
+    }
+
+    fn inject_incoming_for_test(
+        player: &mut PlayerInternal,
+        token: PreviewToken,
+        result: Result<PlaybackSource, PlayerLoadError>,
+    ) {
+        player.handle_preload_load_result(
+            next_track_uri(),
+            PreloadTransition::Scheduled(scheduled_test_plan()),
+            OwnedLoadResult {
+                owner: SourceOwner::Preview(token),
+                result,
+            },
+        );
+    }
+
+    #[test]
+    fn preview_start_retains_normal_source_and_cancels_normal_transition_state() {
+        let mut player = playing_test_player_at(42_123);
+        install_ready_normal_preload(&mut player);
+        let runtime = tokio::runtime::Runtime::new().expect("preview test runtime");
+        let _guard = runtime.enter();
+        player
+            .handle_command(PlayerCommand::SetPreviewAuthority {
+                authority: preview_authority(9),
+                retained: RetainedPlaybackDisposition::Discard,
+                reason: PreviewCancelReason::SessionChanged,
+            })
+            .unwrap();
+        player
+            .handle_command(PlayerCommand::StartPreview(preview_request(preview_token(
+                1, 9,
+            ))))
+            .unwrap();
+        assert!(player.preview.as_ref().unwrap().retained.state.is_playing());
+        assert_eq!(player.retained_position_for_test(), Some(42_123));
+        assert!(matches!(player.preload, PlayerPreload::Loading { .. }));
+        assert_eq!(
+            player.preview_load_positions_for_test(),
+            Some((181_812, 944))
+        );
+        assert_eq!(player.transition.state(), TransitionState::Idle);
+    }
+
+    #[test]
+    fn loaded_preview_sources_must_match_expected_playable_identities() {
+        let runtime = tokio::runtime::Runtime::new().expect("preview test runtime");
+        let _guard = runtime.enter();
+        let token = preview_token(1, 9);
+        let mut player = playing_test_player_at(42_123);
+        let mut events = preview_event_channel(&mut player);
+        begin_preview_for_test(&mut player, preview_request(token.clone()));
+        let mut source = scripted_source(track_uri(), 181_812, Box::new(ScriptedDecoder));
+        source.audio_item.uri = next_track_uri().to_string();
+
+        inject_outgoing_for_test(&mut player, token.clone(), Ok(source));
+
+        assert!(matches!(
+            events.try_recv(),
+            Ok(PlayerEvent::PreviewFailed {
+                token: failed,
+                reason: PreviewFailure::PlayableMismatch,
+                ..
+            }) if failed == token
+        ));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn replacing_preview_transfers_retained_normal_state_without_restoring_between_requests() {
+        let runtime = tokio::runtime::Runtime::new().expect("preview test runtime");
+        let _guard = runtime.enter();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts.clone(), stops.clone());
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(42_123));
+        begin_preview_for_test(&mut player, preview_request(preview_token(1, 9)));
+        begin_preview_for_test(&mut player, preview_request(preview_token(2, 9)));
+
+        assert_eq!(player.retained_position_for_test(), Some(42_123));
+        assert_eq!(
+            player
+                .preview
+                .as_ref()
+                .map(|preview| &preview.request.token),
+            Some(&preview_token(2, 9))
+        );
+        assert_eq!(starts.load(Ordering::Acquire), 0);
+        assert_eq!(stops.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn stale_outgoing_or_incoming_load_completion_cannot_enter_replacement() {
+        let runtime = tokio::runtime::Runtime::new().expect("preview test runtime");
+        let _guard = runtime.enter();
+        let old = preview_token(1, 9);
+        let replacement = preview_token(2, 9);
+        let mut player = playing_test_player_at(42_123);
+        begin_preview_for_test(&mut player, preview_request(old.clone()));
+        begin_preview_for_test(&mut player, preview_request(replacement.clone()));
+
+        inject_outgoing_for_test(
+            &mut player,
+            old.clone(),
+            Ok(scripted_source(
+                track_uri(),
+                181_812,
+                Box::new(ScriptedDecoder),
+            )),
+        );
+        inject_incoming_for_test(
+            &mut player,
+            old,
+            Ok(scripted_source(
+                next_track_uri(),
+                944,
+                Box::new(ScriptedDecoder),
+            )),
+        );
+
+        assert_eq!(
+            player
+                .preview
+                .as_ref()
+                .map(|preview| &preview.request.token),
+            Some(&replacement)
+        );
+        assert!(matches!(player.state, PlayerState::Loading { .. }));
+        assert!(matches!(player.preload, PlayerPreload::Loading { .. }));
+    }
+
+    #[test]
+    fn preview_reuses_the_existing_player_thread_and_sink() {
+        let runtime = tokio::runtime::Runtime::new().expect("preview test runtime");
+        let _guard = runtime.enter();
+        let mut player = playing_test_player_at(42_123);
+        let sink_identity = sink_instance_id_for_test(&player);
+        let player_id = player.player_id;
+
+        begin_preview_for_test(&mut player, preview_request(preview_token(1, 9)));
+
+        assert_eq!(sink_instance_id_for_test(&player), sink_identity);
+        assert_eq!(player.player_id, player_id);
+    }
+
+    #[test]
+    fn preview_load_failures_are_preview_only_events() {
+        for (incoming, expected) in [
+            (false, PreviewFailure::OutgoingLoad),
+            (true, PreviewFailure::IncomingLoad),
+        ] {
+            let runtime = tokio::runtime::Runtime::new().expect("preview test runtime");
+            let _guard = runtime.enter();
+            let token = preview_token(1, 9);
+            let mut player = playing_test_player_at(42_123);
+            let mut events = preview_event_channel(&mut player);
+            begin_preview_for_test(&mut player, preview_request(token.clone()));
+            let error = Err(PlayerLoadError::message(
+                PlayerLoadErrorKind::PermanentTrack,
+                "scripted preview load failure",
+            ));
+            if incoming {
+                inject_incoming_for_test(&mut player, token.clone(), error);
+            } else {
+                inject_outgoing_for_test(&mut player, token.clone(), error);
+            }
+
+            assert!(matches!(
+                events.try_recv(),
+                Ok(PlayerEvent::PreviewFailed {
+                    token: failed,
+                    reason,
+                    ..
+                }) if failed == token && reason == expected
+            ));
+            assert!(events.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn preview_source_readiness_emits_no_ordinary_loading_or_track_events() {
+        let runtime = tokio::runtime::Runtime::new().expect("preview test runtime");
+        let _guard = runtime.enter();
+        let token = preview_token(1, 9);
+        let mut player = playing_test_player_at(42_123);
+        let mut events = preview_event_channel(&mut player);
+        begin_preview_for_test(&mut player, preview_request(token.clone()));
+
+        inject_incoming_for_test(
+            &mut player,
+            token.clone(),
+            Ok(scripted_source(
+                next_track_uri(),
+                944,
+                Box::new(ScriptedDecoder),
+            )),
+        );
+        inject_outgoing_for_test(
+            &mut player,
+            token.clone(),
+            Ok(scripted_source(
+                track_uri(),
+                181_812,
+                Box::new(ScriptedDecoder),
+            )),
+        );
+
+        assert!(matches!(
+            events.try_recv(),
+            Ok(PlayerEvent::PreviewStarted { token: started }) if started == token
+        ));
+        assert!(events.try_recv().is_err());
     }
 
     fn speed_transition_plan(
@@ -5196,6 +5951,7 @@ mod tests {
                 12_000,
                 Box::new(ScriptedDecoder),
             )),
+            owner: SourceOwner::Normal,
         };
         arm_test_transition(&mut player);
 
@@ -5219,6 +5975,7 @@ mod tests {
                 12_000,
                 Box::new(ScriptedDecoder),
             )),
+            owner: SourceOwner::Normal,
         };
 
         assert!(
@@ -5345,6 +6102,7 @@ mod tests {
             transition,
             secondary_trim_frames,
             source,
+            ..
         } = &player.preload
         else {
             panic!("same-track plan upgrade should preserve the ready preload");
@@ -5457,6 +6215,7 @@ mod tests {
                     packets_remaining: None,
                 }),
             )),
+            owner: SourceOwner::Normal,
         };
 
         player.arm_transition_if_selected();
@@ -5496,6 +6255,7 @@ mod tests {
                     packets_remaining: Some(1),
                 }),
             )),
+            owner: SourceOwner::Normal,
         };
 
         player.arm_transition_if_selected();
@@ -5532,6 +6292,7 @@ mod tests {
                     packets_remaining: None,
                 }),
             )),
+            owner: SourceOwner::Normal,
         };
 
         player.arm_transition_if_selected();
@@ -5579,7 +6340,10 @@ mod tests {
             converter: Converter::new(None),
             transition_policy: Box::new(NoTransitionPolicy),
             transition: TransitionEngine::new(SAMPLE_RATE, NUM_CHANNELS as usize),
+            transition_owner: None,
             crossfade_load_ack: None,
+            preview_authority: None,
+            preview: None,
             normalisation_peaks: [0.0; 2],
             normalisation_integrators: [0.0; 2],
             normalisation_channel: 0,
@@ -5862,6 +6626,7 @@ mod tests {
                     packets_remaining: None,
                 }),
             )),
+            owner: SourceOwner::Normal,
         };
         arm_test_transition(&mut player);
         assert!(
@@ -6224,6 +6989,7 @@ mod tests {
                     entered: Some(entered_tx),
                 }),
             )),
+            owner: SourceOwner::Normal,
         };
 
         player.arm_transition_if_selected();
@@ -6475,6 +7241,7 @@ mod tests {
             transition: PreloadTransition::Scheduled(scheduled_test_plan()),
             secondary_trim_frames: 0,
             source: Box::new(incoming),
+            owner: SourceOwner::Normal,
         };
         promoted
             .start_secondary_decode()
@@ -6560,6 +7327,7 @@ mod tests {
                     packets_remaining: None,
                 }),
             )),
+            owner: SourceOwner::Normal,
         };
 
         player
@@ -6744,6 +7512,7 @@ mod tests {
             track_id,
             play_request_id,
             source,
+            ..
         } = &player.state
         else {
             panic!("secondary should be current after completion");
@@ -6820,6 +7589,7 @@ mod tests {
                     packets_remaining: None,
                 }),
             )),
+            owner: SourceOwner::Normal,
         };
         player
             .start_secondary_decode()
@@ -6854,6 +7624,7 @@ mod tests {
             track_id,
             play_request_id,
             source,
+            ..
         } = &player.state
         else {
             panic!("active transition EOF should promote secondary");
@@ -6907,6 +7678,7 @@ mod tests {
                     packets_remaining: None,
                 }),
             )),
+            owner: SourceOwner::Normal,
         };
         player
             .start_secondary_decode()
@@ -6985,6 +7757,7 @@ mod tests {
                     packets_remaining: None,
                 }),
             )),
+            owner: SourceOwner::Normal,
         };
         player
             .start_secondary_decode()
@@ -7044,6 +7817,7 @@ mod tests {
                     packets_remaining: None,
                 }),
             )),
+            owner: SourceOwner::Normal,
         };
         player
             .start_secondary_decode()
@@ -7166,6 +7940,7 @@ mod tests {
                     packets_remaining: None,
                 }),
             )),
+            owner: SourceOwner::Normal,
         };
         player
             .start_secondary_decode()
@@ -7527,9 +8302,9 @@ mod tests {
         player.preload = PlayerPreload::Loading {
             track_id: next_track_uri(),
             transition: PreloadTransition::SafetyFallback,
-            loader: Box::pin(DropTrackingLoader {
+            loader: OwnedTrackLoader::normal(Box::pin(DropTrackingLoader {
                 dropped: Arc::new(AtomicBool::new(false)),
-            }),
+            })),
         };
         player
             .handle_command_load(next_track_uri(), None, true, 0)
@@ -7786,9 +8561,9 @@ mod tests {
         player.preload = PlayerPreload::Loading {
             track_id: track_id.clone(),
             transition: PreloadTransition::Scheduled(transition_plan.clone()),
-            loader: Box::pin(DropTrackingLoader {
+            loader: OwnedTrackLoader::normal(Box::pin(DropTrackingLoader {
                 dropped: old_loader_dropped.clone(),
-            }),
+            })),
         };
 
         let replacement = session(&runtime);
@@ -7832,6 +8607,7 @@ mod tests {
                     packets_remaining: None,
                 }),
             )),
+            owner: SourceOwner::Normal,
         };
         player
             .start_secondary_decode()
