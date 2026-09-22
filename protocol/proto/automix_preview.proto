@@ -1,0 +1,26 @@
+// Preview envelope reconstructed from the installed Spotify desktop client codec.
+// The package name is a librespot label, not an upstream Spotify package claim.
+syntax = "proto2";
+
+package librespot.spotify.automix_preview;
+
+import "automix_transition.proto";
+import "spotify_auto_mix_metadata.proto";
+
+message AutomixPreview {
+    optional string track_uri_1 = 1;
+    optional string track_uri_2 = 2;
+    optional string automix_mode = 3;
+    optional string transition_uri = 4;
+    optional int64 start_position_ms = 5;
+    optional bool relative_start_position = 6;
+    optional spotify.automix.live.Cuepoints cuepoints = 7;
+    optional int64 stop_position_ms = 8;
+    optional spotify.automix.proto.Transition transition_recipe = 9;
+    optional string playable_track_uri_1 = 10;
+    optional string playable_track_uri_2 = 11;
+    optional string context_uri = 12;
+    optional string arm_id = 13;
+    optional double item_speed_a = 14;
+    optional double item_speed_b = 15;
+}

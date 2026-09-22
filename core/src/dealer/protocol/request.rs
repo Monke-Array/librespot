@@ -36,6 +36,7 @@ pub enum Command {
     SetOptions(SetOptionsCommand),
     UpdateContext(UpdateContextCommand),
     SkipNext(SkipNextCommand),
+    Signal(SignalCommand),
     // commands that don't send any context (at least not usually...)
     SkipPrev(GenericCommand),
     Resume(GenericCommand),
@@ -67,6 +68,7 @@ impl Display for Command {
                 SetOptions(_) => "set_options",
                 UpdateContext(_) => "update_context",
                 SkipNext(_) => "skip_next",
+                Signal(_) => "signal",
                 SkipPrev(_) => "skip_prev",
                 Resume(_) => "resume",
                 Unknown(json) => {
@@ -165,6 +167,14 @@ pub struct GenericCommand {
     pub logging_params: LoggingParams,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct SignalCommand {
+    pub signal_id: String,
+    #[serde(default)]
+    pub parameters: Option<String>,
+    pub logging_params: LoggingParams,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct TransferOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -214,4 +224,67 @@ pub struct LoggingParams {
     pub command_initiated_time: Option<i64>,
     pub page_instance_ids: Option<Vec<String>>,
     pub command_id: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn command_json(endpoint: &str) -> Value {
+        json!({
+            "message_id": 17,
+            "sent_by_device_id": "controller",
+            "command": {
+                "endpoint": endpoint,
+                "logging_params": {
+                    "command_id": "preview-1"
+                }
+            }
+        })
+    }
+
+    fn signal_json_without_parameters() -> Value {
+        let mut value = command_json("signal");
+        value["command"]["signal_id"] = json!("automix-preview");
+        value
+    }
+
+    #[test]
+    fn automix_signal_is_typed_without_decoding_parameters() {
+        let request: Request = serde_json::from_value(json!({
+            "message_id": 17,
+            "sent_by_device_id": "controller",
+            "command": {
+                "endpoint": "signal",
+                "signal_id": "automix-preview",
+                "parameters": "AQID",
+                "logging_params": {
+                    "command_id": "preview-1"
+                }
+            }
+        }))
+        .unwrap();
+
+        let Command::Signal(signal) = request.command else {
+            panic!("signal must be typed")
+        };
+        assert_eq!(signal.signal_id, "automix-preview");
+        assert_eq!(signal.parameters.as_deref(), Some("AQID"));
+    }
+
+    #[test]
+    fn signal_preserves_absent_parameters() {
+        let request: Request = serde_json::from_value(signal_json_without_parameters()).unwrap();
+        let Command::Signal(signal) = request.command else {
+            panic!("signal must be typed")
+        };
+        assert_eq!(signal.parameters, None);
+    }
+
+    #[test]
+    fn unrelated_endpoint_remains_unknown() {
+        let request: Request = serde_json::from_value(command_json("future-command")).unwrap();
+        assert!(matches!(request.command, Command::Unknown(_)));
+    }
 }
