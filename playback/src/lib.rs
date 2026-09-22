@@ -13,11 +13,17 @@ pub mod dither;
 mod local_file;
 pub mod mixer;
 pub mod player;
+mod preview;
 mod secondary;
 mod symphonia_util;
 mod time_stretch;
 mod transition;
 
+pub use preview::{
+    PreviewAuthority, PreviewCancelReason, PreviewFailure, PreviewFrameBudget, PreviewGeneration,
+    PreviewPlaybackRequest, PreviewRestoreOutcome, PreviewToken, PreviewTrack,
+    RetainedPlaybackDisposition,
+};
 pub use time_stretch::{SpeedAutomation, SpeedAutomationError, SpeedPoint};
 pub use transition::{GainCurve, GainCurveSegment, GainPoint, TransitionPlan, TransitionPlanError};
 
