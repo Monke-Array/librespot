@@ -3,7 +3,10 @@ use librespot_core::{
     SpotifyUri,
     dealer::{manager::Reply, protocol::request::SignalCommand},
 };
-use librespot_playback::{PreviewAuthority, PreviewGeneration, PreviewToken, TransitionPlan};
+use librespot_playback::{
+    PreviewAuthority, PreviewCancelReason, PreviewFailure, PreviewGeneration,
+    PreviewRestoreOutcome, PreviewToken, TransitionPlan,
+};
 use librespot_protocol::{automix_preview::AutomixPreview, spotify_auto_mix_metadata::Cuepoints};
 use protobuf::Message;
 use sha1::{Digest, Sha1};
@@ -107,13 +110,17 @@ pub(crate) struct ResolvedAutomixPreview {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreviewDescriptor {
+    automix_mode: String,
     canonical_a: String,
     playable_a: String,
     canonical_b: String,
     playable_b: String,
     context_uri: Option<String>,
     transition_uri: Option<String>,
+    field_presence: PreviewFieldPresence,
     arm_id_present: bool,
+    cuepoints_present: bool,
+    relative_start_position: bool,
     provenance: SpotifyTransitionProvenance,
     preset_id: i32,
     style_ids: SpotifyStyleIds,
@@ -137,13 +144,17 @@ impl PreviewDescriptor {
             .overlap()
             .map_err(librespot_core::Error::invalid_argument)?;
         Ok(Self {
+            automix_mode: resolved.request.automix_mode.clone(),
             canonical_a: resolved.request.canonical_a.to_uri()?,
             playable_a: resolved.request.playable_a.to_uri()?,
             canonical_b: resolved.request.canonical_b.to_uri()?,
             playable_b: resolved.request.playable_b.to_uri()?,
             context_uri: resolved.request.context_uri.clone(),
             transition_uri: resolved.request.transition_uri.clone(),
-            arm_id_present: resolved.request.fields.arm_id,
+            field_presence: resolved.request.fields,
+            arm_id_present: resolved.request.arm_id.is_some(),
+            cuepoints_present: resolved.request.cuepoints.is_some(),
+            relative_start_position: resolved.request.relative_start_position,
             provenance: SpotifyTransitionProvenance::PreviewSignal,
             preset_id: resolved.preset_id,
             style_ids: resolved.style.styles,
@@ -157,6 +168,102 @@ impl PreviewDescriptor {
             item_speed_b_bits: resolved.request.item_speed_b_bits,
         })
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PreviewLogEvent {
+    Started,
+    Attached,
+    Replaced {
+        retired: PreviewGeneration,
+    },
+    Completed {
+        restore: PreviewRestoreOutcome,
+    },
+    Cancelled {
+        reason: PreviewCancelReason,
+        restore: PreviewRestoreOutcome,
+    },
+    Failed {
+        reason: PreviewFailure,
+        restore: PreviewRestoreOutcome,
+    },
+}
+
+pub(crate) fn preview_diagnostic(
+    token: &PreviewToken,
+    fingerprint: &PreviewFingerprint,
+    descriptor: &PreviewDescriptor,
+    event: PreviewLogEvent,
+) -> String {
+    let event = match event {
+        PreviewLogEvent::Started => "event=start".to_owned(),
+        PreviewLogEvent::Attached => "event=duplicate-attach".to_owned(),
+        PreviewLogEvent::Replaced { retired } => {
+            format!("event=replace retired_generation={}", retired.0)
+        }
+        PreviewLogEvent::Completed { restore } => {
+            format!("event=complete restore={restore:?}")
+        }
+        PreviewLogEvent::Cancelled { reason, restore } => {
+            format!("event=cancel reason={reason:?} restore={restore:?}")
+        }
+        PreviewLogEvent::Failed { reason, restore } => {
+            format!("event=fail reason={reason:?} restore={restore:?}")
+        }
+    };
+    let fingerprint = fingerprint
+        .0
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let provenance = match descriptor.provenance {
+        SpotifyTransitionProvenance::InlineMetadata => "inline",
+        SpotifyTransitionProvenance::TransitionUriHydration => "hydrated",
+        SpotifyTransitionProvenance::BackendMetadata => "backend",
+        SpotifyTransitionProvenance::LocalCalculation => "local",
+        SpotifyTransitionProvenance::PreviewSignal => "preview-signal",
+        SpotifyTransitionProvenance::DeterministicPolicy => "deterministic",
+    };
+    let bounded = |value: &str| value.chars().take(160).collect::<String>();
+    let optional = |value: Option<&str>| bounded(value.unwrap_or("-"));
+    format!(
+        "[spotify-preview] {event} session={} generation={} normal_generation={} mode={} canonical_a={} playable_a={} canonical_b={} playable_b={} context={} transition={} transition_present={} cuepoints_present={} stop_present={} context_present={} arm_id_present={} relative_start={} fingerprint={} provenance={} preset={} style={}/{}/{}/{}/{}/{} start_a_ms={} start_b_ms={} duration_ms={} outgoing_load_ms={} incoming_load_ms={} post_roll_ms={} speed_a={} speed_b={} queue_advanced=false normal_promotion_emitted=false",
+        bounded(&token.authority.connect_session_id),
+        token.generation.0,
+        token.authority.normal_ownership_generation,
+        bounded(&descriptor.automix_mode),
+        bounded(&descriptor.canonical_a),
+        bounded(&descriptor.playable_a),
+        bounded(&descriptor.canonical_b),
+        bounded(&descriptor.playable_b),
+        optional(descriptor.context_uri.as_deref()),
+        optional(descriptor.transition_uri.as_deref()),
+        descriptor.field_presence.transition_uri,
+        descriptor.cuepoints_present,
+        descriptor.field_presence.stop_position_ms,
+        descriptor.field_presence.context_uri,
+        descriptor.arm_id_present,
+        descriptor.relative_start_position,
+        fingerprint,
+        provenance,
+        descriptor.preset_id,
+        descriptor.style_ids.volume,
+        descriptor.style_ids.eq,
+        descriptor.style_ids.filter_fx,
+        descriptor.style_ids.fx,
+        descriptor.style_ids.jogwheel,
+        descriptor.style_ids.looping,
+        descriptor.start_a_ms,
+        descriptor.start_b_ms,
+        descriptor.duration_ms,
+        descriptor.outgoing_load_ms,
+        descriptor.incoming_load_ms,
+        descriptor.post_roll_ms,
+        f64::from_bits(descriptor.item_speed_a_bits),
+        f64::from_bits(descriptor.item_speed_b_bits),
+    )
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -194,6 +301,11 @@ impl ActivePreviewSession {
         &self.descriptor
     }
 
+    pub(crate) fn fingerprint(&self) -> &PreviewFingerprint {
+        &self.fingerprint
+    }
+
+    #[cfg(test)]
     pub(crate) fn waiter_count(&self) -> usize {
         self.waiters.len()
     }
@@ -805,13 +917,23 @@ mod tests {
 
     fn descriptor() -> PreviewDescriptor {
         PreviewDescriptor {
+            automix_mode: "auto".to_owned(),
             canonical_a: TRACK_A.to_owned(),
             playable_a: TRACK_A.to_owned(),
             canonical_b: TRACK_B.to_owned(),
             playable_b: TRACK_B.to_owned(),
             context_uri: Some("spotify:playlist:mixer".to_owned()),
             transition_uri: Some("spotify:transition:captured".to_owned()),
+            field_presence: PreviewFieldPresence {
+                transition_uri: true,
+                cuepoints: false,
+                stop_position_ms: false,
+                context_uri: true,
+                arm_id: true,
+            },
             arm_id_present: true,
+            cuepoints_present: false,
+            relative_start_position: true,
             provenance: crate::spotify_mix::SpotifyTransitionProvenance::PreviewSignal,
             preset_id: 10,
             style_ids: crate::spotify_mix_style::SpotifyStyleIds {
@@ -874,6 +996,41 @@ mod tests {
         assert_eq!(preview.preset_id, 10);
         assert_eq!(preview.plan.current_start(), Duration::from_millis(184_812));
         assert_eq!(preview.plan.next_start(), Duration::from_millis(944));
+    }
+
+    #[test]
+    fn preview_diagnostic_is_sanitized_and_ownership_explicit() {
+        let command = signal(valid_preview_proto());
+        let raw_parameters = command.parameters.clone().unwrap();
+        let request = decode_automix_preview(&command).unwrap();
+        let PreviewResolution::Playable(resolved) = resolve_automix_preview(request).unwrap()
+        else {
+            panic!("supported preview must resolve")
+        };
+        let descriptor = PreviewDescriptor::from_resolved(&resolved).unwrap();
+        let token = PreviewToken {
+            authority: PreviewAuthority {
+                connect_session_id: "session-test".to_owned(),
+                normal_ownership_generation: 9,
+            },
+            generation: PreviewGeneration(4),
+        };
+
+        let line = preview_diagnostic(
+            &token,
+            &resolved.request.fingerprint,
+            &descriptor,
+            PreviewLogEvent::Completed {
+                restore: librespot_playback::PreviewRestoreOutcome::Restored,
+            },
+        );
+
+        assert!(line.contains("generation=4"));
+        assert!(line.contains("normal_generation=9"));
+        assert!(line.contains("queue_advanced=false"));
+        assert!(line.contains("normal_promotion_emitted=false"));
+        assert!(!line.contains("preview_parameters="));
+        assert!(!line.contains(&raw_parameters));
     }
 
     #[test]

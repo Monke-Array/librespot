@@ -50,17 +50,6 @@ pub(crate) fn log_player_command_json(json: &str) {
                 }
             }
             crate::runtime_trace!("dealer_command={}", Value::Object(fields));
-            if command["signal_id"] == "automix-preview" {
-                if let Some(parameters) = command["parameters"].as_str() {
-                    if parameters.len() <= 16384
-                        && parameters
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b))
-                    {
-                        crate::runtime_trace!("preview_parameters={parameters}");
-                    }
-                }
-            }
         }
     }
     if !enabled() {

@@ -41,8 +41,8 @@ use crate::{
         TransitionHydrationKey, hydrate_transition_data, transition_uri,
     },
     spotify_mix_preview::{
-        PreviewAdmission, PreviewCoordinator, PreviewDescriptor, PreviewResolution,
-        decode_automix_preview, resolve_automix_preview,
+        PreviewAdmission, PreviewCoordinator, PreviewDescriptor, PreviewLogEvent,
+        PreviewResolution, decode_automix_preview, preview_diagnostic, resolve_automix_preview,
     },
     state::{
         context::{ContextType, ResetContext},
@@ -1236,13 +1236,30 @@ impl SpircTask {
                 return Ok(());
             }
             PlayerEvent::PreviewCompleted { token, restore } => {
+                let diagnostic = self
+                    .preview_ownership
+                    .coordinator
+                    .active()
+                    .filter(|active| active.token() == token)
+                    .map(|active| {
+                        preview_diagnostic(
+                            token,
+                            active.fingerprint(),
+                            active.descriptor(),
+                            PreviewLogEvent::Completed { restore: *restore },
+                        )
+                    });
                 let current = self
                     .preview_ownership
                     .coordinator
                     .finish(token, Reply::Success);
-                info!(
-                    "[spotify-preview] completion token={token:?} current={current} restore={restore:?}; ordinary queue advancement=false"
-                );
+                if let Some(diagnostic) = diagnostic {
+                    info!("{diagnostic}");
+                } else {
+                    info!(
+                        "[spotify-preview] event=stale-complete token={token:?} current={current} restore={restore:?} queue_advanced=false normal_promotion_emitted=false"
+                    );
+                }
                 return Ok(());
             }
             PlayerEvent::PreviewCancelled {
@@ -1250,13 +1267,33 @@ impl SpircTask {
                 reason,
                 restore,
             } => {
+                let diagnostic = self
+                    .preview_ownership
+                    .coordinator
+                    .active()
+                    .filter(|active| active.token() == token)
+                    .map(|active| {
+                        preview_diagnostic(
+                            token,
+                            active.fingerprint(),
+                            active.descriptor(),
+                            PreviewLogEvent::Cancelled {
+                                reason: *reason,
+                                restore: *restore,
+                            },
+                        )
+                    });
                 let current = self
                     .preview_ownership
                     .coordinator
                     .finish(token, Reply::Failure);
-                info!(
-                    "[spotify-preview] cancellation token={token:?} current={current} reason={reason:?} restore={restore:?}; ordinary queue advancement=false"
-                );
+                if let Some(diagnostic) = diagnostic {
+                    info!("{diagnostic}");
+                } else {
+                    info!(
+                        "[spotify-preview] event=stale-cancel token={token:?} current={current} reason={reason:?} restore={restore:?} queue_advanced=false normal_promotion_emitted=false"
+                    );
+                }
                 return Ok(());
             }
             PlayerEvent::PreviewFailed {
@@ -1264,13 +1301,33 @@ impl SpircTask {
                 reason,
                 restore,
             } => {
+                let diagnostic = self
+                    .preview_ownership
+                    .coordinator
+                    .active()
+                    .filter(|active| active.token() == token)
+                    .map(|active| {
+                        preview_diagnostic(
+                            token,
+                            active.fingerprint(),
+                            active.descriptor(),
+                            PreviewLogEvent::Failed {
+                                reason: *reason,
+                                restore: *restore,
+                            },
+                        )
+                    });
                 let current = self
                     .preview_ownership
                     .coordinator
                     .finish(token, Reply::Failure);
-                warn!(
-                    "[spotify-preview] failure token={token:?} current={current} reason={reason:?} restore={restore:?}; ordinary queue advancement=false"
-                );
+                if let Some(diagnostic) = diagnostic {
+                    warn!("{diagnostic}");
+                } else {
+                    warn!(
+                        "[spotify-preview] event=stale-fail token={token:?} current={current} reason={reason:?} restore={restore:?} queue_advanced=false normal_promotion_emitted=false"
+                    );
+                }
                 return Ok(());
             }
             _ => {}
@@ -1752,17 +1809,43 @@ impl SpircTask {
         let token = admission.token().clone();
 
         if matches!(admission, PreviewAdmission::Attached(_)) {
-            info!("[spotify-preview] duplicate attached token={token:?} descriptor={descriptor:?}");
+            info!(
+                "{}",
+                preview_diagnostic(
+                    &token,
+                    &resolved.request.fingerprint,
+                    &descriptor,
+                    PreviewLogEvent::Attached,
+                )
+            );
             return Ok(Some(token));
         }
 
         if let PreviewAdmission::Replaced { ref retired, .. } = admission {
             info!(
-                "[spotify-preview] replacing token={retired:?} with token={token:?}; old waiters resolved failure"
+                "{}",
+                preview_diagnostic(
+                    &token,
+                    &resolved.request.fingerprint,
+                    &descriptor,
+                    PreviewLogEvent::Replaced {
+                        retired: retired.generation,
+                    },
+                )
             );
             self.player
                 .cancel_preview(retired.clone(), PreviewCancelReason::Replaced);
         }
+
+        info!(
+            "{}",
+            preview_diagnostic(
+                &token,
+                &resolved.request.fingerprint,
+                &descriptor,
+                PreviewLogEvent::Started,
+            )
+        );
 
         let request = PreviewPlaybackRequest {
             token: token.clone(),
@@ -1783,9 +1866,6 @@ impl SpircTask {
             authority,
             RetainedPlaybackDisposition::Restore,
             PreviewCancelReason::Replaced,
-        );
-        info!(
-            "[spotify-preview] starting token={token:?} descriptor={descriptor:?}; Connect queue untouched"
         );
         self.player.start_preview(request);
         Ok(Some(token))
