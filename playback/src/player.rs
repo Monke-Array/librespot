@@ -40,8 +40,8 @@ use crate::{
         PreviewRestoreOutcome, PreviewToken, RetainedPlaybackDisposition,
     },
     secondary::{
-        Decoder, SECONDARY_PCM_CHANNEL_CAPACITY, SECONDARY_PCM_CHUNK_FRAMES, SecondaryPcmBlock,
-        SecondaryPcmReadiness, SecondaryRead, SourceDecoder,
+        Decoder, SECONDARY_PCM_CHANNEL_CAPACITY, SECONDARY_PCM_CHUNK_FRAMES, SecondaryDecodeOwner,
+        SecondaryPcmBlock, SecondaryPcmReadiness, SecondaryRead, SourceDecoder,
     },
     transition::{
         FixedDurationTransitionPolicy, ScheduledTransitionPolicy, TransitionEngine, TransitionPlan,
@@ -1068,6 +1068,7 @@ struct PreviewOwner {
     retained: RetainedPlayback,
     phase: PreviewPhase,
     started: bool,
+    pcm_consumed_frames: usize,
 }
 
 struct CancellableTrackLoader {
@@ -2623,6 +2624,7 @@ impl PlayerInternal {
         );
         let _timing = crate::core::runtime_trace::SlowOperation::new("cancel_secondary_source", 10);
         self.transition.cancel(reason);
+        self.transition_owner = None;
         let preload = mem::replace(&mut self.preload, PlayerPreload::None);
         if !matches!(preload, PlayerPreload::None) {
             self.next_secondary_generation();
@@ -2647,6 +2649,7 @@ impl PlayerInternal {
         );
         let _timing = crate::core::runtime_trace::SlowOperation::new("cancel_transition", 10);
         self.transition.cancel(reason);
+        self.transition_owner = None;
         if let PlayerPreload::Ready { source, .. } = &mut self.preload {
             if let Some(position_ms) = source.decoder.finish_transition_dsp() {
                 source.stream_position_ms = position_ms;
@@ -2684,6 +2687,15 @@ impl PlayerInternal {
         };
 
         let generation = self.next_secondary_generation();
+        let source_owner = match &self.preload {
+            PlayerPreload::Ready { owner, .. } => owner.clone(),
+            _ => unreachable!("ready secondary changed before decoder ownership was selected"),
+        };
+        let decode_owner = match &source_owner {
+            SourceOwner::Normal => SecondaryDecodeOwner::normal(generation),
+            SourceOwner::Preview(token) => SecondaryDecodeOwner::preview(generation, token.clone()),
+        };
+        self.transition_owner = Some(source_owner);
         crate::core::runtime_trace!(
             "worker_create player={} generation={generation} track={:?} speed={speed_automation:?} pcm_capacity={pcm_channel_capacity}",
             self.player_id,
@@ -2698,7 +2710,7 @@ impl PlayerInternal {
 
         source.decoder.start_secondary(
             source.stream_loader_controller.clone(),
-            generation,
+            decode_owner,
             track_id.to_string(),
             speed_automation,
             source.stream_position_ms,
@@ -2790,11 +2802,17 @@ impl PlayerInternal {
             (track_id.clone(), read)
         };
 
-        let generation = match &read {
-            SecondaryRead::Pcm(block) => block.generation,
-            SecondaryRead::Eof { generation } | SecondaryRead::Failed { generation, .. } => {
-                *generation
-            }
+        self.handle_secondary_read(track_id, read)
+    }
+
+    fn handle_secondary_read(
+        &mut self,
+        track_id: SpotifyUri,
+        read: SecondaryRead,
+    ) -> SecondaryFrameRead {
+        let owner = match &read {
+            SecondaryRead::Pcm(block) => &block.owner,
+            SecondaryRead::Eof { owner } | SecondaryRead::Failed { owner, .. } => owner,
             SecondaryRead::Pending => return SecondaryFrameRead::Pending,
             SecondaryRead::Disconnected => {
                 debug!("Secondary decode failed for <{track_id}>: worker disconnected");
@@ -2803,22 +2821,48 @@ impl PlayerInternal {
             }
         };
 
-        if generation != self.secondary_generation {
+        let expected_owner = SecondaryDecodeOwner {
+            generation: self.secondary_generation,
+            preview_token: match &self.transition_owner {
+                Some(SourceOwner::Preview(token)) => Some(token.clone()),
+                Some(SourceOwner::Normal) | None => None,
+            },
+        };
+        if owner != &expected_owner {
             debug!(
-                "Discarding stale secondary PCM generation {} for <{track_id}>; current generation is {}",
-                generation, self.secondary_generation
+                "Discarding stale secondary PCM owner {:?} for <{track_id}>; current owner is {:?}",
+                owner, expected_owner
             );
-            self.cancel_secondary_source("stale secondary decode generation");
+            if owner.preview_token.is_none() && expected_owner.preview_token.is_none() {
+                self.cancel_secondary_source("stale secondary decode generation");
+            }
             return SecondaryFrameRead::Unavailable;
         }
 
         match read {
-            SecondaryRead::Pcm(block) => SecondaryFrameRead::Ready(block),
-            SecondaryRead::Eof { .. } => {
-                self.cancel_secondary_source("secondary reached EOF");
+            SecondaryRead::Pcm(block) => {
+                if let Some(preview) = self.preview.as_mut()
+                    && block.owner.preview_token.as_ref() == Some(&preview.request.token)
+                {
+                    preview.pcm_consumed_frames = preview.pcm_consumed_frames.saturating_add(
+                        block.packet.samples().map_or(0, |s| s.len()) / NUM_CHANNELS as usize,
+                    );
+                }
+                SecondaryFrameRead::Ready(block)
+            }
+            SecondaryRead::Eof { owner } => {
+                if let Some(token) = owner.preview_token {
+                    self.fail_preview(token, PreviewFailure::SecondaryUnavailable);
+                } else {
+                    self.cancel_secondary_source("secondary reached EOF");
+                }
                 SecondaryFrameRead::Unavailable
             }
-            SecondaryRead::Failed { error, .. } => {
+            SecondaryRead::Failed { owner, error } => {
+                if let Some(token) = owner.preview_token {
+                    self.fail_preview(token, PreviewFailure::SecondaryUnavailable);
+                    return SecondaryFrameRead::Unavailable;
+                }
                 let error = PlayerLoadError::from_decoder_error(&self.session, error);
                 if let PlayerState::Playing {
                     play_request_id, ..
@@ -4435,6 +4479,7 @@ impl PlayerInternal {
             retained,
             phase: PreviewPhase::Loading,
             started: false,
+            pcm_consumed_frames: 0,
         });
         Ok(())
     }
@@ -4504,6 +4549,34 @@ impl PlayerInternal {
                 preview.request.incoming_load_position_ms,
             )
         })
+    }
+
+    #[cfg(test)]
+    fn inject_secondary_block_for_test(&mut self, stale_token: PreviewToken) {
+        let preview = self
+            .preview
+            .as_ref()
+            .expect("preview injection requires an active preview");
+        let active = preview.request.token.clone();
+        let track_id = preview.request.incoming.canonical.clone();
+        self.transition_owner = Some(SourceOwner::Preview(active));
+        let block = SecondaryPcmBlock {
+            owner: SecondaryDecodeOwner::preview(self.secondary_generation, stale_token),
+            position: AudioPacketPosition {
+                position_ms: 944,
+                skipped: false,
+            },
+            packet: AudioPacket::Samples(vec![0.0; 8 * NUM_CHANNELS as usize]),
+            source_end_position_ms: None,
+        };
+        let _ = self.handle_secondary_read(track_id, SecondaryRead::Pcm(block));
+    }
+
+    #[cfg(test)]
+    fn preview_pcm_consumed_for_test(&self) -> usize {
+        self.preview
+            .as_ref()
+            .map_or(0, |preview| preview.pcm_consumed_frames)
     }
 
     fn handle_command(&mut self, cmd: PlayerCommand) -> PlayerResult {
@@ -6834,6 +6907,36 @@ mod tests {
         assert!(player.try_take_secondary_packet().is_none());
         assert!(matches!(player.preload, PlayerPreload::None));
         assert!(matches!(player.state, PlayerState::Playing { .. }));
+    }
+
+    #[test]
+    fn stale_preview_worker_cannot_cancel_or_feed_replacement() {
+        let runtime = tokio::runtime::Runtime::new().expect("preview test runtime");
+        let _guard = runtime.enter();
+        let replacement = preview_token(2, 9);
+        let mut player = playing_test_player_at(42_123);
+        begin_preview_for_test(&mut player, preview_request(replacement.clone()));
+        inject_incoming_for_test(
+            &mut player,
+            replacement.clone(),
+            Ok(scripted_source(
+                next_track_uri(),
+                944,
+                Box::new(ScriptedDecoder),
+            )),
+        );
+
+        player.inject_secondary_block_for_test(preview_token(1, 9));
+
+        assert_eq!(
+            player
+                .preview
+                .as_ref()
+                .map(|preview| &preview.request.token),
+            Some(&replacement)
+        );
+        assert_eq!(player.preview_pcm_consumed_for_test(), 0);
+        assert!(matches!(player.preload, PlayerPreload::Ready { .. }));
     }
 
     #[test]

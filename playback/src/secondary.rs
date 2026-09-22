@@ -11,7 +11,7 @@ use std::{
 use librespot_audio::StreamLoaderController;
 
 use crate::{
-    NUM_CHANNELS, SAMPLE_RATE, SpeedAutomation,
+    NUM_CHANNELS, PreviewToken, SAMPLE_RATE, SpeedAutomation,
     decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, DecoderError, DecoderResult},
     time_stretch::PitchPreservingTimeStretch,
 };
@@ -66,7 +66,7 @@ impl SourceDecoder {
     pub(crate) fn start_secondary(
         &mut self,
         stream_loader_controller: StreamLoaderController,
-        generation: u64,
+        owner: SecondaryDecodeOwner,
         track_label: String,
         speed_automation: Option<SpeedAutomation>,
         source_position_ms: u32,
@@ -84,7 +84,7 @@ impl SourceDecoder {
         *self = Self::Worker(SecondaryDecodeWorker::spawn(
             decoder,
             stream_loader_controller,
-            generation,
+            owner,
             track_label,
             speed_automation,
             source_position_ms,
@@ -107,7 +107,7 @@ impl SourceDecoder {
         *self = Self::Worker(SecondaryDecodeWorker::spawn_with_cancellation(
             decoder,
             stream_loader_controller,
-            generation,
+            SecondaryDecodeOwner::normal(generation),
             track_label,
             cancelled,
             None,
@@ -169,8 +169,30 @@ impl SourceDecoder {
     }
 }
 
-pub(crate) struct SecondaryDecodeMessage {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SecondaryDecodeOwner {
     pub generation: u64,
+    pub preview_token: Option<PreviewToken>,
+}
+
+impl SecondaryDecodeOwner {
+    pub(crate) fn normal(generation: u64) -> Self {
+        Self {
+            generation,
+            preview_token: None,
+        }
+    }
+
+    pub(crate) fn preview(generation: u64, token: PreviewToken) -> Self {
+        Self {
+            generation,
+            preview_token: Some(token),
+        }
+    }
+}
+
+pub(crate) struct SecondaryDecodeMessage {
+    pub owner: SecondaryDecodeOwner,
     pub event: SecondaryDecodeEvent,
 }
 
@@ -181,7 +203,7 @@ pub(crate) enum SecondaryDecodeEvent {
 }
 
 pub(crate) struct SecondaryPcmBlock {
-    pub generation: u64,
+    pub owner: SecondaryDecodeOwner,
     pub position: AudioPacketPosition,
     pub packet: AudioPacket,
     pub source_end_position_ms: Option<u32>,
@@ -191,10 +213,10 @@ pub(crate) enum SecondaryRead {
     Pcm(SecondaryPcmBlock),
     Pending,
     Eof {
-        generation: u64,
+        owner: SecondaryDecodeOwner,
     },
     Failed {
-        generation: u64,
+        owner: SecondaryDecodeOwner,
         error: DecoderError,
     },
     Disconnected,
@@ -217,7 +239,7 @@ pub(crate) struct SecondaryDecodeWorker {
     pcm_buffer: Vec<f64>,
     pcm_origin: Option<AudioPacketPosition>,
     pcm_consumed_frames: u64,
-    pcm_generation: Option<u64>,
+    pcm_owner: Option<SecondaryDecodeOwner>,
     pending_terminal: Option<SecondaryDecodeMessage>,
     max_pcm_samples: usize,
     time_stretch: Option<PitchPreservingTimeStretch>,
@@ -228,7 +250,7 @@ impl SecondaryDecodeWorker {
     fn spawn(
         decoder: Decoder,
         stream_loader_controller: StreamLoaderController,
-        generation: u64,
+        owner: SecondaryDecodeOwner,
         track_label: String,
         speed_automation: Option<SpeedAutomation>,
         source_position_ms: u32,
@@ -238,7 +260,7 @@ impl SecondaryDecodeWorker {
         Self::spawn_with_cancellation(
             decoder,
             stream_loader_controller,
-            generation,
+            owner,
             track_label,
             cancelled,
             speed_automation,
@@ -250,7 +272,7 @@ impl SecondaryDecodeWorker {
     fn spawn_with_cancellation(
         decoder: Decoder,
         stream_loader_controller: StreamLoaderController,
-        generation: u64,
+        owner: SecondaryDecodeOwner,
         track_label: String,
         cancelled: Arc<AtomicBool>,
         speed_automation: Option<SpeedAutomation>,
@@ -273,7 +295,7 @@ impl SecondaryDecodeWorker {
                     sender,
                     worker_cancelled,
                     worker_finished,
-                    generation,
+                    owner,
                     &worker_track_label,
                 );
             })
@@ -303,7 +325,7 @@ impl SecondaryDecodeWorker {
             ),
             pcm_origin: None,
             pcm_consumed_frames: 0,
-            pcm_generation: None,
+            pcm_owner: None,
             pending_terminal: None,
             max_pcm_samples,
             time_stretch,
@@ -332,11 +354,11 @@ impl SecondaryDecodeWorker {
 
             match message.event {
                 SecondaryDecodeEvent::Packet(position, AudioPacket::Samples(packet)) => {
-                    self.push_pcm(message.generation, position, packet);
+                    self.push_pcm(message.owner, position, packet);
                 }
                 SecondaryDecodeEvent::Packet(_, AudioPacket::Raw(_)) => {
                     self.pending_terminal = Some(SecondaryDecodeMessage {
-                        generation: message.generation,
+                        owner: message.owner,
                         event: SecondaryDecodeEvent::Failed(DecoderError::PassthroughDecoder(
                             "secondary PCM assembler received encoded audio".into(),
                         )),
@@ -344,7 +366,7 @@ impl SecondaryDecodeWorker {
                 }
                 event @ (SecondaryDecodeEvent::Eof | SecondaryDecodeEvent::Failed(_)) => {
                     self.pending_terminal = Some(SecondaryDecodeMessage {
-                        generation: message.generation,
+                        owner: message.owner,
                         event,
                     });
                 }
@@ -361,10 +383,10 @@ impl SecondaryDecodeWorker {
             .expect("incomplete PCM without a terminal event must have returned pending");
         match message.event {
             SecondaryDecodeEvent::Eof => SecondaryRead::Eof {
-                generation: message.generation,
+                owner: message.owner,
             },
             SecondaryDecodeEvent::Failed(error) => SecondaryRead::Failed {
-                generation: message.generation,
+                owner: message.owner,
                 error,
             },
             SecondaryDecodeEvent::Packet(_, _) => {
@@ -397,11 +419,11 @@ impl SecondaryDecodeWorker {
 
             match message.event {
                 SecondaryDecodeEvent::Packet(position, AudioPacket::Samples(packet)) => {
-                    self.push_pcm(message.generation, position, packet);
+                    self.push_pcm(message.owner, position, packet);
                 }
                 SecondaryDecodeEvent::Packet(_, AudioPacket::Raw(_)) => {
                     self.pending_terminal = Some(SecondaryDecodeMessage {
-                        generation: message.generation,
+                        owner: message.owner,
                         event: SecondaryDecodeEvent::Failed(DecoderError::PassthroughDecoder(
                             "secondary PCM assembler received encoded audio".into(),
                         )),
@@ -409,7 +431,7 @@ impl SecondaryDecodeWorker {
                 }
                 event @ (SecondaryDecodeEvent::Eof | SecondaryDecodeEvent::Failed(_)) => {
                     self.pending_terminal = Some(SecondaryDecodeMessage {
-                        generation: message.generation,
+                        owner: message.owner,
                         event,
                     });
                 }
@@ -458,12 +480,13 @@ impl SecondaryDecodeWorker {
         };
         self.pcm_consumed_frames += frames as u64;
         let packet = AudioPacket::Samples(self.pcm_buffer.drain(..samples).collect());
-        let generation = self
-            .pcm_generation
-            .expect("buffered PCM must retain its generation");
+        let owner = self
+            .pcm_owner
+            .clone()
+            .expect("buffered PCM must retain its owner");
 
         SecondaryPcmBlock {
-            generation,
+            owner,
             position,
             packet,
             source_end_position_ms: None,
@@ -505,7 +528,7 @@ impl SecondaryDecodeWorker {
                     .as_mut()
                     .expect("stretched readiness requires a processor");
                 stretch.fill_output(samples);
-                if stretch.available_samples() >= samples && self.pcm_generation.is_some() {
+                if stretch.available_samples() >= samples && self.pcm_owner.is_some() {
                     return SecondaryPcmReadiness::Ready;
                 }
             }
@@ -517,7 +540,7 @@ impl SecondaryDecodeWorker {
                     .as_mut()
                     .expect("stretched readiness requires a processor");
                 stretch.fill_output(samples);
-                return if stretch.available_samples() >= samples && self.pcm_generation.is_some() {
+                return if stretch.available_samples() >= samples && self.pcm_owner.is_some() {
                     SecondaryPcmReadiness::Ready
                 } else {
                     SecondaryPcmReadiness::Unavailable
@@ -548,14 +571,14 @@ impl SecondaryDecodeWorker {
         let position_ms = duration_ms_u32(stretch.source_position());
         let packet = AudioPacket::Samples(stretch.take(samples));
         let source_end_position_ms = Some(duration_ms_u32(stretch.source_position()));
-        let generation = self.pcm_generation?;
+        let owner = self.pcm_owner.clone()?;
         let skipped = self
             .pcm_origin
             .as_ref()
             .is_some_and(|origin| origin.skipped && self.pcm_consumed_frames == 0);
         self.pcm_consumed_frames += (samples / NUM_CHANNELS as usize) as u64;
         let block = SecondaryPcmBlock {
-            generation,
+            owner,
             position: AudioPacketPosition {
                 position_ms,
                 skipped,
@@ -571,10 +594,10 @@ impl SecondaryDecodeWorker {
             SecondaryDecodeEvent::Packet(position, AudioPacket::Samples(samples)) => {
                 if self.pcm_origin.is_none() {
                     self.pcm_origin = Some(position);
-                    self.pcm_generation = Some(message.generation);
+                    self.pcm_owner = Some(message.owner.clone());
                     self.pcm_consumed_frames = 0;
                 }
-                if self.pcm_generation == Some(message.generation) {
+                if self.pcm_owner.as_ref() == Some(&message.owner) {
                     self.time_stretch
                         .as_mut()
                         .expect("stretched message requires a processor")
@@ -583,7 +606,7 @@ impl SecondaryDecodeWorker {
             }
             SecondaryDecodeEvent::Packet(_, AudioPacket::Raw(_)) => {
                 self.pending_terminal = Some(SecondaryDecodeMessage {
-                    generation: message.generation,
+                    owner: message.owner,
                     event: SecondaryDecodeEvent::Failed(DecoderError::PassthroughDecoder(
                         "time stretching received an encoded packet".into(),
                     )),
@@ -591,7 +614,7 @@ impl SecondaryDecodeWorker {
             }
             event @ (SecondaryDecodeEvent::Eof | SecondaryDecodeEvent::Failed(_)) => {
                 self.pending_terminal = Some(SecondaryDecodeMessage {
-                    generation: message.generation,
+                    owner: message.owner,
                     event,
                 });
             }
@@ -615,10 +638,10 @@ impl SecondaryDecodeWorker {
             .expect("terminal read requires a pending event");
         match message.event {
             SecondaryDecodeEvent::Eof => SecondaryRead::Eof {
-                generation: message.generation,
+                owner: message.owner,
             },
             SecondaryDecodeEvent::Failed(error) => SecondaryRead::Failed {
-                generation: message.generation,
+                owner: message.owner,
                 error,
             },
             SecondaryDecodeEvent::Packet(_, _) => unreachable!("only terminal events are stored"),
@@ -633,7 +656,7 @@ impl SecondaryDecodeWorker {
         let stretch = self.time_stretch.take()?;
         let (source_position, samples) = stretch.finish();
         debug_assert!(self.pcm_buffer.is_empty());
-        if self.pcm_generation.is_some() {
+        if self.pcm_owner.is_some() {
             self.pcm_origin = Some(AudioPacketPosition {
                 position_ms: duration_ms_u32(source_position),
                 skipped: false,
@@ -680,7 +703,7 @@ impl SecondaryDecodeWorker {
 
         match message.event {
             SecondaryDecodeEvent::Packet(position, AudioPacket::Samples(packet)) => {
-                self.push_pcm(message.generation, position, packet);
+                self.push_pcm(message.owner, position, packet);
                 let block = self.take_pcm(self.pcm_buffer.len());
                 Ok(Some((block.position, block.packet)))
             }
@@ -737,15 +760,20 @@ impl SecondaryDecodeWorker {
         }
     }
 
-    fn push_pcm(&mut self, generation: u64, position: AudioPacketPosition, mut packet: Vec<f64>) {
+    fn push_pcm(
+        &mut self,
+        owner: SecondaryDecodeOwner,
+        position: AudioPacketPosition,
+        mut packet: Vec<f64>,
+    ) {
         assert!(packet.len() <= SECONDARY_PCM_CHUNK_SAMPLES);
         assert!(self.pcm_buffer.len() + packet.len() <= self.max_pcm_samples);
         if self.pcm_origin.is_none() {
             self.pcm_origin = Some(position);
             self.pcm_consumed_frames = 0;
-            self.pcm_generation = Some(generation);
+            self.pcm_owner = Some(owner);
         } else {
-            debug_assert_eq!(self.pcm_generation, Some(generation));
+            debug_assert_eq!(self.pcm_owner.as_ref(), Some(&owner));
         }
         self.pcm_buffer.append(&mut packet);
     }
@@ -791,11 +819,15 @@ fn run_decode_worker(
     sender: SyncSender<SecondaryDecodeMessage>,
     cancelled: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
-    generation: u64,
+    owner: SecondaryDecodeOwner,
     track_label: &str,
 ) {
     debug!("Secondary decode started for <{track_label}>");
-    crate::core::runtime_trace!("worker_start generation={generation} track={track_label}");
+    crate::core::runtime_trace!(
+        "worker_start generation={} preview={:?} track={track_label}",
+        owner.generation,
+        owner.preview_token
+    );
     let mut reported_ready = false;
     let mut pending_samples = Vec::with_capacity(SECONDARY_PCM_CHUNK_SAMPLES);
     let mut pending_position = None;
@@ -827,7 +859,7 @@ fn run_decode_worker(
 
                     if pending_samples.len() == SECONDARY_PCM_CHUNK_SAMPLES {
                         let message = SecondaryDecodeMessage {
-                            generation,
+                            owner: owner.clone(),
                             event: SecondaryDecodeEvent::Packet(
                                 pending_position
                                     .take()
@@ -843,7 +875,9 @@ fn run_decode_worker(
                         if !reported_ready {
                             debug!("Secondary PCM ready for transition for <{track_label}>");
                             crate::core::runtime_trace!(
-                                "worker_pcm_ready generation={generation} track={track_label}"
+                                "worker_pcm_ready generation={} preview={:?} track={track_label}",
+                                owner.generation,
+                                owner.preview_token
                             );
                             reported_ready = true;
                         }
@@ -856,7 +890,7 @@ fn run_decode_worker(
                 );
                 debug!("Secondary decode failed for <{track_label}>: {error}");
                 let _ = sender.send(SecondaryDecodeMessage {
-                    generation,
+                    owner: owner.clone(),
                     event: SecondaryDecodeEvent::Failed(error),
                 });
                 break;
@@ -866,7 +900,7 @@ fn run_decode_worker(
                 if !pending_samples.is_empty()
                     && sender
                         .send(SecondaryDecodeMessage {
-                            generation,
+                            owner: owner.clone(),
                             event: SecondaryDecodeEvent::Packet(
                                 pending_position
                                     .take()
@@ -879,7 +913,7 @@ fn run_decode_worker(
                     break;
                 }
                 let _ = sender.send(SecondaryDecodeMessage {
-                    generation,
+                    owner: owner.clone(),
                     event: SecondaryDecodeEvent::Eof,
                 });
                 break;
@@ -889,7 +923,7 @@ fn run_decode_worker(
                 if !pending_samples.is_empty()
                     && sender
                         .send(SecondaryDecodeMessage {
-                            generation,
+                            owner: owner.clone(),
                             event: SecondaryDecodeEvent::Packet(
                                 pending_position
                                     .take()
@@ -902,7 +936,7 @@ fn run_decode_worker(
                     break;
                 }
                 let _ = sender.send(SecondaryDecodeMessage {
-                    generation,
+                    owner: owner.clone(),
                     event: SecondaryDecodeEvent::Failed(error),
                 });
                 break;
@@ -911,4 +945,63 @@ fn run_decode_worker(
     }
 
     finished.store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{PreviewAuthority, PreviewGeneration, PreviewToken};
+
+    fn decode_one_test_block(owner: SecondaryDecodeOwner) -> SecondaryPcmBlock {
+        let (sender, receiver) = sync_channel(1);
+        sender
+            .send(SecondaryDecodeMessage {
+                owner,
+                event: SecondaryDecodeEvent::Packet(
+                    AudioPacketPosition {
+                        position_ms: 123,
+                        skipped: false,
+                    },
+                    AudioPacket::Samples(vec![0.25; SECONDARY_PCM_CHUNK_SAMPLES]),
+                ),
+            })
+            .expect("test PCM should fit the channel");
+        let mut worker = SecondaryDecodeWorker {
+            receiver: Some(receiver),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            finished: Arc::new(AtomicBool::new(false)),
+            stream_loader_controller: StreamLoaderController::from_local_file(4096),
+            thread: None,
+            track_label: "test-preview".to_owned(),
+            pcm_buffer: Vec::new(),
+            pcm_origin: None,
+            pcm_consumed_frames: 0,
+            pcm_owner: None,
+            pending_terminal: None,
+            max_pcm_samples: SECONDARY_PCM_CHUNK_SAMPLES,
+            time_stretch: None,
+            time_stretch_flushed: false,
+        };
+        match worker.try_read(SECONDARY_PCM_CHUNK_SAMPLES) {
+            SecondaryRead::Pcm(block) => block,
+            _ => panic!("test worker should return the tagged PCM block"),
+        }
+    }
+
+    fn token(session: &str, preview_generation: u64, normal_generation: u64) -> PreviewToken {
+        PreviewToken {
+            authority: PreviewAuthority {
+                connect_session_id: session.to_owned(),
+                normal_ownership_generation: normal_generation,
+            },
+            generation: PreviewGeneration(preview_generation),
+        }
+    }
+
+    #[test]
+    fn secondary_pcm_carries_the_complete_preview_token() {
+        let owner = SecondaryDecodeOwner::preview(12, token("session-a", 4, 9));
+        let block = decode_one_test_block(owner.clone());
+        assert_eq!(block.owner, owner);
+    }
 }
