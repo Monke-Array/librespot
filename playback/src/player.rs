@@ -36,8 +36,8 @@ use crate::{
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
     preview::{
-        PreviewAuthority, PreviewCancelReason, PreviewFailure, PreviewPlaybackRequest,
-        PreviewRestoreOutcome, PreviewToken, RetainedPlaybackDisposition,
+        PreviewAuthority, PreviewCancelReason, PreviewFailure, PreviewFrameBudget,
+        PreviewPlaybackRequest, PreviewRestoreOutcome, PreviewToken, RetainedPlaybackDisposition,
     },
     secondary::{
         Decoder, SECONDARY_PCM_CHANNEL_CAPACITY, SECONDARY_PCM_CHUNK_FRAMES, SecondaryDecodeOwner,
@@ -231,6 +231,7 @@ struct PlayerInternal {
     crossfade_load_ack: Option<CrossfadeLoadAck>,
     preview_authority: Option<PreviewAuthority>,
     preview: Option<PreviewOwner>,
+    last_preview_post_roll_frames: Option<usize>,
 
     // The dynamic limiter is one global output-stage processor after transition mixing.
     normalisation_integrators: [f64; 2],
@@ -747,6 +748,7 @@ impl Player {
                 crossfade_load_ack: None,
                 preview_authority: None,
                 preview: None,
+                last_preview_post_roll_frames: None,
 
                 normalisation_peaks: [0.0; 2],
                 normalisation_integrators: [0.0; 2],
@@ -1055,6 +1057,11 @@ impl FusedFuture for OwnedTrackLoader {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PreviewPhase {
     Loading,
+    Transition,
+    PostRoll {
+        budget: PreviewFrameBudget,
+        frames_written: usize,
+    },
 }
 
 struct RetainedPlayback {
@@ -2267,10 +2274,11 @@ impl Future for PlayerInternal {
                     ref track_id,
                     play_request_id,
                     ref mut source,
-                    ..
+                    ref owner,
                 } = self.state
                 {
                     let track_id = track_id.clone();
+                    let owner = owner.clone();
                     let normalisation_factor = source.normalisation_factor;
                     let result = {
                         let _timing = crate::core::runtime_trace::SlowOperation::new(
@@ -2288,7 +2296,7 @@ impl Future for PlayerInternal {
                                     new_stream_position_ms,
                                 );
 
-                                if !passthrough {
+                                if !passthrough && owner == SourceOwner::Normal {
                                     match packet.samples() {
                                         Ok(_) => {
                                             let new_stream_position = Duration::from_millis(
@@ -2363,6 +2371,7 @@ impl Future for PlayerInternal {
                                                 track_id.clone(),
                                                 play_request_id,
                                                 source.stream_position_ms,
+                                                owner.clone(),
                                                 DecoderError::SymphoniaDecoder(format!(
                                                     "decoded packet type mismatch: {e}"
                                                 )),
@@ -2377,8 +2386,13 @@ impl Future for PlayerInternal {
                             }
                         }
                         Err(e) => {
-                            decoder_failure =
-                                Some((track_id, play_request_id, source.stream_position_ms, e));
+                            decoder_failure = Some((
+                                track_id,
+                                play_request_id,
+                                source.stream_position_ms,
+                                owner,
+                                e,
+                            ));
                         }
                     }
                 } else {
@@ -2387,35 +2401,41 @@ impl Future for PlayerInternal {
                 };
             }
 
-            if let Some((track_id, play_request_id, position_ms, source)) = decoder_failure {
+            if let Some((track_id, play_request_id, position_ms, owner, source)) = decoder_failure {
                 let error = PlayerLoadError::from_decoder_error(&self.session, source);
                 debug!(
                     "Decoder stopped for <{track_id}> at {position_ms} ms with classification {:?}",
                     error.kind
                 );
-                match error.kind {
-                    PlayerLoadErrorKind::TransientNetwork
-                    | PlayerLoadErrorKind::TransientService
-                    | PlayerLoadErrorKind::SessionInvalid => self.begin_recovery(RecoveryRequest {
-                        track_id,
-                        play_request_id,
-                        position_ms,
-                        start_playback: true,
-                        kind: error.kind,
-                        failed_attempts: 0,
-                        buffer_starved: true,
-                    }),
-                    PlayerLoadErrorKind::PermanentTrack => {
-                        self.state.playing_to_end_of_track();
-                        self.network_health = RecoveryHealth::Healthy;
-                        self.send_event(PlayerEvent::Unavailable {
-                            track_id,
-                            play_request_id,
-                        });
-                    }
-                    PlayerLoadErrorKind::Cancelled => {
-                        self.state = PlayerState::Stopped;
-                        self.ensure_sink_stopped(true);
+                if let SourceOwner::Preview(token) = owner {
+                    self.fail_preview(token, PreviewFailure::Render);
+                } else {
+                    match error.kind {
+                        PlayerLoadErrorKind::TransientNetwork
+                        | PlayerLoadErrorKind::TransientService
+                        | PlayerLoadErrorKind::SessionInvalid => {
+                            self.begin_recovery(RecoveryRequest {
+                                track_id,
+                                play_request_id,
+                                position_ms,
+                                start_playback: true,
+                                kind: error.kind,
+                                failed_attempts: 0,
+                                buffer_starved: true,
+                            })
+                        }
+                        PlayerLoadErrorKind::PermanentTrack => {
+                            self.state.playing_to_end_of_track();
+                            self.network_health = RecoveryHealth::Healthy;
+                            self.send_event(PlayerEvent::Unavailable {
+                                track_id,
+                                play_request_id,
+                            });
+                        }
+                        PlayerLoadErrorKind::Cancelled => {
+                            self.state = PlayerState::Stopped;
+                            self.ensure_sink_stopped(true);
+                        }
                     }
                 }
             }
@@ -2426,13 +2446,13 @@ impl Future for PlayerInternal {
                 ref track_id,
                 play_request_id,
                 ref mut source,
-                ..
+                owner: SourceOwner::Normal,
             }
             | PlayerState::Paused {
                 ref track_id,
                 play_request_id,
                 ref mut source,
-                ..
+                owner: SourceOwner::Normal,
             } = self.state
             {
                 let track_id = track_id.clone();
@@ -3030,7 +3050,15 @@ impl PlayerInternal {
             if let Err(e) = self.start_secondary_decode() {
                 warn!("Unable to start secondary decoder: {e}");
                 self.mark_transition_attempted();
-                self.cancel_secondary_source("secondary decoder could not start");
+                if let Some(token) = self
+                    .preview
+                    .as_ref()
+                    .map(|preview| preview.request.token.clone())
+                {
+                    self.fail_preview(token, PreviewFailure::SecondaryUnavailable);
+                } else {
+                    self.cancel_secondary_source("secondary decoder could not start");
+                }
                 return;
             }
         }
@@ -3069,6 +3097,13 @@ impl PlayerInternal {
         if self.config.passthrough {
             debug!("Transition policy selected PCM mixing while encoded passthrough is active");
             self.mark_transition_attempted();
+            if let Some(token) = self
+                .preview
+                .as_ref()
+                .map(|preview| preview.request.token.clone())
+            {
+                self.fail_preview(token, PreviewFailure::Render);
+            }
             return;
         }
 
@@ -3084,7 +3119,15 @@ impl PlayerInternal {
                 Err(e) => {
                     warn!("Unable to start secondary decoder: {e}");
                     self.mark_transition_attempted();
-                    self.cancel_secondary_source("secondary decoder could not start");
+                    if let Some(token) = self
+                        .preview
+                        .as_ref()
+                        .map(|preview| preview.request.token.clone())
+                    {
+                        self.fail_preview(token, PreviewFailure::SecondaryUnavailable);
+                    } else {
+                        self.cancel_secondary_source("secondary decoder could not start");
+                    }
                     return;
                 }
             }
@@ -3106,7 +3149,13 @@ impl PlayerInternal {
             SecondaryPcmReadiness::Pending => {
                 debug!("Transition skipped: secondary PCM was not ready before transition start");
                 self.mark_transition_attempted();
-                if !prepare_normal_crossfade {
+                if let Some(token) = self
+                    .preview
+                    .as_ref()
+                    .map(|preview| preview.request.token.clone())
+                {
+                    self.fail_preview(token, PreviewFailure::SecondaryUnavailable);
+                } else if !prepare_normal_crossfade {
                     self.cancel_secondary_source(
                         "secondary PCM was not ready before transition start",
                     );
@@ -3116,7 +3165,13 @@ impl PlayerInternal {
             SecondaryPcmReadiness::Unavailable => {
                 debug!("Transition skipped: secondary PCM was unavailable before transition start");
                 self.mark_transition_attempted();
-                if !prepare_normal_crossfade {
+                if let Some(token) = self
+                    .preview
+                    .as_ref()
+                    .map(|preview| preview.request.token.clone())
+                {
+                    self.fail_preview(token, PreviewFailure::SecondaryUnavailable);
+                } else if !prepare_normal_crossfade {
                     self.cancel_secondary_source(
                         "secondary PCM unavailable before transition start",
                     );
@@ -3137,8 +3192,20 @@ impl PlayerInternal {
                 }
                 debug!("[transition] transition armed");
                 self.mark_transition_attempted();
+                if let Some(preview) = self.preview.as_mut() {
+                    preview.phase = PreviewPhase::Transition;
+                }
             }
-            Err(e) => warn!("Unable to arm transition: {e}"),
+            Err(e) => {
+                warn!("Unable to arm transition: {e}");
+                if let Some(token) = self
+                    .preview
+                    .as_ref()
+                    .map(|preview| preview.request.token.clone())
+                {
+                    self.fail_preview(token, PreviewFailure::Render);
+                }
+            }
         }
     }
 
@@ -3384,6 +3451,15 @@ impl PlayerInternal {
         packet: Option<(AudioPacketPosition, AudioPacket)>,
         normalisation_factor: f64,
     ) {
+        if self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| matches!(preview.phase, PreviewPhase::PostRoll { .. }))
+        {
+            self.handle_preview_post_roll(packet, normalisation_factor);
+            return;
+        }
+
         match packet {
             Some((packet_position, packet)) => {
                 if packet.is_empty() {
@@ -3433,6 +3509,14 @@ impl PlayerInternal {
                 }
             }
             None => {
+                if let Some(token) = self
+                    .preview
+                    .as_ref()
+                    .map(|preview| preview.request.token.clone())
+                {
+                    self.fail_preview(token, PreviewFailure::PrematureOutgoingEof);
+                    return;
+                }
                 if self.transition.state() == TransitionState::Active
                     && matches!(self.preload, PlayerPreload::Ready { .. })
                 {
@@ -3548,7 +3632,15 @@ impl PlayerInternal {
         let _timing = crate::core::runtime_trace::SlowOperation::new("sink_write", 250);
         if let Err(e) = self.sink.write(packet, &mut self.converter) {
             error!("{e}");
-            self.handle_pause();
+            if let Some(token) = self
+                .preview
+                .as_ref()
+                .map(|preview| preview.request.token.clone())
+            {
+                self.fail_preview(token, PreviewFailure::Render);
+            } else {
+                self.handle_pause();
+            }
             false
         } else {
             true
@@ -3562,8 +3654,16 @@ impl PlayerInternal {
                 "Transition current PCM has {} samples not aligned to {channels} channels",
                 samples.len()
             );
-            self.cancel_transition("unaligned current PCM");
-            self.write_output_packet(AudioPacket::Samples(samples), volume);
+            if let Some(token) = self
+                .preview
+                .as_ref()
+                .map(|preview| preview.request.token.clone())
+            {
+                self.fail_preview(token, PreviewFailure::Render);
+            } else {
+                self.cancel_transition("unaligned current PCM");
+                self.write_output_packet(AudioPacket::Samples(samples), volume);
+            }
             return;
         }
 
@@ -3575,8 +3675,19 @@ impl PlayerInternal {
                 .min(self.transition.remaining_frames());
             if frames == 0 {
                 error!("Transition reached zero remaining frames without finishing");
-                self.cancel_transition("invalid frame accounting");
-                self.write_output_packet(AudioPacket::Samples(samples[offset..].to_vec()), volume);
+                if let Some(token) = self
+                    .preview
+                    .as_ref()
+                    .map(|preview| preview.request.token.clone())
+                {
+                    self.fail_preview(token, PreviewFailure::Render);
+                } else {
+                    self.cancel_transition("invalid frame accounting");
+                    self.write_output_packet(
+                        AudioPacket::Samples(samples[offset..].to_vec()),
+                        volume,
+                    );
+                }
                 return;
             }
 
@@ -3586,18 +3697,28 @@ impl PlayerInternal {
                 SecondaryFrameRead::Ready(block) => block,
                 SecondaryFrameRead::Pending => {
                     debug!("Transition aborted: secondary PCM underrun; continuing current track");
-                    self.cancel_transition("secondary PCM underrun");
-                    self.write_output_packet(
-                        AudioPacket::Samples(samples[offset..].to_vec()),
-                        volume,
-                    );
+                    if let Some(token) = self
+                        .preview
+                        .as_ref()
+                        .map(|preview| preview.request.token.clone())
+                    {
+                        self.fail_preview(token, PreviewFailure::SecondaryUnavailable);
+                    } else {
+                        self.cancel_transition("secondary PCM underrun");
+                        self.write_output_packet(
+                            AudioPacket::Samples(samples[offset..].to_vec()),
+                            volume,
+                        );
+                    }
                     return;
                 }
                 SecondaryFrameRead::Unavailable => {
-                    self.write_output_packet(
-                        AudioPacket::Samples(samples[offset..].to_vec()),
-                        volume,
-                    );
+                    if self.preview.is_none() {
+                        self.write_output_packet(
+                            AudioPacket::Samples(samples[offset..].to_vec()),
+                            volume,
+                        );
+                    }
                     return;
                 }
             };
@@ -3626,11 +3747,19 @@ impl PlayerInternal {
                 Ok(packet) => packet,
                 Err(e) => {
                     error!("Transition engine rejected aligned PCM: {e}");
-                    self.cancel_transition("rendering failed");
-                    self.write_output_packet(
-                        AudioPacket::Samples(samples[offset..].to_vec()),
-                        volume,
-                    );
+                    if let Some(token) = self
+                        .preview
+                        .as_ref()
+                        .map(|preview| preview.request.token.clone())
+                    {
+                        self.fail_preview(token, PreviewFailure::Render);
+                    } else {
+                        self.cancel_transition("rendering failed");
+                        self.write_output_packet(
+                            AudioPacket::Samples(samples[offset..].to_vec()),
+                            volume,
+                        );
+                    }
                     return;
                 }
             };
@@ -3659,8 +3788,177 @@ impl PlayerInternal {
         }
     }
 
+    fn handle_preview_post_roll(
+        &mut self,
+        packet: Option<(AudioPacketPosition, AudioPacket)>,
+        normalisation_factor: f64,
+    ) {
+        let Some((_, AudioPacket::Samples(mut samples))) = packet else {
+            let token = self
+                .preview
+                .as_ref()
+                .expect("post-roll requires preview ownership")
+                .request
+                .token
+                .clone();
+            self.fail_preview(token, PreviewFailure::PrematureIncomingEof);
+            return;
+        };
+        let channels = NUM_CHANNELS as usize;
+        if samples.is_empty() || samples.len() % channels != 0 {
+            let token = self
+                .preview
+                .as_ref()
+                .expect("post-roll requires preview ownership")
+                .request
+                .token
+                .clone();
+            self.fail_preview(token, PreviewFailure::Render);
+            return;
+        }
+
+        let (token, frames, complete) = {
+            let preview = self
+                .preview
+                .as_mut()
+                .expect("post-roll requires preview ownership");
+            let PreviewPhase::PostRoll {
+                budget,
+                frames_written,
+            } = &mut preview.phase
+            else {
+                unreachable!("post-roll handler requires post-roll phase");
+            };
+            let frames = budget.take(samples.len() / channels);
+            samples.truncate(frames.saturating_mul(channels));
+            *frames_written = frames_written.saturating_add(frames);
+            (preview.request.token.clone(), frames, budget.is_complete())
+        };
+        if frames == 0 {
+            self.complete_preview_playback(token);
+            return;
+        }
+
+        let volume = self.volume_getter.attenuation_factor();
+        self.apply_source_normalisation(&mut samples, normalisation_factor, volume);
+        if !self.write_output_packet(AudioPacket::Samples(samples), volume) {
+            return;
+        }
+        if complete {
+            self.complete_preview_playback(token);
+        }
+    }
+
+    fn complete_preview_transition(&mut self) -> PlayerResult {
+        let token = self
+            .preview
+            .as_ref()
+            .ok_or_else(|| Error::internal("preview transition completed without preview owner"))?
+            .request
+            .token
+            .clone();
+        if self.transition_owner.as_ref() != Some(&SourceOwner::Preview(token.clone())) {
+            return Err(Error::internal(
+                "preview transition completed under stale renderer ownership",
+            ));
+        }
+        if !matches!(
+            &self.state,
+            PlayerState::Playing {
+                owner: SourceOwner::Preview(owner),
+                ..
+            } if owner == &token
+        ) || !matches!(
+            &self.preload,
+            PlayerPreload::Ready {
+                owner: SourceOwner::Preview(owner),
+                ..
+            } if owner == &token
+        ) {
+            return Err(Error::internal(
+                "preview transition completed without matching A/B ownership",
+            ));
+        }
+
+        self.transition
+            .complete()
+            .map_err(|error| Error::internal(error.to_string()))?;
+        let PlayerState::Playing {
+            source: outgoing, ..
+        } = mem::replace(&mut self.state, PlayerState::Invalid)
+        else {
+            unreachable!("preview outgoing ownership was validated above");
+        };
+        let PlayerPreload::Ready {
+            track_id,
+            mut source,
+            ..
+        } = mem::replace(&mut self.preload, PlayerPreload::None)
+        else {
+            unreachable!("preview incoming ownership was validated above");
+        };
+        if let Some(position_ms) = source.decoder.finish_transition_dsp() {
+            source.stream_position_ms = position_ms;
+        }
+        drop(outgoing);
+        source.reported_nominal_start_time =
+            Instant::now().checked_sub(Duration::from_millis(u64::from(source.stream_position_ms)));
+        source.suggested_to_preload_next_track = false;
+        self.state = PlayerState::Playing {
+            track_id,
+            play_request_id: 0,
+            source: *source,
+            owner: SourceOwner::Preview(token.clone()),
+        };
+        self.transition_owner = None;
+        self.crossfade_load_ack = None;
+        self.last_preview_post_roll_frames = None;
+        let post_roll = self
+            .preview
+            .as_ref()
+            .expect("preview owner remains active at handoff")
+            .request
+            .post_roll;
+        self.preview
+            .as_mut()
+            .expect("preview owner remains active at handoff")
+            .phase = PreviewPhase::PostRoll {
+            budget: PreviewFrameBudget::new(post_roll),
+            frames_written: 0,
+        };
+        debug!("[preview] internal B handoff token={token:?}; ordinary promotion suppressed");
+        Ok(())
+    }
+
+    fn complete_preview_playback(&mut self, token: PreviewToken) {
+        let matches = self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.request.token == token);
+        if !matches {
+            return;
+        }
+        let preview = self.preview.take().expect("matching preview checked above");
+        let frames_written = match preview.phase {
+            PreviewPhase::PostRoll { frames_written, .. } => frames_written,
+            PreviewPhase::Loading | PreviewPhase::Transition => 0,
+        };
+        self.last_preview_post_roll_frames = Some(frames_written);
+        self.state = PlayerState::Stopped;
+        self.preload = PlayerPreload::None;
+        self.transition_owner = None;
+        self.ensure_sink_stopped(true);
+        self.send_event(PlayerEvent::PreviewCompleted {
+            token,
+            restore: PreviewRestoreOutcome::NotOwned,
+        });
+    }
+
     fn complete_crossfade(&mut self) -> PlayerResult {
         let _timing = crate::core::runtime_trace::SlowOperation::new("complete_crossfade", 10);
+        if self.preview.is_some() {
+            return self.complete_preview_transition();
+        }
         if !matches!(self.state, PlayerState::Playing { .. })
             || !matches!(self.preload, PlayerPreload::Ready { .. })
         {
@@ -4577,6 +4875,18 @@ impl PlayerInternal {
         self.preview
             .as_ref()
             .map_or(0, |preview| preview.pcm_consumed_frames)
+    }
+
+    #[cfg(test)]
+    fn preview_post_roll_frames_written_for_test(&self) -> usize {
+        self.last_preview_post_roll_frames.unwrap_or_else(|| {
+            self.preview
+                .as_ref()
+                .map_or(0, |preview| match preview.phase {
+                    PreviewPhase::PostRoll { frames_written, .. } => frames_written,
+                    PreviewPhase::Loading | PreviewPhase::Transition => 0,
+                })
+        })
     }
 
     fn handle_command(&mut self, cmd: PlayerCommand) -> PlayerResult {
@@ -5697,14 +6007,117 @@ mod tests {
         token: PreviewToken,
         result: Result<PlaybackSource, PlayerLoadError>,
     ) {
+        let plan = player
+            .preview
+            .as_ref()
+            .expect("incoming injection requires an active preview")
+            .request
+            .plan
+            .clone();
         player.handle_preload_load_result(
             next_track_uri(),
-            PreloadTransition::Scheduled(scheduled_test_plan()),
+            PreloadTransition::Scheduled(plan),
             OwnedLoadResult {
                 owner: SourceOwner::Preview(token),
                 result,
             },
         );
+    }
+
+    fn armed_preview_test_player() -> (tokio::runtime::Runtime, PlayerInternal, PlayerEventChannel)
+    {
+        let runtime = tokio::runtime::Runtime::new().expect("preview renderer runtime");
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        set_playing_source(&mut player, track_uri(), scripted_loaded_track(42_123));
+        let events = preview_event_channel(&mut player);
+        let token = preview_token(1, 9);
+        let decode_calls = Arc::new(AtomicUsize::new(0));
+        {
+            let _guard = runtime.enter();
+            begin_preview_for_test(&mut player, preview_request(token.clone()));
+            inject_incoming_for_test(
+                &mut player,
+                token.clone(),
+                Ok(scripted_source(
+                    next_track_uri(),
+                    944,
+                    Box::new(CountingPcmDecoder {
+                        calls: decode_calls.clone(),
+                        packets_remaining: None,
+                    }),
+                )),
+            );
+            let mut outgoing = scripted_source(track_uri(), 181_812, Box::new(ScriptedDecoder));
+            outgoing.duration_ms = 300_000;
+            outgoing.canonical_duration_ms = 300_000;
+            inject_outgoing_for_test(&mut player, token, Ok(outgoing));
+            if let PlayerState::Playing { source, .. } = &mut player.state {
+                source.stream_position_ms = 184_612;
+            }
+            player.arm_transition_if_selected();
+        }
+        wait_until("preview secondary worker did not produce PCM", || {
+            decode_calls.load(Ordering::Acquire) > 0
+        });
+        if let PlayerState::Playing { source, .. } = &mut player.state {
+            source.stream_position_ms = 184_812;
+        }
+        player.arm_transition_if_selected();
+        assert_eq!(player.transition.state(), TransitionState::Armed);
+        (runtime, player, events)
+    }
+
+    fn render_through_transition(player: &mut PlayerInternal) {
+        let mut rendered = 0usize;
+        let total = player.transition.total_frames();
+        while rendered < total {
+            wait_until("preview secondary PCM was not ready", || {
+                player.secondary_pcm_readiness(NUM_CHANNELS as usize)
+                    == SecondaryPcmReadiness::Ready
+            });
+            let frames = (total - rendered).min(SECONDARY_PCM_CHUNK_FRAMES);
+            let position_ms = 184_812u32.saturating_add(
+                u32::try_from(rendered as u64 * 1000 / u64::from(SAMPLE_RATE)).unwrap_or(u32::MAX),
+            );
+            player.handle_packet(
+                Some((
+                    AudioPacketPosition {
+                        position_ms,
+                        skipped: false,
+                    },
+                    AudioPacket::Samples(vec![0.5; frames * NUM_CHANNELS as usize]),
+                )),
+                1.0,
+            );
+            rendered += frames;
+        }
+    }
+
+    fn drain_events(events: &mut PlayerEventChannel) -> Vec<PlayerEvent> {
+        let mut drained = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            drained.push(event);
+        }
+        drained
+    }
+
+    fn is_ordinary_ownership_event(event: &PlayerEvent) -> bool {
+        matches!(
+            event,
+            PlayerEvent::PlayRequestIdChanged { .. }
+                | PlayerEvent::Stopped { .. }
+                | PlayerEvent::Loading { .. }
+                | PlayerEvent::Preloading { .. }
+                | PlayerEvent::Playing { .. }
+                | PlayerEvent::Paused { .. }
+                | PlayerEvent::TimeToPreloadNextTrack { .. }
+                | PlayerEvent::EndOfTrack { .. }
+                | PlayerEvent::Unavailable { .. }
+                | PlayerEvent::LoadFailed { .. }
+                | PlayerEvent::TrackChanged { .. }
+        )
     }
 
     #[test]
@@ -5985,7 +6398,7 @@ mod tests {
             .expect("test requires a worker-backed secondary")
     }
 
-    fn wait_until(message: &str, condition: impl Fn() -> bool) {
+    fn wait_until(message: &str, mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(1);
         while !condition() {
             assert!(Instant::now() < deadline, "{message}");
@@ -6417,6 +6830,7 @@ mod tests {
             crossfade_load_ack: None,
             preview_authority: None,
             preview: None,
+            last_preview_post_roll_frames: None,
             normalisation_peaks: [0.0; 2],
             normalisation_integrators: [0.0; 2],
             normalisation_channel: 0,
@@ -6937,6 +7351,80 @@ mod tests {
         );
         assert_eq!(player.preview_pcm_consumed_for_test(), 0);
         assert!(matches!(player.preload, PlayerPreload::Ready { .. }));
+    }
+
+    #[test]
+    fn preview_transition_uses_existing_engine_then_hands_off_without_promotion_events() {
+        let (_runtime, mut player, mut events) = armed_preview_test_player();
+        render_through_transition(&mut player);
+        let events = drain_events(&mut events);
+
+        assert!(matches!(
+            player.preview.as_ref().map(|preview| &preview.phase),
+            Some(PreviewPhase::PostRoll { .. })
+        ));
+        assert!(!events.iter().any(is_ordinary_ownership_event));
+        assert!(player.crossfade_load_ack.is_none());
+    }
+
+    #[test]
+    fn preview_b_plays_exactly_three_seconds_then_completes() {
+        let (_runtime, mut player, mut events) = armed_preview_test_player();
+        render_through_transition(&mut player);
+        drain_events(&mut events);
+
+        player.handle_packet(
+            Some((
+                AudioPacketPosition {
+                    position_ms: 8_329,
+                    skipped: false,
+                },
+                AudioPacket::Samples(vec![0.25; (132_300 + 512) * NUM_CHANNELS as usize]),
+            )),
+            1.0,
+        );
+        let events = drain_events(&mut events);
+
+        assert_eq!(player.preview_post_roll_frames_written_for_test(), 132_300);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::PreviewCompleted { .. }))
+        );
+        assert!(!events.iter().any(is_ordinary_ownership_event));
+    }
+
+    #[test]
+    fn preview_b_early_eof_is_failure_not_end_of_track() {
+        let (_runtime, mut player, mut events) = armed_preview_test_player();
+        render_through_transition(&mut player);
+        drain_events(&mut events);
+
+        player.handle_packet(
+            Some((
+                AudioPacketPosition {
+                    position_ms: 8_329,
+                    skipped: false,
+                },
+                AudioPacket::Samples(vec![0.25; 132_299 * NUM_CHANNELS as usize]),
+            )),
+            1.0,
+        );
+        player.handle_packet(None, 1.0);
+        let events = drain_events(&mut events);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PlayerEvent::PreviewFailed {
+                reason: PreviewFailure::PrematureIncomingEof,
+                ..
+            }
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::EndOfTrack { .. }))
+        );
     }
 
     #[test]
