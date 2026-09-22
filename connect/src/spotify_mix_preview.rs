@@ -4,7 +4,15 @@ use librespot_protocol::{automix_preview::AutomixPreview, spotify_auto_mix_metad
 use protobuf::Message;
 use sha1::{Digest, Sha1};
 
-use crate::spotify_mix::{SpotifyTransitionError, SpotifyTransitionRecipe, item_speeds_match};
+use librespot_playback::TransitionPlan;
+
+use crate::{
+    spotify_mix::{
+        SpotifyRecipeMaterialization, SpotifyRecipePlanError, SpotifyTransitionError,
+        SpotifyTransitionRecipe, item_speeds_match, materialize_spotify_recipe,
+    },
+    spotify_mix_style::{ResolvedSpotifyStyle, SpotifyStyleResolutionError},
+};
 
 pub(crate) const PREVIEW_WINDOW_MS: u32 = 3_000;
 const MAX_PREVIEW_PARAMETERS_LEN: usize = 16 * 1024;
@@ -77,6 +85,62 @@ pub(crate) struct AutomixPreviewRequest {
     pub item_speed_b_bits: u64,
     pub recipe: SpotifyTransitionRecipe,
     pub fingerprint: PreviewFingerprint,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PreviewResolution {
+    NoTransition { preset_id: i32 },
+    Playable(ResolvedAutomixPreview),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedAutomixPreview {
+    pub request: AutomixPreviewRequest,
+    pub preset_id: i32,
+    pub style: Box<ResolvedSpotifyStyle>,
+    pub plan: TransitionPlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AutomixPreviewResolutionError {
+    MissingPreset,
+    UnknownPreset(i32),
+    UnsupportedRenderer { preset_id: i32 },
+}
+
+pub(crate) fn resolve_automix_preview(
+    request: AutomixPreviewRequest,
+) -> Result<PreviewResolution, AutomixPreviewResolutionError> {
+    let preset_id = request.recipe.preset().map(|preset| preset.id());
+    match materialize_spotify_recipe(&request.recipe) {
+        Ok(SpotifyRecipeMaterialization::None { preset_id }) => {
+            Ok(PreviewResolution::NoTransition { preset_id })
+        }
+        Ok(SpotifyRecipeMaterialization::Playable {
+            preset_id,
+            style,
+            plan,
+        }) => Ok(PreviewResolution::Playable(ResolvedAutomixPreview {
+            request,
+            preset_id,
+            style,
+            plan,
+        })),
+        Err(SpotifyRecipePlanError::MissingPreset) => {
+            Err(AutomixPreviewResolutionError::MissingPreset)
+        }
+        Err(SpotifyRecipePlanError::Style(SpotifyStyleResolutionError::UnknownPreset(id))) => {
+            Err(AutomixPreviewResolutionError::UnknownPreset(id))
+        }
+        Err(SpotifyRecipePlanError::Style(
+            SpotifyStyleResolutionError::UnsupportedVolumeStyle(_),
+        ))
+        | Err(SpotifyRecipePlanError::UnsupportedRenderer) => {
+            Err(AutomixPreviewResolutionError::UnsupportedRenderer {
+                preset_id: preset_id.unwrap_or_default(),
+            })
+        }
+    }
 }
 
 pub(crate) fn decode_automix_preview(
@@ -366,11 +430,15 @@ fn hash_field(hash: &mut Sha1, tag: &[u8], value: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use data_encoding::BASE64;
     use librespot_core::dealer::protocol::request::{LoggingParams, SignalCommand};
     use librespot_protocol::{
         automix_preview::AutomixPreview,
-        automix_transition::{Overlap, Preset, Transition},
+        automix_transition::{
+            EqCurveOverrides, EqStyle, FilterFxStyle, Overlap, Preset, Transition,
+        },
     };
     use protobuf::{Message, MessageField};
 
@@ -432,6 +500,14 @@ mod tests {
                 }),
                 preset: MessageField::some(Preset {
                     id: Some(10),
+                    eq_style_override: MessageField::some(EqStyle {
+                        id: Some(0),
+                        ..Default::default()
+                    }),
+                    filter_fx_style_override: MessageField::some(FilterFxStyle {
+                        id: Some(0),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -473,6 +549,32 @@ mod tests {
         wire
     }
 
+    fn with_preset(preset_id: i32) -> AutomixPreview {
+        let mut wire = valid_preview_proto();
+        wire.transition_recipe
+            .mut_or_insert_default()
+            .preset
+            .mut_or_insert_default()
+            .id = Some(preset_id);
+        wire
+    }
+
+    fn with_custom_curve() -> AutomixPreview {
+        let mut wire = valid_preview_proto();
+        wire.transition_recipe
+            .mut_or_insert_default()
+            .preset
+            .mut_or_insert_default()
+            .eq_out_curve_overrides = MessageField::some(EqCurveOverrides::default());
+        wire
+    }
+
+    fn resolve_wire(
+        wire: AutomixPreview,
+    ) -> Result<PreviewResolution, AutomixPreviewResolutionError> {
+        resolve_automix_preview(decode_wire(wire).unwrap())
+    }
+
     #[test]
     fn valid_relative_preview_decodes_with_exact_positions_and_presence() {
         let request = decode_automix_preview(&signal(valid_preview_proto())).unwrap();
@@ -481,6 +583,34 @@ mod tests {
         assert_eq!(request.incoming_load_position_ms, 944);
         assert!(request.fields.transition_uri);
         assert!(!request.fields.stop_position_ms);
+    }
+
+    #[test]
+    fn supported_preview_uses_shared_style_and_plan() {
+        let request = decode_wire(valid_preview_proto()).unwrap();
+        let resolved = resolve_automix_preview(request).unwrap();
+        let PreviewResolution::Playable(preview) = resolved else {
+            panic!("must render")
+        };
+        assert_eq!(preview.preset_id, 10);
+        assert_eq!(preview.plan.current_start(), Duration::from_millis(184_812));
+        assert_eq!(preview.plan.next_start(), Duration::from_millis(944));
+    }
+
+    #[test]
+    fn none_is_successful_no_preview_but_unknown_and_custom_are_rejected() {
+        assert!(matches!(
+            resolve_wire(with_preset(0)).unwrap(),
+            PreviewResolution::NoTransition { preset_id: 0 }
+        ));
+        assert_eq!(
+            resolve_wire(with_preset(999)).unwrap_err(),
+            AutomixPreviewResolutionError::UnknownPreset(999)
+        );
+        assert_eq!(
+            resolve_wire(with_custom_curve()).unwrap_err(),
+            AutomixPreviewResolutionError::UnsupportedRenderer { preset_id: 10 }
+        );
     }
 
     #[test]

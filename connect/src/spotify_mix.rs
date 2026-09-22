@@ -155,6 +155,7 @@ pub(crate) struct SpotifyTransitionAttempt {
 #[derive(Clone, Debug)]
 pub(crate) enum SpotifyTransitionResolution {
     Selected(ResolvedSpotifyTransition),
+    #[cfg(test)]
     TerminalNone {
         source: SpotifyTransitionSource,
         provenance: SpotifyTransitionProvenance,
@@ -185,9 +186,23 @@ pub(crate) enum SpotifyTransitionPlanResolution {
     },
 }
 
-enum SpotifyRecipePlanError {
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SpotifyRecipePlanError {
+    MissingPreset,
     Style(SpotifyStyleResolutionError),
     UnsupportedRenderer,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum SpotifyRecipeMaterialization {
+    None {
+        preset_id: i32,
+    },
+    Playable {
+        preset_id: i32,
+        style: Box<ResolvedSpotifyStyle>,
+        plan: TransitionPlan,
+    },
 }
 
 fn reject_candidate(
@@ -263,27 +278,6 @@ fn evaluate_recipe_candidate(
         ));
     }
 
-    let Some(preset) = candidate.recipe.preset() else {
-        return Err(reject_candidate(
-            &candidate,
-            SpotifyTransitionRejection::MissingPreset,
-        ));
-    };
-    let preset_id = preset.id();
-    if preset_id == 0 {
-        return Ok(SpotifyTransitionResolution::TerminalNone {
-            source: candidate.source,
-            provenance: candidate.provenance,
-            edge: candidate.edge,
-        });
-    }
-    if !(0..=22).contains(&preset_id) {
-        return Err(reject_candidate(
-            &candidate,
-            SpotifyTransitionRejection::UnknownPreset(preset_id),
-        ));
-    }
-
     Ok(SpotifyTransitionResolution::Selected(
         ResolvedSpotifyTransition {
             source: candidate.source,
@@ -304,14 +298,36 @@ pub(crate) fn resolve_recipe_sources(
     let mut rejections = Vec::new();
     if let Some(saved) = saved {
         match evaluate_recipe_candidate(active_edge, saved) {
-            Ok(resolution) => return resolution,
+            Ok(SpotifyTransitionResolution::Selected(transition)) => {
+                match classify_recipe_source(transition) {
+                    Ok(resolution) => return resolution,
+                    Err(rejection) => rejections.push(rejection),
+                }
+            }
+            Ok(SpotifyTransitionResolution::TerminalNone { .. }) => {
+                unreachable!("candidate evaluation returns validated recipes")
+            }
+            Ok(SpotifyTransitionResolution::LocalAuto { .. }) => {
+                unreachable!("candidate evaluation returns validated recipes")
+            }
             Err(rejection) => rejections.push(rejection),
         }
     }
     if let Some(backend) = backend {
         if backend_enabled {
             match evaluate_recipe_candidate(active_edge, backend) {
-                Ok(resolution) => return resolution,
+                Ok(SpotifyTransitionResolution::Selected(transition)) => {
+                    match classify_recipe_source(transition) {
+                        Ok(resolution) => return resolution,
+                        Err(rejection) => rejections.push(rejection),
+                    }
+                }
+                Ok(SpotifyTransitionResolution::TerminalNone { .. }) => {
+                    unreachable!("candidate evaluation returns validated recipes")
+                }
+                Ok(SpotifyTransitionResolution::LocalAuto { .. }) => {
+                    unreachable!("candidate evaluation returns validated recipes")
+                }
                 Err(rejection) => rejections.push(rejection),
             }
         } else {
@@ -342,14 +358,29 @@ pub(crate) fn resolve_transition_plan_sources(
 
         match evaluate_recipe_candidate(active_edge, candidate) {
             Ok(SpotifyTransitionResolution::Selected(transition)) => {
-                match transition_plan_for_resolved_recipe(&transition.recipe) {
-                    Ok((style, plan)) => {
+                match materialize_spotify_recipe(&transition.recipe) {
+                    Ok(SpotifyRecipeMaterialization::Playable { style, plan, .. }) => {
                         return SpotifyTransitionPlanResolution::Selected {
                             transition,
-                            style: Box::new(style),
+                            style,
                             plan,
                             rejections,
                         };
+                    }
+                    Ok(SpotifyRecipeMaterialization::None { .. }) => {
+                        return SpotifyTransitionPlanResolution::TerminalNone {
+                            source: transition.source,
+                            provenance: transition.provenance,
+                            edge: transition.edge,
+                            rejections,
+                        };
+                    }
+                    Err(SpotifyRecipePlanError::MissingPreset) => {
+                        rejections.push(SpotifyTransitionAttempt {
+                            source: transition.source,
+                            provenance: transition.provenance,
+                            reason: SpotifyTransitionRejection::MissingPreset,
+                        });
                     }
                     Err(SpotifyRecipePlanError::Style(
                         SpotifyStyleResolutionError::UnknownPreset(preset_id),
@@ -378,6 +409,7 @@ pub(crate) fn resolve_transition_plan_sources(
                     }
                 }
             }
+            #[cfg(test)]
             Ok(SpotifyTransitionResolution::TerminalNone {
                 source,
                 provenance,
@@ -401,15 +433,19 @@ pub(crate) fn resolve_transition_plan_sources(
     SpotifyTransitionPlanResolution::LocalAuto { rejections }
 }
 
-fn transition_plan_for_resolved_recipe(
+pub(crate) fn materialize_spotify_recipe(
     recipe: &SpotifyTransitionRecipe,
-) -> Result<(ResolvedSpotifyStyle, TransitionPlan), SpotifyRecipePlanError> {
+) -> Result<SpotifyRecipeMaterialization, SpotifyRecipePlanError> {
     let overlap = recipe
         .overlap()
         .expect("decoded recipes retain a validated overlap");
     let preset = recipe
         .preset()
-        .expect("selected recipes retain a validated preset");
+        .ok_or(SpotifyRecipePlanError::MissingPreset)?;
+    let preset_id = preset.id();
+    if preset_id == 0 {
+        return Ok(SpotifyRecipeMaterialization::None { preset_id });
+    }
     let style =
         resolve_spotify_style(preset, overlap, false).map_err(SpotifyRecipePlanError::Style)?;
     if !style.unsupported.is_empty()
@@ -421,7 +457,45 @@ fn transition_plan_for_resolved_recipe(
 
     let plan = materialize_volume_plan(overlap, &style)
         .map_err(|_| SpotifyRecipePlanError::UnsupportedRenderer)?;
-    Ok((style, plan))
+    Ok(SpotifyRecipeMaterialization::Playable {
+        preset_id,
+        style: Box::new(style),
+        plan,
+    })
+}
+
+#[cfg(test)]
+fn classify_recipe_source(
+    transition: ResolvedSpotifyTransition,
+) -> Result<SpotifyTransitionResolution, SpotifyTransitionAttempt> {
+    match materialize_spotify_recipe(&transition.recipe) {
+        Ok(SpotifyRecipeMaterialization::None { .. }) => {
+            Ok(SpotifyTransitionResolution::TerminalNone {
+                source: transition.source,
+                provenance: transition.provenance,
+                edge: transition.edge,
+            })
+        }
+        Ok(SpotifyRecipeMaterialization::Playable { .. })
+        | Err(SpotifyRecipePlanError::Style(
+            SpotifyStyleResolutionError::UnsupportedVolumeStyle(_),
+        ))
+        | Err(SpotifyRecipePlanError::UnsupportedRenderer) => {
+            Ok(SpotifyTransitionResolution::Selected(transition))
+        }
+        Err(SpotifyRecipePlanError::MissingPreset) => Err(SpotifyTransitionAttempt {
+            source: transition.source,
+            provenance: transition.provenance,
+            reason: SpotifyTransitionRejection::MissingPreset,
+        }),
+        Err(SpotifyRecipePlanError::Style(SpotifyStyleResolutionError::UnknownPreset(
+            preset_id,
+        ))) => Err(SpotifyTransitionAttempt {
+            source: transition.source,
+            provenance: transition.provenance,
+            reason: SpotifyTransitionRejection::UnknownPreset(preset_id),
+        }),
+    }
 }
 
 fn materialize_volume_plan(
@@ -1688,6 +1762,22 @@ mod tests {
             rejections[0].reason,
             SpotifyTransitionRejection::PreviewOnly
         );
+
+        let preview = resolver_candidate(
+            SpotifyTransitionSource::Saved,
+            SpotifyTransitionProvenance::PreviewSignal,
+            transition(),
+            7,
+        );
+        let SpotifyTransitionPlanResolution::LocalAuto { rejections } =
+            resolve_transition_plan_sources(&active, Some(preview), None, true)
+        else {
+            panic!("preview candidate must not materialize live playback");
+        };
+        assert_eq!(
+            rejections[0].reason,
+            SpotifyTransitionRejection::PreviewOnly
+        );
     }
 
     fn volume_only_transition() -> Transition {
@@ -1719,6 +1809,35 @@ mod tests {
         assert_eq!(plan.current_start(), Duration::from_millis(175_000));
         assert_eq!(plan.next_start(), Duration::from_millis(12_000));
         assert_eq!(plan.duration(), Duration::from_millis(8_000));
+    }
+
+    #[test]
+    fn shared_materializer_preserves_saved_live_plan() {
+        let active = resolver_edge(7);
+        let saved = resolver_candidate(
+            SpotifyTransitionSource::Saved,
+            SpotifyTransitionProvenance::InlineMetadata,
+            volume_only_transition(),
+            7,
+        );
+        let expected = match materialize_spotify_recipe(&saved.recipe).unwrap() {
+            SpotifyRecipeMaterialization::Playable { plan, .. } => plan,
+            SpotifyRecipeMaterialization::None { .. } => panic!("saved recipe must render"),
+        };
+
+        let SpotifyTransitionPlanResolution::Selected { plan, .. } =
+            resolve_transition_plan_sources(&active, Some(saved), None, true)
+        else {
+            panic!("saved recipe must remain selected");
+        };
+        assert_eq!(plan.current_start(), expected.current_start());
+        assert_eq!(plan.next_start(), expected.next_start());
+        assert_eq!(plan.duration(), expected.duration());
+        assert_eq!(
+            plan.next_speed_automation(),
+            expected.next_speed_automation()
+        );
+        assert_eq!(plan, expected, "gain curves and complete plan must match");
     }
 
     #[test]
