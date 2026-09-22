@@ -23,6 +23,7 @@ mod spotify_auto_mix_selection;
 pub mod spotify_materialized_transition;
 mod spotify_mix;
 mod spotify_mix_hydration;
+mod spotify_mix_preview;
 mod spotify_mix_style;
 mod state;
 

@@ -479,15 +479,19 @@ fn materialize_volume_plan(
 }
 
 impl SpotifyTransitionRecipe {
+    pub(crate) fn from_transition(transition: Transition) -> Result<Self, SpotifyTransitionError> {
+        let recipe = Self { transition };
+        recipe.sanity_check()?;
+        Ok(recipe)
+    }
+
     pub(crate) fn from_base64(encoded: &str) -> Result<Self, SpotifyTransitionError> {
         let bytes = BASE64
             .decode(encoded.as_bytes())
             .map_err(|_| SpotifyTransitionError::InvalidBase64)?;
         let transition = Transition::parse_from_bytes(&bytes)
             .map_err(|_| SpotifyTransitionError::InvalidProtobuf)?;
-        let recipe = Self { transition };
-        recipe.sanity_check()?;
-        Ok(recipe)
+        Self::from_transition(transition)
     }
 
     #[cfg(test)]
@@ -544,7 +548,7 @@ impl SpotifyTransitionRecipe {
         Ok(recipe)
     }
 
-    fn overlap(&self) -> Result<&Overlap, SpotifyTransitionError> {
+    pub(crate) fn overlap(&self) -> Result<&Overlap, SpotifyTransitionError> {
         self.transition
             .overlap
             .as_ref()
@@ -693,7 +697,7 @@ impl SpotifyTransitionRecipe {
         ))
     }
 
-    fn preset(&self) -> Option<&Preset> {
+    pub(crate) fn preset(&self) -> Option<&Preset> {
         self.transition.preset.as_ref()
     }
 }
@@ -706,7 +710,7 @@ fn normalized_item_speed(speed: f64) -> f64 {
     }
 }
 
-fn item_speeds_match(left: f64, right: f64) -> bool {
+pub(crate) fn item_speeds_match(left: f64, right: f64) -> bool {
     (normalized_item_speed(left) - normalized_item_speed(right)).abs() <= ITEM_SPEED_TOLERANCE
 }
 

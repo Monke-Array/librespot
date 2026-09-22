@@ -75,6 +75,8 @@ enum SpircError {
     FailedDealerSetup,
     #[error("unknown endpoint: {0:#?}")]
     UnknownEndpoint(serde_json::Value),
+    #[error("unsupported signal: {0}")]
+    UnsupportedSignal(String),
 }
 
 struct LocalAutoTaskResult {
@@ -196,7 +198,7 @@ impl From<SpircError> for Error {
         match err {
             NoData | NoUri(_) => Error::unavailable(err),
             InvalidUri(_) | FailedDealerSetup => Error::aborted(err),
-            UnknownEndpoint(_) => Error::unimplemented(err),
+            UnknownEndpoint(_) | UnsupportedSignal(_) => Error::unimplemented(err),
         }
     }
 }
@@ -1509,6 +1511,7 @@ impl SpircTask {
                 Err(SpircError::NoData)?
             }
             Unknown(unknown) => Err(SpircError::UnknownEndpoint(unknown))?,
+            Signal(signal) => Err(SpircError::UnsupportedSignal(signal.signal_id))?,
             // implicit update of the connect_state
             UpdateContext(update_context) => {
                 if matches!(update_context.context.uri, Some(ref uri) if uri != self.connect_state.context_uri())
