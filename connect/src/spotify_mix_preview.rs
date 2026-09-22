@@ -1,17 +1,21 @@
 use data_encoding::BASE64;
-use librespot_core::{SpotifyUri, dealer::protocol::request::SignalCommand};
+use librespot_core::{
+    SpotifyUri,
+    dealer::{manager::Reply, protocol::request::SignalCommand},
+};
+use librespot_playback::{PreviewAuthority, PreviewGeneration, PreviewToken, TransitionPlan};
 use librespot_protocol::{automix_preview::AutomixPreview, spotify_auto_mix_metadata::Cuepoints};
 use protobuf::Message;
 use sha1::{Digest, Sha1};
-
-use librespot_playback::TransitionPlan;
+use tokio::sync::mpsc;
 
 use crate::{
     spotify_mix::{
         SpotifyRecipeMaterialization, SpotifyRecipePlanError, SpotifyTransitionError,
-        SpotifyTransitionRecipe, item_speeds_match, materialize_spotify_recipe,
+        SpotifyTransitionProvenance, SpotifyTransitionRecipe, item_speeds_match,
+        materialize_spotify_recipe,
     },
-    spotify_mix_style::{ResolvedSpotifyStyle, SpotifyStyleResolutionError},
+    spotify_mix_style::{ResolvedSpotifyStyle, SpotifyStyleIds, SpotifyStyleResolutionError},
 };
 
 pub(crate) const PREVIEW_WINDOW_MS: u32 = 3_000;
@@ -99,6 +103,178 @@ pub(crate) struct ResolvedAutomixPreview {
     pub preset_id: i32,
     pub style: Box<ResolvedSpotifyStyle>,
     pub plan: TransitionPlan,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreviewDescriptor {
+    canonical_a: String,
+    playable_a: String,
+    canonical_b: String,
+    playable_b: String,
+    context_uri: Option<String>,
+    transition_uri: Option<String>,
+    arm_id_present: bool,
+    provenance: SpotifyTransitionProvenance,
+    preset_id: i32,
+    style_ids: SpotifyStyleIds,
+    start_a_ms: u32,
+    start_b_ms: u32,
+    duration_ms: u32,
+    outgoing_load_ms: u32,
+    incoming_load_ms: u32,
+    post_roll_ms: u32,
+    item_speed_a_bits: u64,
+    item_speed_b_bits: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum PreviewAdmission {
+    Start(PreviewToken),
+    Attached(PreviewToken),
+    Replaced {
+        retired: PreviewToken,
+        started: PreviewToken,
+    },
+}
+
+impl PreviewAdmission {
+    pub(crate) fn token(&self) -> &PreviewToken {
+        match self {
+            Self::Start(token) | Self::Attached(token) => token,
+            Self::Replaced { started, .. } => started,
+        }
+    }
+}
+
+pub(crate) struct ActivePreviewSession {
+    token: PreviewToken,
+    fingerprint: PreviewFingerprint,
+    descriptor: PreviewDescriptor,
+    waiters: Vec<mpsc::UnboundedSender<Reply>>,
+}
+
+impl ActivePreviewSession {
+    pub(crate) fn token(&self) -> &PreviewToken {
+        &self.token
+    }
+
+    pub(crate) fn descriptor(&self) -> &PreviewDescriptor {
+        &self.descriptor
+    }
+
+    pub(crate) fn waiter_count(&self) -> usize {
+        self.waiters.len()
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum PreviewCoordinatorError {
+    GenerationExhausted,
+}
+
+#[derive(Default)]
+pub(crate) struct PreviewCoordinator {
+    next_generation: u64,
+    active: Option<ActivePreviewSession>,
+}
+
+impl PreviewCoordinator {
+    pub(crate) fn admit(
+        &mut self,
+        authority: PreviewAuthority,
+        fingerprint: PreviewFingerprint,
+        descriptor: PreviewDescriptor,
+        waiter: mpsc::UnboundedSender<Reply>,
+    ) -> Result<PreviewAdmission, PreviewCoordinatorError> {
+        if let Some(active) = &mut self.active
+            && active.token.authority == authority
+            && active.fingerprint == fingerprint
+        {
+            active.waiters.push(waiter);
+            return Ok(PreviewAdmission::Attached(active.token.clone()));
+        }
+
+        let Some(generation) = self.next_generation.checked_add(1) else {
+            send_reply(waiter, &Reply::Failure);
+            return Err(PreviewCoordinatorError::GenerationExhausted);
+        };
+        self.next_generation = generation;
+        let retired = self.active.take().map(|active| {
+            let token = active.token;
+            drain_waiters(active.waiters, &Reply::Failure);
+            token
+        });
+        let token = PreviewToken {
+            authority,
+            generation: PreviewGeneration(generation),
+        };
+        self.active = Some(ActivePreviewSession {
+            token: token.clone(),
+            fingerprint,
+            descriptor,
+            waiters: vec![waiter],
+        });
+        Ok(match retired {
+            Some(retired) => PreviewAdmission::Replaced {
+                retired,
+                started: token,
+            },
+            None => PreviewAdmission::Start(token),
+        })
+    }
+
+    pub(crate) fn active(&self) -> Option<&ActivePreviewSession> {
+        self.active.as_ref()
+    }
+
+    pub(crate) fn finish(&mut self, token: &PreviewToken, reply: Reply) -> bool {
+        if self.active.as_ref().map(ActivePreviewSession::token) != Some(token) {
+            return false;
+        }
+        let active = self
+            .active
+            .take()
+            .expect("matching active preview was just checked");
+        drain_waiters(active.waiters, &reply);
+        true
+    }
+
+    pub(crate) fn cancel(&mut self, reply: Reply) -> Option<PreviewToken> {
+        self.active.take().map(|active| {
+            let token = active.token;
+            drain_waiters(active.waiters, &reply);
+            token
+        })
+    }
+
+    pub(crate) fn invalidate_authority(
+        &mut self,
+        reply: Reply,
+    ) -> Result<(), PreviewCoordinatorError> {
+        self.cancel(reply);
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .ok_or(PreviewCoordinatorError::GenerationExhausted)?;
+        Ok(())
+    }
+}
+
+fn drain_waiters(waiters: Vec<mpsc::UnboundedSender<Reply>>, reply: &Reply) {
+    for waiter in waiters {
+        send_reply(waiter, reply);
+    }
+}
+
+fn send_reply(waiter: mpsc::UnboundedSender<Reply>, reply: &Reply) {
+    let reply = match reply {
+        Reply::Success => Reply::Success,
+        Reply::Failure => Reply::Failure,
+        Reply::Unanswered => Reply::Unanswered,
+    };
+    if waiter.send(reply).is_err() {
+        debug!("[spotify-preview] dealer waiter disappeared before terminal reply");
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -433,7 +609,11 @@ mod tests {
     use std::time::Duration;
 
     use data_encoding::BASE64;
-    use librespot_core::dealer::protocol::request::{LoggingParams, SignalCommand};
+    use librespot_core::dealer::{
+        manager::Reply,
+        protocol::request::{LoggingParams, SignalCommand},
+    };
+    use librespot_playback::{PreviewAuthority, PreviewGeneration};
     use librespot_protocol::{
         automix_preview::AutomixPreview,
         automix_transition::{
@@ -441,6 +621,7 @@ mod tests {
         },
     };
     use protobuf::{Message, MessageField};
+    use tokio::sync::mpsc::{self, error::TryRecvError};
 
     const TRACK_A: &str = "spotify:track:2TpxZ7JUBn3uw46aR7qd6V";
     const TRACK_B: &str = "spotify:track:4uLU6hMCjMI75M1A2tKUQC";
@@ -575,6 +756,72 @@ mod tests {
         resolve_automix_preview(decode_wire(wire).unwrap())
     }
 
+    fn reply_channel() -> (mpsc::UnboundedSender<Reply>, mpsc::UnboundedReceiver<Reply>) {
+        mpsc::unbounded_channel()
+    }
+
+    fn authority(generation: u64) -> PreviewAuthority {
+        PreviewAuthority {
+            connect_session_id: "connect-session".to_owned(),
+            normal_ownership_generation: generation,
+        }
+    }
+
+    fn fingerprint(byte: u8) -> PreviewFingerprint {
+        PreviewFingerprint([byte; 20])
+    }
+
+    fn descriptor() -> PreviewDescriptor {
+        PreviewDescriptor {
+            canonical_a: TRACK_A.to_owned(),
+            playable_a: TRACK_A.to_owned(),
+            canonical_b: TRACK_B.to_owned(),
+            playable_b: TRACK_B.to_owned(),
+            context_uri: Some("spotify:playlist:mixer".to_owned()),
+            transition_uri: Some("spotify:transition:captured".to_owned()),
+            arm_id_present: true,
+            provenance: crate::spotify_mix::SpotifyTransitionProvenance::PreviewSignal,
+            preset_id: 10,
+            style_ids: crate::spotify_mix_style::SpotifyStyleIds {
+                volume: 7,
+                eq: 0,
+                filter_fx: 0,
+                fx: 0,
+                jogwheel: 0,
+                looping: 0,
+            },
+            start_a_ms: 184_812,
+            start_b_ms: 944,
+            duration_ms: 7_385,
+            outgoing_load_ms: 181_812,
+            incoming_load_ms: 944,
+            post_roll_ms: 3_000,
+            item_speed_a_bits: 1.0_f64.to_bits(),
+            item_speed_b_bits: 1.0_f64.to_bits(),
+        }
+    }
+
+    fn admit_with_presence(
+        coordinator: &mut PreviewCoordinator,
+        context_present: bool,
+    ) -> librespot_playback::PreviewToken {
+        let mut value = descriptor();
+        if !context_present {
+            value.context_uri = None;
+        }
+        let (tx, _rx) = reply_channel();
+        coordinator
+            .admit(
+                authority(7),
+                fingerprint(u8::from(context_present)),
+                value,
+                tx,
+            )
+            .unwrap()
+            .token()
+            .clone()
+    }
+
     #[test]
     fn valid_relative_preview_decodes_with_exact_positions_and_presence() {
         let request = decode_automix_preview(&signal(valid_preview_proto())).unwrap();
@@ -611,6 +858,102 @@ mod tests {
             resolve_wire(with_custom_curve()).unwrap_err(),
             AutomixPreviewResolutionError::UnsupportedRenderer { preset_id: 10 }
         );
+    }
+
+    #[test]
+    fn identical_duplicate_attaches_without_new_generation() {
+        let mut coordinator = PreviewCoordinator::default();
+        let (first_tx, _first_rx) = reply_channel();
+        let first = coordinator
+            .admit(authority(7), fingerprint(1), descriptor(), first_tx)
+            .unwrap();
+        let (duplicate_tx, _duplicate_rx) = reply_channel();
+        let duplicate = coordinator
+            .admit(authority(7), fingerprint(1), descriptor(), duplicate_tx)
+            .unwrap();
+        assert_eq!(duplicate, PreviewAdmission::Attached(first.token().clone()));
+        assert_eq!(coordinator.active().unwrap().waiter_count(), 2);
+    }
+
+    #[test]
+    fn materially_different_request_replaces_and_fails_old_waiters() {
+        let mut coordinator = PreviewCoordinator::default();
+        let (old_tx, mut old_rx) = reply_channel();
+        let first = coordinator
+            .admit(authority(7), fingerprint(1), descriptor(), old_tx)
+            .unwrap();
+        let (new_tx, mut new_rx) = reply_channel();
+        let second = coordinator
+            .admit(authority(7), fingerprint(2), descriptor(), new_tx)
+            .unwrap();
+        assert!(second.token().generation.0 > first.token().generation.0);
+        assert!(matches!(old_rx.try_recv(), Ok(Reply::Failure)));
+        assert!(matches!(new_rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn optional_presence_difference_is_material_and_stale_finish_is_ignored() {
+        let mut coordinator = PreviewCoordinator::default();
+        let first = admit_with_presence(&mut coordinator, false);
+        let second = admit_with_presence(&mut coordinator, true);
+        assert_ne!(first, second);
+        assert!(!coordinator.finish(&first, Reply::Success));
+        assert_eq!(coordinator.active().unwrap().token(), &second);
+    }
+
+    #[test]
+    fn terminal_paths_drain_waiters_and_authority_invalidation_consumes_generation() {
+        let mut coordinator = PreviewCoordinator::default();
+        let (first_tx, mut first_rx) = reply_channel();
+        let first = coordinator
+            .admit(authority(7), fingerprint(1), descriptor(), first_tx)
+            .unwrap()
+            .token()
+            .clone();
+        assert!(coordinator.finish(&first, Reply::Success));
+        assert!(matches!(first_rx.try_recv(), Ok(Reply::Success)));
+        assert!(coordinator.active().is_none());
+
+        coordinator.invalidate_authority(Reply::Failure).unwrap();
+        let (next_tx, mut next_rx) = reply_channel();
+        let next = coordinator
+            .admit(authority(8), fingerprint(2), descriptor(), next_tx)
+            .unwrap()
+            .token()
+            .clone();
+        assert_eq!(next.generation, PreviewGeneration(first.generation.0 + 2));
+        assert_eq!(coordinator.cancel(Reply::Failure), Some(next.clone()));
+        assert!(matches!(next_rx.try_recv(), Ok(Reply::Failure)));
+        assert!(coordinator.active().is_none());
+    }
+
+    #[test]
+    fn generation_exhaustion_fails_the_new_waiter_without_reusing_a_token() {
+        let mut coordinator = PreviewCoordinator {
+            next_generation: u64::MAX,
+            active: None,
+        };
+        let (tx, mut rx) = reply_channel();
+        assert_eq!(
+            coordinator.admit(authority(7), fingerprint(1), descriptor(), tx),
+            Err(PreviewCoordinatorError::GenerationExhausted)
+        );
+        assert!(matches!(rx.try_recv(), Ok(Reply::Failure)));
+        assert!(coordinator.active().is_none());
+    }
+
+    #[test]
+    fn disappeared_dealer_responder_does_not_block_terminal_completion() {
+        let mut coordinator = PreviewCoordinator::default();
+        let (tx, rx) = reply_channel();
+        let token = coordinator
+            .admit(authority(7), fingerprint(1), descriptor(), tx)
+            .unwrap()
+            .token()
+            .clone();
+        drop(rx);
+        assert!(coordinator.finish(&token, Reply::Success));
+        assert!(coordinator.active().is_none());
     }
 
     #[test]
