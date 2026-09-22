@@ -232,6 +232,7 @@ struct PlayerInternal {
     preview_authority: Option<PreviewAuthority>,
     preview: Option<PreviewOwner>,
     last_preview_post_roll_frames: Option<usize>,
+    last_preview_restore_outcome: Option<PreviewRestoreOutcome>,
 
     // The dynamic limiter is one global output-stage processor after transition mixing.
     normalisation_integrators: [f64; 2],
@@ -749,6 +750,7 @@ impl Player {
                 preview_authority: None,
                 preview: None,
                 last_preview_post_roll_frames: None,
+                last_preview_restore_outcome: None,
 
                 normalisation_peaks: [0.0; 2],
                 normalisation_integrators: [0.0; 2],
@@ -3931,27 +3933,15 @@ impl PlayerInternal {
     }
 
     fn complete_preview_playback(&mut self, token: PreviewToken) {
-        let matches = self
-            .preview
-            .as_ref()
-            .is_some_and(|preview| preview.request.token == token);
-        if !matches {
+        let restore = self.terminate_preview(
+            &token,
+            RetainedPlaybackDisposition::Restore,
+            PreviewRestoreOutcome::DiscardedByAuthority,
+        );
+        if restore == PreviewRestoreOutcome::NotOwned {
             return;
         }
-        let preview = self.preview.take().expect("matching preview checked above");
-        let frames_written = match preview.phase {
-            PreviewPhase::PostRoll { frames_written, .. } => frames_written,
-            PreviewPhase::Loading | PreviewPhase::Transition => 0,
-        };
-        self.last_preview_post_roll_frames = Some(frames_written);
-        self.state = PlayerState::Stopped;
-        self.preload = PlayerPreload::None;
-        self.transition_owner = None;
-        self.ensure_sink_stopped(true);
-        self.send_event(PlayerEvent::PreviewCompleted {
-            token,
-            restore: PreviewRestoreOutcome::NotOwned,
-        });
+        self.send_event(PlayerEvent::PreviewCompleted { token, restore });
     }
 
     fn complete_crossfade(&mut self) -> PlayerResult {
@@ -4786,45 +4776,113 @@ impl PlayerInternal {
         &mut self,
         token: &PreviewToken,
         reason: PreviewCancelReason,
-        _retained: RetainedPlaybackDisposition,
+        retained: RetainedPlaybackDisposition,
     ) {
+        let discarded = if reason == PreviewCancelReason::SessionChanged {
+            PreviewRestoreOutcome::DiscardedByAuthority
+        } else {
+            PreviewRestoreOutcome::DiscardedByCommand
+        };
+        let restore = self.terminate_preview(token, retained, discarded);
+        if restore == PreviewRestoreOutcome::NotOwned {
+            return;
+        }
+        self.send_event(PlayerEvent::PreviewCancelled {
+            token: token.clone(),
+            reason,
+            restore,
+        });
+    }
+
+    fn fail_preview(&mut self, token: PreviewToken, reason: PreviewFailure) {
+        let restore = self.terminate_preview(
+            &token,
+            RetainedPlaybackDisposition::Restore,
+            PreviewRestoreOutcome::DiscardedByAuthority,
+        );
+        if restore == PreviewRestoreOutcome::NotOwned {
+            return;
+        }
+        self.send_event(PlayerEvent::PreviewFailed {
+            token,
+            reason,
+            restore,
+        });
+    }
+
+    fn terminate_preview(
+        &mut self,
+        token: &PreviewToken,
+        disposition: RetainedPlaybackDisposition,
+        discarded: PreviewRestoreOutcome,
+    ) -> PreviewRestoreOutcome {
         let matches = self
             .preview
             .as_ref()
             .is_some_and(|preview| &preview.request.token == token);
         if !matches {
-            return;
+            return PreviewRestoreOutcome::NotOwned;
         }
-        self.preview.take();
+        let owner = self.preview.take().expect("matching preview checked above");
+        if let PreviewPhase::PostRoll { frames_written, .. } = owner.phase {
+            self.last_preview_post_roll_frames = Some(frames_written);
+        }
         self.state = PlayerState::Stopped;
-        self.cancel_secondary_source("preview cancelled");
+        self.cancel_secondary_source("preview terminal cleanup");
         self.transition_owner = None;
+        self.crossfade_load_ack = None;
         self.ensure_sink_stopped(true);
-        self.send_event(PlayerEvent::PreviewCancelled {
-            token: token.clone(),
-            reason,
-            restore: PreviewRestoreOutcome::NotOwned,
-        });
+
+        let authority_valid = self.preview_authority.as_ref() == Some(&token.authority)
+            && self.session.session_id() == token.authority.connect_session_id;
+        let outcome = if disposition == RetainedPlaybackDisposition::Restore && authority_valid {
+            self.resume_retained_playback(owner.retained)
+        } else if disposition == RetainedPlaybackDisposition::Restore {
+            PreviewRestoreOutcome::DiscardedByAuthority
+        } else {
+            discarded
+        };
+        self.last_preview_restore_outcome = Some(outcome);
+        outcome
     }
 
-    fn fail_preview(&mut self, token: PreviewToken, reason: PreviewFailure) {
-        if !self
-            .preview
-            .as_ref()
-            .is_some_and(|preview| preview.request.token == token)
-        {
-            return;
+    fn resume_retained_playback(&mut self, retained: RetainedPlayback) -> PreviewRestoreOutcome {
+        self.state = retained.state;
+        self.recovery = retained.recovery;
+        match &mut self.state {
+            PlayerState::Playing {
+                track_id,
+                play_request_id,
+                source,
+                owner: SourceOwner::Normal,
+            } => {
+                let position_ms = source.stream_position_ms;
+                source.reported_nominal_start_time =
+                    Instant::now().checked_sub(Duration::from_millis(u64::from(position_ms)));
+                let event = PlayerEvent::PositionCorrection {
+                    track_id: track_id.clone(),
+                    play_request_id: *play_request_id,
+                    position_ms,
+                };
+                if retained.sink_was_running {
+                    self.ensure_sink_running();
+                }
+                self.send_event(event);
+            }
+            PlayerState::Paused { .. }
+            | PlayerState::Loading { .. }
+            | PlayerState::EndOfTrack { .. }
+            | PlayerState::Stopped => self.ensure_sink_stopped(false),
+            PlayerState::Playing {
+                owner: SourceOwner::Preview(_),
+                ..
+            }
+            | PlayerState::Invalid => {
+                self.state = PlayerState::Stopped;
+                return PreviewRestoreOutcome::DiscardedByAuthority;
+            }
         }
-        self.preview.take();
-        self.state = PlayerState::Stopped;
-        self.cancel_secondary_source("preview source load failed");
-        self.transition_owner = None;
-        self.ensure_sink_stopped(true);
-        self.send_event(PlayerEvent::PreviewFailed {
-            token,
-            reason,
-            restore: PreviewRestoreOutcome::NotOwned,
-        });
+        PreviewRestoreOutcome::Restored
     }
 
     #[cfg(test)]
@@ -4889,6 +4947,27 @@ impl PlayerInternal {
         })
     }
 
+    #[cfg(test)]
+    fn inject_preview_completion_for_test(&mut self, token: PreviewToken) {
+        self.complete_preview_playback(token);
+    }
+
+    #[cfg(test)]
+    fn last_restore_outcome_for_test(&self) -> Option<PreviewRestoreOutcome> {
+        self.last_preview_restore_outcome
+    }
+
+    #[cfg(test)]
+    fn current_position_for_test(&self) -> Option<u32> {
+        match &self.state {
+            PlayerState::Loading { position_ms, .. } => Some(*position_ms),
+            PlayerState::Paused { source, .. }
+            | PlayerState::Playing { source, .. }
+            | PlayerState::EndOfTrack { source, .. } => Some(source.stream_position_ms),
+            PlayerState::Stopped | PlayerState::Invalid => None,
+        }
+    }
+
     fn handle_command(&mut self, cmd: PlayerCommand) -> PlayerResult {
         let _timing = crate::core::runtime_trace::SlowOperation::new("player_command", 10);
         crate::core::runtime_trace!(
@@ -4899,6 +4978,24 @@ impl PlayerInternal {
             self.preload.track_id()
         );
         debug!("command={cmd:?}");
+        let preemption = match &cmd {
+            PlayerCommand::Preload { .. }
+            | PlayerCommand::Play
+            | PlayerCommand::Pause
+            | PlayerCommand::Seek(_) => Some(RetainedPlaybackDisposition::Restore),
+            PlayerCommand::Load { .. } | PlayerCommand::Stop | PlayerCommand::SetSession(_) => {
+                Some(RetainedPlaybackDisposition::Discard)
+            }
+            _ => None,
+        };
+        if let Some(disposition) = preemption
+            && let Some(token) = self
+                .preview
+                .as_ref()
+                .map(|preview| preview.request.token.clone())
+        {
+            self.cancel_preview_owned(&token, PreviewCancelReason::NormalCommand, disposition);
+        }
         match cmd {
             PlayerCommand::Load {
                 track_id,
@@ -5911,6 +6008,20 @@ mod tests {
         }
     }
 
+    fn preview_token_for_player(
+        player: &PlayerInternal,
+        preview_generation: u64,
+        normal_generation: u64,
+    ) -> PreviewToken {
+        PreviewToken {
+            authority: PreviewAuthority {
+                connect_session_id: player.session.session_id().to_owned(),
+                normal_ownership_generation: normal_generation,
+            },
+            generation: PreviewGeneration(preview_generation),
+        }
+    }
+
     fn preview_request(token: PreviewToken) -> PreviewPlaybackRequest {
         let gain = |from, to| {
             GainCurve::new(vec![GainCurveSegment {
@@ -6831,6 +6942,7 @@ mod tests {
             preview_authority: None,
             preview: None,
             last_preview_post_roll_frames: None,
+            last_preview_restore_outcome: None,
             normalisation_peaks: [0.0; 2],
             normalisation_integrators: [0.0; 2],
             normalisation_channel: 0,
@@ -7425,6 +7537,146 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, PlayerEvent::EndOfTrack { .. }))
         );
+    }
+
+    #[test]
+    fn newer_authority_or_session_prevents_stale_restore() {
+        let runtime = tokio::runtime::Runtime::new().expect("preview restore runtime");
+        let _guard = runtime.enter();
+        let old = preview_token(1, 9);
+        let mut player = playing_test_player_at(42_123);
+        begin_preview_for_test(&mut player, preview_request(old.clone()));
+        player
+            .handle_command(PlayerCommand::SetPreviewAuthority {
+                authority: preview_authority(10),
+                retained: RetainedPlaybackDisposition::Discard,
+                reason: PreviewCancelReason::SessionChanged,
+            })
+            .unwrap();
+
+        player.inject_preview_completion_for_test(old);
+
+        assert_eq!(
+            player.last_restore_outcome_for_test(),
+            Some(PreviewRestoreOutcome::DiscardedByAuthority)
+        );
+        assert_ne!(player.current_position_for_test(), Some(42_123));
+    }
+
+    #[test]
+    fn completed_preview_restores_exact_retained_source_and_play_intent() {
+        let runtime = tokio::runtime::Runtime::new().expect("preview restore runtime");
+        let _guard = runtime.enter();
+        let mut player = playing_test_player_at(42_123);
+        let token = preview_token_for_player(&player, 1, 9);
+        begin_preview_for_test(&mut player, preview_request(token.clone()));
+
+        player.complete_preview_playback(token);
+
+        assert_eq!(player.current_position_for_test(), Some(42_123));
+        assert!(player.state.is_playing());
+        assert_eq!(
+            player.last_restore_outcome_for_test(),
+            Some(PreviewRestoreOutcome::Restored)
+        );
+    }
+
+    #[test]
+    fn retained_paused_source_remains_paused_after_preview() {
+        let runtime = tokio::runtime::Runtime::new().expect("preview restore runtime");
+        let _guard = runtime.enter();
+        let mut player = playing_test_player_at(9_876);
+        player.state.playing_to_paused();
+        let token = preview_token_for_player(&player, 1, 9);
+        begin_preview_for_test(&mut player, preview_request(token.clone()));
+
+        player.complete_preview_playback(token);
+
+        assert_eq!(player.current_position_for_test(), Some(9_876));
+        assert!(matches!(player.state, PlayerState::Paused { .. }));
+    }
+
+    #[test]
+    fn retained_stopped_state_resumes_without_preview_source_events() {
+        let runtime = tokio::runtime::Runtime::new().expect("preview restore runtime");
+        let _guard = runtime.enter();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        let mut player = player_internal_with_sink(&runtime, starts, stops);
+        player.state = PlayerState::Stopped;
+        let mut events = preview_event_channel(&mut player);
+        let token = preview_token_for_player(&player, 1, 9);
+        begin_preview_for_test(&mut player, preview_request(token.clone()));
+
+        player.complete_preview_playback(token);
+        let events = drain_events(&mut events);
+
+        assert!(player.preview.is_none());
+        assert!(matches!(player.state, PlayerState::Stopped));
+        assert!(!events.iter().any(is_ordinary_ownership_event));
+    }
+
+    #[test]
+    fn every_normal_playback_command_preempts_before_execution() {
+        for case in 0..7 {
+            let runtime = tokio::runtime::Runtime::new().expect("preview preemption runtime");
+            let _guard = runtime.enter();
+            let mut player = playing_test_player_at(42_123);
+            let mut events = preview_event_channel(&mut player);
+            let token = preview_token_for_player(&player, 1, 9);
+            begin_preview_for_test(&mut player, preview_request(token));
+            let command = match case {
+                0 => PlayerCommand::Load {
+                    track_id: next_track_uri(),
+                    play: true,
+                    position_ms: 0,
+                },
+                1 => PlayerCommand::Preload {
+                    track_id: next_track_uri(),
+                    transition: PreloadTransition::SafetyFallback,
+                },
+                2 => PlayerCommand::Play,
+                3 => PlayerCommand::Pause,
+                4 => PlayerCommand::Stop,
+                5 => PlayerCommand::Seek(43_000),
+                6 => PlayerCommand::SetSession(session(&runtime)),
+                _ => unreachable!(),
+            };
+
+            player.handle_command(command).expect("normal command");
+            let events = drain_events(&mut events);
+
+            assert!(player.preview.is_none());
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, PlayerEvent::PreviewCancelled { .. }))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn stale_renderer_completion_after_preemption_cannot_restore_or_promote() {
+        let runtime = tokio::runtime::Runtime::new().expect("preview preemption runtime");
+        let _guard = runtime.enter();
+        let mut player = playing_test_player_at(42_123);
+        let token = preview_token_for_player(&player, 1, 9);
+        begin_preview_for_test(&mut player, preview_request(token.clone()));
+        player
+            .handle_command(PlayerCommand::Load {
+                track_id: next_track_uri(),
+                play: true,
+                position_ms: 0,
+            })
+            .unwrap();
+        let after = format!("{:?}", player.state);
+
+        player.complete_preview_playback(token);
+
+        assert_eq!(format!("{:?}", player.state), after);
+        assert!(player.crossfade_load_ack.is_none());
     }
 
     #[test]
