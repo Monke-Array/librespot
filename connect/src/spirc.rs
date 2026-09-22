@@ -40,6 +40,10 @@ use crate::{
         CacheLookup, HydrationResult, TransitionDataClient, TransitionHydrationCache,
         TransitionHydrationKey, hydrate_transition_data, transition_uri,
     },
+    spotify_mix_preview::{
+        PreviewAdmission, PreviewCoordinator, PreviewDescriptor, PreviewResolution,
+        decode_automix_preview, resolve_automix_preview,
+    },
     state::{
         context::{ContextType, ResetContext},
         provider::IsProvider,
@@ -47,6 +51,11 @@ use crate::{
     },
 };
 use futures_util::StreamExt;
+use librespot_core::dealer::protocol::request::SignalCommand;
+use librespot_playback::{
+    PreviewAuthority, PreviewCancelReason, PreviewPlaybackRequest, PreviewToken, PreviewTrack,
+    RetainedPlaybackDisposition,
+};
 use librespot_protocol::context_page::ContextPage;
 use librespot_protocol::player::ProvidedTrack;
 use protobuf::MessageField;
@@ -77,6 +86,8 @@ enum SpircError {
     UnknownEndpoint(serde_json::Value),
     #[error("unsupported signal: {0}")]
     UnsupportedSignal(String),
+    #[error("Spotify preview ownership generation exhausted")]
+    PreviewGenerationExhausted,
 }
 
 struct LocalAutoTaskResult {
@@ -199,8 +210,15 @@ impl From<SpircError> for Error {
             NoData | NoUri(_) => Error::unavailable(err),
             InvalidUri(_) | FailedDealerSetup => Error::aborted(err),
             UnknownEndpoint(_) | UnsupportedSignal(_) => Error::unimplemented(err),
+            PreviewGenerationExhausted => Error::failed_precondition(err),
         }
     }
+}
+
+#[derive(Default)]
+struct PreviewSpircOwnership {
+    coordinator: PreviewCoordinator,
+    normal_ownership_generation: u64,
 }
 
 struct SpircTask {
@@ -231,6 +249,7 @@ struct SpircTask {
     transition_hydration_cache: TransitionHydrationCache,
     transition_hydrations: JoinSet<HydrationResult>,
     transition_edge_generation: u64,
+    preview_ownership: PreviewSpircOwnership,
     local_auto_pair: Option<LocalAutoPairState>,
     local_auto_current_identity: Option<AutoTrackIdentity>,
     local_auto_tasks: JoinSet<LocalAutoTaskResult>,
@@ -328,6 +347,55 @@ enum PlayerQueueAction {
     Preserve,
     Advance,
     Unavailable { track_id: SpotifyUri, advance: bool },
+}
+
+fn send_dealer_reply(sender: mpsc::UnboundedSender<Reply>, reply: Reply) {
+    if sender.send(reply).is_err() {
+        debug!("[spotify-preview] dealer responder disappeared before terminal reply");
+    }
+}
+
+fn dealer_preview_preemption(
+    command: &Command,
+) -> Option<(PreviewCancelReason, RetainedPlaybackDisposition)> {
+    use Command::*;
+    let retained = match command {
+        Pause(_)
+        | SeekTo(_)
+        | Resume(_)
+        | SetShufflingContext(_)
+        | SetRepeatingTrack(_)
+        | SetRepeatingContext(_)
+        | AddToQueue(_)
+        | SetQueue(_)
+        | SetOptions(_)
+        | UpdateContext(_) => RetainedPlaybackDisposition::Restore,
+        Transfer(_) | Play(_) | SkipNext(_) | SkipPrev(_) => RetainedPlaybackDisposition::Discard,
+        Signal(_) | Unknown(_) => return None,
+    };
+    Some((PreviewCancelReason::NormalCommand, retained))
+}
+
+fn local_preview_preemption(
+    command: &SpircCommand,
+) -> Option<(PreviewCancelReason, RetainedPlaybackDisposition)> {
+    use SpircCommand::*;
+    let retained = match command {
+        Play | PlayPause | Pause | SetPosition(_) | Shuffle(_) | Repeat(_) | RepeatTrack(_) => {
+            RetainedPlaybackDisposition::Restore
+        }
+        Prev | Next | Disconnect { .. } | Transfer(_) | Load(_) | Activate => {
+            RetainedPlaybackDisposition::Discard
+        }
+        Shutdown => {
+            return Some((
+                PreviewCancelReason::Shutdown,
+                RetainedPlaybackDisposition::Discard,
+            ));
+        }
+        ReplaceSession { .. } | VolumeUp | VolumeDown | SetVolume(_) => return None,
+    };
+    Some((PreviewCancelReason::NormalCommand, retained))
 }
 
 fn player_queue_action(
@@ -452,6 +520,7 @@ impl Spirc {
             transition_hydration_cache: TransitionHydrationCache::default(),
             transition_hydrations: JoinSet::new(),
             transition_edge_generation: 0,
+            preview_ownership: PreviewSpircOwnership::default(),
             local_auto_pair: None,
             local_auto_current_identity: None,
             local_auto_tasks: JoinSet::new(),
@@ -710,6 +779,10 @@ impl SpircTask {
     }
 
     async fn replace_session(&mut self, session: Session) -> Result<(), Error> {
+        self.advance_normal_ownership(
+            PreviewCancelReason::SessionChanged,
+            RetainedPlaybackDisposition::Discard,
+        )?;
         preserve_session_identity(&self.session, &session);
 
         let bindings = match Self::connect_session(&session, self.credentials.clone()).await {
@@ -972,6 +1045,12 @@ impl SpircTask {
                         }
                     }
                     SpircCommand::Shutdown => {
+                        if let Err(why) = self.advance_normal_ownership(
+                            PreviewCancelReason::Shutdown,
+                            RetainedPlaybackDisposition::Discard,
+                        ) {
+                            error!("failed to cancel preview during shutdown: {why}");
+                        }
                         self.handle_pause();
                         self.shutdown = true;
                         if let Some(commands) = self.commands.as_mut() {
@@ -1082,6 +1161,9 @@ impl SpircTask {
     async fn handle_command(&mut self, cmd: SpircCommand) -> Result<(), Error> {
         let command_name = cmd.name();
         trace!("Received SpircCommand::{command_name}");
+        if let Some((reason, retained)) = local_preview_preemption(&cmd) {
+            self.advance_normal_ownership(reason, retained)?;
+        }
         match cmd {
             SpircCommand::ReplaceSession { session, result } => {
                 let replacement = self.replace_session(session).await;
@@ -1141,6 +1223,59 @@ impl SpircTask {
     }
 
     fn handle_player_event(&mut self, event: PlayerEvent) -> Result<(), Error> {
+        match &event {
+            PlayerEvent::PreviewStarted { token } => {
+                let current = self
+                    .preview_ownership
+                    .coordinator
+                    .active()
+                    .is_some_and(|active| active.token() == token);
+                debug!(
+                    "[spotify-preview] start event token={token:?} current={current}; no Connect ownership event"
+                );
+                return Ok(());
+            }
+            PlayerEvent::PreviewCompleted { token, restore } => {
+                let current = self
+                    .preview_ownership
+                    .coordinator
+                    .finish(token, Reply::Success);
+                info!(
+                    "[spotify-preview] completion token={token:?} current={current} restore={restore:?}; ordinary queue advancement=false"
+                );
+                return Ok(());
+            }
+            PlayerEvent::PreviewCancelled {
+                token,
+                reason,
+                restore,
+            } => {
+                let current = self
+                    .preview_ownership
+                    .coordinator
+                    .finish(token, Reply::Failure);
+                info!(
+                    "[spotify-preview] cancellation token={token:?} current={current} reason={reason:?} restore={restore:?}; ordinary queue advancement=false"
+                );
+                return Ok(());
+            }
+            PlayerEvent::PreviewFailed {
+                token,
+                reason,
+                restore,
+            } => {
+                let current = self
+                    .preview_ownership
+                    .coordinator
+                    .finish(token, Reply::Failure);
+                warn!(
+                    "[spotify-preview] failure token={token:?} current={current} reason={reason:?} restore={restore:?}; ordinary queue advancement=false"
+                );
+                return Ok(());
+            }
+            _ => {}
+        }
+
         if let PlayerEvent::TrackChanged {
             track_id,
             audio_item,
@@ -1453,6 +1588,10 @@ impl SpircTask {
                 && cluster.active_device_id != self.session.device_id();
             if became_inactive {
                 info!("device became inactive");
+                self.advance_normal_ownership(
+                    PreviewCancelReason::Inactive,
+                    RetainedPlaybackDisposition::Discard,
+                )?;
                 self.handle_disconnect().await?;
                 self.handle_stop();
             } else if self.connect_state.is_active() {
@@ -1462,6 +1601,10 @@ impl SpircTask {
                 self.update_state = true;
             }
         } else if self.connect_state.is_active() {
+            self.advance_normal_ownership(
+                PreviewCancelReason::Inactive,
+                RetainedPlaybackDisposition::Discard,
+            )?;
             self.connect_state.became_inactive(&self.session).await?;
         }
 
@@ -1472,6 +1615,18 @@ impl SpircTask {
         &mut self,
         (request, sender): RequestReply,
     ) -> Result<(), Error> {
+        if let Command::Signal(signal) = request.command {
+            debug!(
+                "handling preview signal '{}' from {}",
+                signal.signal_id, request.sent_by_device_id
+            );
+            self.handle_preview_signal(signal, sender)?;
+            return Ok(());
+        }
+
+        if let Some((reason, retained)) = dealer_preview_preemption(&request.command) {
+            self.advance_normal_ownership(reason, retained)?;
+        }
         self.connect_state.set_last_command(request.clone());
         self.connect_state
             .trace_runtime_queue("before dealer command");
@@ -1499,6 +1654,141 @@ impl SpircTask {
         self.connect_state
             .trace_runtime_queue("after dealer command");
         sender.send(response).map_err(Into::into)
+    }
+
+    fn preview_authority(&self) -> PreviewAuthority {
+        PreviewAuthority {
+            connect_session_id: self.session.session_id(),
+            normal_ownership_generation: self.preview_ownership.normal_ownership_generation,
+        }
+    }
+
+    fn advance_normal_ownership(
+        &mut self,
+        reason: PreviewCancelReason,
+        retained: RetainedPlaybackDisposition,
+    ) -> Result<(), Error> {
+        self.preview_ownership.normal_ownership_generation = self
+            .preview_ownership
+            .normal_ownership_generation
+            .checked_add(1)
+            .ok_or(SpircError::PreviewGenerationExhausted)?;
+        if matches!(
+            reason,
+            PreviewCancelReason::SessionChanged
+                | PreviewCancelReason::Inactive
+                | PreviewCancelReason::Shutdown
+        ) {
+            self.preview_ownership
+                .coordinator
+                .invalidate_authority(Reply::Failure)
+                .map_err(|_| SpircError::PreviewGenerationExhausted)?;
+        } else {
+            self.preview_ownership.coordinator.cancel(Reply::Failure);
+        }
+        let authority = self.preview_authority();
+        debug!(
+            "[spotify-preview] authority advanced session={} normal_generation={} reason={reason:?} retained={retained:?}",
+            authority.connect_session_id, authority.normal_ownership_generation
+        );
+        self.player
+            .set_preview_authority(authority, retained, reason);
+        Ok(())
+    }
+
+    fn handle_preview_signal(
+        &mut self,
+        signal: SignalCommand,
+        sender: mpsc::UnboundedSender<Reply>,
+    ) -> Result<Option<PreviewToken>, Error> {
+        if signal.signal_id != "automix-preview" {
+            warn!(
+                "[spotify-preview] rejecting unsupported signal {}",
+                signal.signal_id
+            );
+            send_dealer_reply(sender, Reply::Failure);
+            return Ok(None);
+        }
+
+        let decoded = match decode_automix_preview(&signal) {
+            Ok(decoded) => decoded,
+            Err(reason) => {
+                warn!("[spotify-preview] rejecting malformed request: {reason:?}");
+                send_dealer_reply(sender, Reply::Failure);
+                return Ok(None);
+            }
+        };
+        let resolved = match resolve_automix_preview(decoded) {
+            Ok(PreviewResolution::NoTransition { preset_id }) => {
+                info!(
+                    "[spotify-preview] intentional NONE preset={preset_id}; no preview audio or queue action"
+                );
+                send_dealer_reply(sender, Reply::Success);
+                return Ok(None);
+            }
+            Ok(PreviewResolution::Playable(resolved)) => resolved,
+            Err(reason) => {
+                warn!("[spotify-preview] rejecting unrenderable request: {reason:?}");
+                send_dealer_reply(sender, Reply::Failure);
+                return Ok(None);
+            }
+        };
+
+        let descriptor = match PreviewDescriptor::from_resolved(&resolved) {
+            Ok(descriptor) => descriptor,
+            Err(reason) => {
+                warn!("[spotify-preview] rejecting invalid resolved identities: {reason}");
+                send_dealer_reply(sender, Reply::Failure);
+                return Ok(None);
+            }
+        };
+        let fingerprint = resolved.request.fingerprint.clone();
+        let authority = self.preview_authority();
+        let admission = self
+            .preview_ownership
+            .coordinator
+            .admit(authority.clone(), fingerprint, descriptor.clone(), sender)
+            .map_err(|_| SpircError::PreviewGenerationExhausted)?;
+        let token = admission.token().clone();
+
+        if matches!(admission, PreviewAdmission::Attached(_)) {
+            info!("[spotify-preview] duplicate attached token={token:?} descriptor={descriptor:?}");
+            return Ok(Some(token));
+        }
+
+        if let PreviewAdmission::Replaced { ref retired, .. } = admission {
+            info!(
+                "[spotify-preview] replacing token={retired:?} with token={token:?}; old waiters resolved failure"
+            );
+            self.player
+                .cancel_preview(retired.clone(), PreviewCancelReason::Replaced);
+        }
+
+        let request = PreviewPlaybackRequest {
+            token: token.clone(),
+            outgoing: PreviewTrack {
+                canonical: resolved.request.canonical_a,
+                expected_playable: resolved.request.playable_a,
+            },
+            incoming: PreviewTrack {
+                canonical: resolved.request.canonical_b,
+                expected_playable: resolved.request.playable_b,
+            },
+            outgoing_load_position_ms: resolved.request.outgoing_load_position_ms,
+            incoming_load_position_ms: resolved.request.incoming_load_position_ms,
+            post_roll: Duration::from_millis(u64::from(resolved.request.window_ms)),
+            plan: resolved.plan,
+        };
+        self.player.set_preview_authority(
+            authority,
+            RetainedPlaybackDisposition::Restore,
+            PreviewCancelReason::Replaced,
+        );
+        info!(
+            "[spotify-preview] starting token={token:?} descriptor={descriptor:?}; Connect queue untouched"
+        );
+        self.player.start_preview(request);
+        Ok(Some(token))
     }
 
     async fn handle_request(&mut self, request: Request) -> Result<(), Error> {
@@ -3186,6 +3476,29 @@ impl SpircTask {
 
 impl Drop for SpircTask {
     fn drop(&mut self) {
+        let had_preview = self
+            .preview_ownership
+            .coordinator
+            .cancel(Reply::Failure)
+            .is_some();
+        if had_preview
+            && let Some(generation) = self
+                .preview_ownership
+                .normal_ownership_generation
+                .checked_add(1)
+        {
+            self.player.set_preview_authority(
+                PreviewAuthority {
+                    connect_session_id: self.session.session_id(),
+                    normal_ownership_generation: generation,
+                },
+                RetainedPlaybackDisposition::Discard,
+                PreviewCancelReason::Shutdown,
+            );
+            debug!(
+                "[spotify-preview] SPIRC dropped active preview; dealer waiters resolved failure"
+            );
+        }
         debug!("drop Spirc[{}]", self.spirc_id);
     }
 }
@@ -3194,11 +3507,83 @@ impl Drop for SpircTask {
 mod tests {
     use super::*;
     use crate::{core::config::SessionConfig, playback::player::PlayerLoadErrorKind};
+    use data_encoding::BASE64;
+    use librespot_core::dealer::protocol::request::{LoggingParams, SignalCommand};
     use librespot_protocol::context_track::ContextTrack;
+    use librespot_protocol::{
+        automix_preview::AutomixPreview,
+        automix_transition::{EqStyle, FilterFxStyle, Overlap, Preset, Transition},
+    };
+    use protobuf::{Message, MessageField};
+    use tokio::sync::mpsc::error::TryRecvError;
 
     const CURRENT_URI: &str = "spotify:track:2TpxZ7JUBn3uw46aR7qd6V";
     const NEXT_URI: &str = "spotify:track:4cOdK2wGLETKBW3PvgPWqT";
     const LATER_URI: &str = "spotify:track:7ouMYWpwJ422jRcDASZB7P";
+
+    fn preview_signal(arm_id: &str, preset_id: i32) -> SignalCommand {
+        let wire = AutomixPreview {
+            track_uri_1: Some(CURRENT_URI.to_owned()),
+            track_uri_2: Some(NEXT_URI.to_owned()),
+            automix_mode: Some("auto".to_owned()),
+            transition_uri: Some("spotify:transition:captured".to_owned()),
+            start_position_ms: Some(3_000),
+            relative_start_position: Some(true),
+            transition_recipe: MessageField::some(Transition {
+                overlap: MessageField::some(Overlap {
+                    start_a_ms: Some(184_812),
+                    start_b_ms: Some(944),
+                    duration_ms: Some(7_385),
+                    track_a_uri: Some(CURRENT_URI.to_owned()),
+                    track_b_uri: Some(NEXT_URI.to_owned()),
+                    track_a_playable_uri: Some(CURRENT_URI.to_owned()),
+                    track_b_playable_uri: Some(NEXT_URI.to_owned()),
+                    item_speed_a: Some(1.0),
+                    item_speed_b: Some(1.0),
+                    ..Default::default()
+                }),
+                preset: MessageField::some(Preset {
+                    id: Some(preset_id),
+                    eq_style_override: MessageField::some(EqStyle {
+                        id: Some(0),
+                        ..Default::default()
+                    }),
+                    filter_fx_style_override: MessageField::some(FilterFxStyle {
+                        id: Some(0),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            playable_track_uri_1: Some(CURRENT_URI.to_owned()),
+            playable_track_uri_2: Some(NEXT_URI.to_owned()),
+            context_uri: Some("spotify:playlist:mixer".to_owned()),
+            arm_id: Some(arm_id.to_owned()),
+            item_speed_a: Some(1.0),
+            item_speed_b: Some(1.0),
+            ..Default::default()
+        };
+        SignalCommand {
+            signal_id: "automix-preview".to_owned(),
+            parameters: Some(BASE64.encode(&wire.write_to_bytes().unwrap())),
+            logging_params: LoggingParams {
+                interaction_ids: None,
+                device_identifier: None,
+                command_initiated_time: None,
+                page_instance_ids: None,
+                command_id: Some("preview-test".to_owned()),
+            },
+        }
+    }
+
+    fn valid_preview_signal_with_arm(arm_id: &str) -> SignalCommand {
+        preview_signal(arm_id, 10)
+    }
+
+    fn valid_preview_signal() -> SignalCommand {
+        valid_preview_signal_with_arm("captured-arm")
+    }
 
     // Real command handler and queue state; only the audio hardware is replaced.
     // Missing local files fail locally, so these tests never contact Spotify.
@@ -3253,6 +3638,7 @@ mod tests {
             transition_hydration_cache: Default::default(),
             transition_hydrations: JoinSet::new(),
             transition_edge_generation: 0,
+            preview_ownership: PreviewSpircOwnership::default(),
             local_auto_pair: None,
             local_auto_current_identity: None,
             local_auto_tasks: JoinSet::new(),
@@ -3265,6 +3651,188 @@ mod tests {
             update_state: false,
             spirc_id: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn preview_signal_is_pending_until_matching_terminal_event() {
+        let mut task = queue_command_task();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let token = task
+            .handle_preview_signal(valid_preview_signal(), sender)
+            .expect("valid preview should be admitted")
+            .expect("playable preview should return its token");
+
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        task.handle_player_event(PlayerEvent::PreviewCompleted {
+            token,
+            restore: librespot_playback::PreviewRestoreOutcome::Restored,
+        })
+        .unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(Reply::Success)));
+    }
+
+    #[tokio::test]
+    async fn identical_preview_attaches_but_material_change_replaces() {
+        let mut task = queue_command_task();
+        let (first_sender, mut first_receiver) = mpsc::unbounded_channel();
+        let first = task
+            .handle_preview_signal(valid_preview_signal(), first_sender)
+            .unwrap()
+            .unwrap();
+        let (duplicate_sender, mut duplicate_receiver) = mpsc::unbounded_channel();
+        let duplicate = task
+            .handle_preview_signal(valid_preview_signal(), duplicate_sender)
+            .unwrap()
+            .unwrap();
+        assert_eq!(duplicate, first);
+        assert_eq!(
+            task.preview_ownership
+                .coordinator
+                .active()
+                .unwrap()
+                .waiter_count(),
+            2
+        );
+        assert!(matches!(
+            first_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            duplicate_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+
+        let (replacement_sender, mut replacement_receiver) = mpsc::unbounded_channel();
+        let replacement = task
+            .handle_preview_signal(
+                valid_preview_signal_with_arm("materially-different-arm"),
+                replacement_sender,
+            )
+            .unwrap()
+            .unwrap();
+        assert_ne!(replacement, first);
+        assert!(matches!(first_receiver.try_recv(), Ok(Reply::Failure)));
+        assert!(matches!(duplicate_receiver.try_recv(), Ok(Reply::Failure)));
+        assert!(matches!(
+            replacement_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_preview_does_not_disturb_active_preview() {
+        let mut task = queue_command_task();
+        let (active_sender, mut active_receiver) = mpsc::unbounded_channel();
+        let active = task
+            .handle_preview_signal(valid_preview_signal(), active_sender)
+            .unwrap()
+            .unwrap();
+        let (bad_sender, mut bad_receiver) = mpsc::unbounded_channel();
+        task.handle_preview_signal(
+            SignalCommand {
+                signal_id: "automix-preview".to_owned(),
+                parameters: None,
+                logging_params: valid_preview_signal().logging_params,
+            },
+            bad_sender,
+        )
+        .unwrap();
+
+        assert!(matches!(bad_receiver.try_recv(), Ok(Reply::Failure)));
+        assert!(matches!(
+            active_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+        assert_eq!(
+            task.preview_ownership.coordinator.active().unwrap().token(),
+            &active
+        );
+    }
+
+    #[tokio::test]
+    async fn none_is_immediate_success_without_disturbing_active_preview() {
+        let mut task = queue_command_task();
+        let (active_sender, mut active_receiver) = mpsc::unbounded_channel();
+        let active = task
+            .handle_preview_signal(valid_preview_signal(), active_sender)
+            .unwrap()
+            .unwrap();
+        let (none_sender, mut none_receiver) = mpsc::unbounded_channel();
+
+        let none = task
+            .handle_preview_signal(preview_signal("none-arm", 0), none_sender)
+            .unwrap();
+
+        assert!(none.is_none());
+        assert!(matches!(none_receiver.try_recv(), Ok(Reply::Success)));
+        assert!(matches!(
+            active_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+        assert_eq!(
+            task.preview_ownership.coordinator.active().unwrap().token(),
+            &active
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_preview_completion_cannot_finish_replacement_or_advance_queue() {
+        let mut task = queue_command_task();
+        let (old_sender, mut old_receiver) = mpsc::unbounded_channel();
+        let old = task
+            .handle_preview_signal(valid_preview_signal(), old_sender)
+            .unwrap()
+            .unwrap();
+        let (new_sender, mut new_receiver) = mpsc::unbounded_channel();
+        let new = task
+            .handle_preview_signal(valid_preview_signal_with_arm("replacement-arm"), new_sender)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(old_receiver.try_recv(), Ok(Reply::Failure)));
+        let before = (
+            task.connect_state.current_track(|track| track.uri.clone()),
+            task.connect_state
+                .preview_next_provided_track()
+                .map(|track| track.uri.clone()),
+            task.play_request_id,
+            task.transition_edge_generation,
+        );
+
+        task.handle_player_event(PlayerEvent::PreviewCompleted {
+            token: old,
+            restore: librespot_playback::PreviewRestoreOutcome::NotOwned,
+        })
+        .unwrap();
+
+        assert_eq!(
+            task.preview_ownership.coordinator.active().unwrap().token(),
+            &new
+        );
+        assert!(matches!(new_receiver.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(
+            before,
+            (
+                task.connect_state.current_track(|track| track.uri.clone()),
+                task.connect_state
+                    .preview_next_provided_track()
+                    .map(|track| track.uri.clone()),
+                task.play_request_id,
+                task.transition_edge_generation,
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_command_preempts_preview_and_resolves_waiter() {
+        let mut task = queue_command_task();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        task.handle_preview_signal(valid_preview_signal(), sender)
+            .unwrap();
+
+        let _ = task.handle_command(SpircCommand::Pause).await;
+
+        assert!(matches!(receiver.try_recv(), Ok(Reply::Failure)));
+        assert!(task.preview_ownership.coordinator.active().is_none());
     }
 
     fn context_with_tracks(context_uri: &str, track_uris: &[&str]) -> Context {

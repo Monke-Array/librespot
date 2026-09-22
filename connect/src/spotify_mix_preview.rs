@@ -127,6 +127,38 @@ pub(crate) struct PreviewDescriptor {
     item_speed_b_bits: u64,
 }
 
+impl PreviewDescriptor {
+    pub(crate) fn from_resolved(
+        resolved: &ResolvedAutomixPreview,
+    ) -> Result<Self, librespot_core::Error> {
+        let overlap = resolved
+            .request
+            .recipe
+            .overlap()
+            .map_err(librespot_core::Error::invalid_argument)?;
+        Ok(Self {
+            canonical_a: resolved.request.canonical_a.to_uri()?,
+            playable_a: resolved.request.playable_a.to_uri()?,
+            canonical_b: resolved.request.canonical_b.to_uri()?,
+            playable_b: resolved.request.playable_b.to_uri()?,
+            context_uri: resolved.request.context_uri.clone(),
+            transition_uri: resolved.request.transition_uri.clone(),
+            arm_id_present: resolved.request.fields.arm_id,
+            provenance: SpotifyTransitionProvenance::PreviewSignal,
+            preset_id: resolved.preset_id,
+            style_ids: resolved.style.styles,
+            start_a_ms: overlap.start_a_ms() as u32,
+            start_b_ms: overlap.start_b_ms() as u32,
+            duration_ms: overlap.duration_ms() as u32,
+            outgoing_load_ms: resolved.request.outgoing_load_position_ms,
+            incoming_load_ms: resolved.request.incoming_load_position_ms,
+            post_roll_ms: resolved.request.window_ms,
+            item_speed_a_bits: resolved.request.item_speed_a_bits,
+            item_speed_b_bits: resolved.request.item_speed_b_bits,
+        })
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum PreviewAdmission {
     Start(PreviewToken),
