@@ -68,14 +68,23 @@ impl RequestHandler for DealerRequestHandler {
             return;
         }
 
+        let transport = responder.tx.clone();
         tokio::spawn(async move {
-            let reply = rx.recv().await.unwrap_or(Reply::Failure);
-            debug!("replying to ws request: {reply:?}");
-            match reply {
-                Reply::Unanswered => responder.force_unanswered(),
-                Reply::Success | Reply::Failure => responder.send(Response {
-                    success: matches!(reply, Reply::Success),
-                }),
+            tokio::select! {
+                reply = rx.recv() => {
+                    let reply = reply.unwrap_or(Reply::Failure);
+                    debug!("replying to ws request: {reply:?}");
+                    match reply {
+                        Reply::Unanswered => responder.force_unanswered(),
+                        Reply::Success | Reply::Failure => responder.send(Response {
+                            success: matches!(reply, Reply::Success),
+                        }),
+                    }
+                }
+                () = transport.closed() => {
+                    debug!("dealer request transport closed before terminal reply");
+                    responder.force_unanswered();
+                }
             }
         });
     }
@@ -170,5 +179,65 @@ impl DealerManager {
         if let Some(dealer) = self.lock(|inner| inner.dealer.take()) {
             dealer.close().await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dealer::protocol::Command;
+    use serde_json::json;
+
+    fn request(message_id: u32) -> Request {
+        Request {
+            message_id,
+            sent_by_device_id: "controller".to_owned(),
+            command: Command::Unknown(json!({ "endpoint": "test" })),
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_request_responder_ends_when_transport_closes() {
+        let (handler, mut requests) = DealerRequestHandler::new();
+        let (websocket_tx, websocket_rx) = mpsc::unbounded_channel();
+        handler.handle_request(
+            request(1),
+            Responder::new("request-a".to_owned(), websocket_tx),
+        );
+        let (_, reply) = requests.recv().await.expect("request should be forwarded");
+
+        drop(websocket_rx);
+        tokio::task::yield_now().await;
+
+        assert!(reply.is_closed());
+    }
+
+    #[tokio::test]
+    async fn pending_request_does_not_block_later_request_reply() {
+        let (handler, mut requests) = DealerRequestHandler::new();
+        let (websocket_tx, mut websocket_rx) = mpsc::unbounded_channel();
+        handler.handle_request(
+            request(1),
+            Responder::new("request-a".to_owned(), websocket_tx.clone()),
+        );
+        let (_, first_reply) = requests.recv().await.expect("first request");
+        handler.handle_request(
+            request(2),
+            Responder::new("request-b".to_owned(), websocket_tx),
+        );
+        let (_, second_reply) = requests.recv().await.expect("second request");
+
+        second_reply
+            .send(Reply::Success)
+            .expect("reply should send");
+        let response = websocket_rx
+            .recv()
+            .await
+            .expect("second websocket response")
+            .into_text()
+            .expect("text response");
+
+        assert!(response.contains("\"key\":\"request-b\""));
+        assert!(!first_reply.is_closed());
     }
 }
