@@ -394,13 +394,13 @@ impl PreviewCoordinator {
     pub(crate) fn invalidate_authority(
         &mut self,
         reply: Reply,
-    ) -> Result<(), PreviewCoordinatorError> {
-        self.cancel(reply);
+    ) -> Result<Option<PreviewToken>, PreviewCoordinatorError> {
+        let retired = self.cancel(reply);
         self.next_generation = self
             .next_generation
             .checked_add(1)
             .ok_or(PreviewCoordinatorError::GenerationExhausted)?;
-        Ok(())
+        Ok(retired)
     }
 }
 

@@ -221,6 +221,43 @@ struct PreviewSpircOwnership {
     normal_ownership_generation: u64,
 }
 
+struct PreviewAuthorityAdvance {
+    authority: PreviewAuthority,
+    retired: Option<PreviewToken>,
+}
+
+impl PreviewSpircOwnership {
+    fn advance_authority(
+        &mut self,
+        connect_session_id: String,
+        reason: PreviewCancelReason,
+    ) -> Result<PreviewAuthorityAdvance, SpircError> {
+        self.normal_ownership_generation = self
+            .normal_ownership_generation
+            .checked_add(1)
+            .ok_or(SpircError::PreviewGenerationExhausted)?;
+        let retired = if matches!(
+            reason,
+            PreviewCancelReason::SessionChanged
+                | PreviewCancelReason::Inactive
+                | PreviewCancelReason::Shutdown
+        ) {
+            self.coordinator
+                .invalidate_authority(Reply::Failure)
+                .map_err(|_| SpircError::PreviewGenerationExhausted)?
+        } else {
+            self.coordinator.cancel(Reply::Failure)
+        };
+        Ok(PreviewAuthorityAdvance {
+            authority: PreviewAuthority {
+                connect_session_id,
+                normal_ownership_generation: self.normal_ownership_generation,
+            },
+            retired,
+        })
+    }
+}
+
 struct SpircTask {
     player: Arc<Player>,
     mixer: Arc<dyn Mixer>,
@@ -1725,31 +1762,19 @@ impl SpircTask {
         reason: PreviewCancelReason,
         retained: RetainedPlaybackDisposition,
     ) -> Result<(), Error> {
-        self.preview_ownership.normal_ownership_generation = self
+        let advance = self
             .preview_ownership
-            .normal_ownership_generation
-            .checked_add(1)
-            .ok_or(SpircError::PreviewGenerationExhausted)?;
-        if matches!(
-            reason,
-            PreviewCancelReason::SessionChanged
-                | PreviewCancelReason::Inactive
-                | PreviewCancelReason::Shutdown
-        ) {
-            self.preview_ownership
-                .coordinator
-                .invalidate_authority(Reply::Failure)
-                .map_err(|_| SpircError::PreviewGenerationExhausted)?;
-        } else {
-            self.preview_ownership.coordinator.cancel(Reply::Failure);
-        }
-        let authority = self.preview_authority();
+            .advance_authority(self.session.session_id(), reason)?;
         debug!(
-            "[spotify-preview] authority advanced session={} normal_generation={} reason={reason:?} retained={retained:?}",
-            authority.connect_session_id, authority.normal_ownership_generation
+            "[spotify-preview] authority advanced session={} normal_generation={} reason={reason:?} retained={retained:?} retired={}",
+            advance.authority.connect_session_id,
+            advance.authority.normal_ownership_generation,
+            advance.retired.is_some(),
         );
-        self.player
-            .set_preview_authority(authority, retained, reason);
+        if advance.retired.is_some() {
+            self.player
+                .set_preview_authority(advance.authority, retained, reason);
+        }
         Ok(())
     }
 
@@ -3911,6 +3936,44 @@ mod tests {
 
         let _ = task.handle_command(SpircCommand::Pause).await;
 
+        assert!(matches!(receiver.try_recv(), Ok(Reply::Failure)));
+        assert!(task.preview_ownership.coordinator.active().is_none());
+    }
+
+    #[test]
+    fn normal_command_without_preview_advances_authority_without_player_update() {
+        let mut ownership = PreviewSpircOwnership::default();
+
+        let advance = ownership
+            .advance_authority("session-a".to_owned(), PreviewCancelReason::NormalCommand)
+            .expect("normal ownership generation should advance");
+
+        assert_eq!(
+            advance.authority,
+            PreviewAuthority {
+                connect_session_id: "session-a".to_owned(),
+                normal_ownership_generation: 1,
+            }
+        );
+        assert!(advance.retired.is_none());
+    }
+
+    #[tokio::test]
+    async fn normal_command_with_preview_retires_once_and_requires_player_update() {
+        let mut task = queue_command_task();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let token = task
+            .handle_preview_signal(valid_preview_signal(), sender)
+            .expect("valid preview should be admitted")
+            .expect("playable preview should return its token");
+        let session_id = task.session.session_id();
+
+        let advance = task
+            .preview_ownership
+            .advance_authority(session_id, PreviewCancelReason::NormalCommand)
+            .expect("normal ownership generation should advance");
+
+        assert_eq!(advance.retired, Some(token));
         assert!(matches!(receiver.try_recv(), Ok(Reply::Failure)));
         assert!(task.preview_ownership.coordinator.active().is_none());
     }
