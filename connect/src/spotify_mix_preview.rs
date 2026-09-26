@@ -270,6 +270,7 @@ pub(crate) fn preview_diagnostic(
 pub(crate) enum PreviewAdmission {
     Start(PreviewToken),
     Attached(PreviewToken),
+    RejectedCapacity(PreviewToken),
     Replaced {
         retired: PreviewToken,
         started: PreviewToken,
@@ -279,11 +280,13 @@ pub(crate) enum PreviewAdmission {
 impl PreviewAdmission {
     pub(crate) fn token(&self) -> &PreviewToken {
         match self {
-            Self::Start(token) | Self::Attached(token) => token,
+            Self::Start(token) | Self::Attached(token) | Self::RejectedCapacity(token) => token,
             Self::Replaced { started, .. } => started,
         }
     }
 }
+
+const MAX_PREVIEW_WAITERS: usize = 8;
 
 pub(crate) struct ActivePreviewSession {
     token: PreviewToken,
@@ -334,6 +337,11 @@ impl PreviewCoordinator {
             && active.token.authority == authority
             && active.fingerprint == fingerprint
         {
+            if active.waiters.len() >= MAX_PREVIEW_WAITERS {
+                let token = active.token.clone();
+                send_reply(waiter, &Reply::Failure);
+                return Ok(PreviewAdmission::RejectedCapacity(token));
+            }
             active.waiters.push(waiter);
             return Ok(PreviewAdmission::Attached(active.token.clone()));
         }
@@ -1062,6 +1070,43 @@ mod tests {
             .unwrap();
         assert_eq!(duplicate, PreviewAdmission::Attached(first.token().clone()));
         assert_eq!(coordinator.active().unwrap().waiter_count(), 2);
+    }
+
+    #[test]
+    fn identical_duplicate_waiters_are_bounded() {
+        let mut coordinator = PreviewCoordinator::default();
+        let (first_tx, first_rx) = reply_channel();
+        let first = coordinator
+            .admit(authority(7), fingerprint(1), descriptor(), first_tx)
+            .unwrap()
+            .token()
+            .clone();
+        let mut retained_receivers = vec![first_rx];
+
+        for _ in 1..8 {
+            let (tx, rx) = reply_channel();
+            assert_eq!(
+                coordinator
+                    .admit(authority(7), fingerprint(1), descriptor(), tx)
+                    .unwrap(),
+                PreviewAdmission::Attached(first.clone())
+            );
+            retained_receivers.push(rx);
+        }
+
+        let (overflow_tx, mut overflow_rx) = reply_channel();
+        assert_eq!(
+            coordinator
+                .admit(authority(7), fingerprint(1), descriptor(), overflow_tx,)
+                .unwrap(),
+            PreviewAdmission::RejectedCapacity(first.clone())
+        );
+        assert!(matches!(overflow_rx.try_recv(), Ok(Reply::Failure)));
+        assert_eq!(coordinator.active().unwrap().token(), &first);
+        assert_eq!(coordinator.active().unwrap().waiter_count(), 8);
+        for receiver in &mut retained_receivers {
+            assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        }
     }
 
     #[test]

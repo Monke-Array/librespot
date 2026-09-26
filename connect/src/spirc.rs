@@ -1831,6 +1831,15 @@ impl SpircTask {
             .coordinator
             .admit(authority.clone(), fingerprint, descriptor.clone(), sender)
             .map_err(|_| SpircError::PreviewGenerationExhausted)?;
+
+        if let PreviewAdmission::RejectedCapacity(token) = &admission {
+            warn!(
+                "[spotify-preview] rejecting duplicate waiter at capacity session={} generation={}",
+                token.authority.connect_session_id, token.generation.0,
+            );
+            return Ok(None);
+        }
+
         let token = admission.token().clone();
 
         if matches!(admission, PreviewAdmission::Attached(_)) {
@@ -3825,6 +3834,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn excess_identical_preview_fails_without_replacing_active_preview() {
+        let mut task = queue_command_task();
+        let (first_sender, first_receiver) = mpsc::unbounded_channel();
+        let first = task
+            .handle_preview_signal(valid_preview_signal(), first_sender)
+            .unwrap()
+            .unwrap();
+        let mut retained_receivers = vec![first_receiver];
+
+        for _ in 1..8 {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            assert_eq!(
+                task.handle_preview_signal(valid_preview_signal(), sender)
+                    .unwrap(),
+                Some(first.clone())
+            );
+            retained_receivers.push(receiver);
+        }
+
+        let (overflow_sender, mut overflow_receiver) = mpsc::unbounded_channel();
+        assert!(
+            task.handle_preview_signal(valid_preview_signal(), overflow_sender)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(overflow_receiver.try_recv(), Ok(Reply::Failure)));
+        assert_eq!(
+            task.preview_ownership.coordinator.active().unwrap().token(),
+            &first
+        );
+        assert_eq!(
+            task.preview_ownership
+                .coordinator
+                .active()
+                .unwrap()
+                .waiter_count(),
+            8
+        );
+        for receiver in &mut retained_receivers {
+            assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        }
+    }
+
+    #[tokio::test]
     async fn malformed_preview_does_not_disturb_active_preview() {
         let mut task = queue_command_task();
         let (active_sender, mut active_receiver) = mpsc::unbounded_channel();
@@ -3976,6 +4029,37 @@ mod tests {
         assert_eq!(advance.retired, Some(token));
         assert!(matches!(receiver.try_recv(), Ok(Reply::Failure)));
         assert!(task.preview_ownership.coordinator.active().is_none());
+    }
+
+    #[tokio::test]
+    async fn session_and_shutdown_authority_changes_drain_all_preview_waiters() {
+        for reason in [
+            PreviewCancelReason::SessionChanged,
+            PreviewCancelReason::Shutdown,
+        ] {
+            let mut task = queue_command_task();
+            let (first_sender, mut first_receiver) = mpsc::unbounded_channel();
+            let token = task
+                .handle_preview_signal(valid_preview_signal(), first_sender)
+                .unwrap()
+                .unwrap();
+            let (duplicate_sender, mut duplicate_receiver) = mpsc::unbounded_channel();
+            assert_eq!(
+                task.handle_preview_signal(valid_preview_signal(), duplicate_sender)
+                    .unwrap(),
+                Some(token.clone())
+            );
+
+            let advance = task
+                .preview_ownership
+                .advance_authority(task.session.session_id(), reason)
+                .expect("authority invalidation should succeed");
+
+            assert_eq!(advance.retired, Some(token));
+            assert!(matches!(first_receiver.try_recv(), Ok(Reply::Failure)));
+            assert!(matches!(duplicate_receiver.try_recv(), Ok(Reply::Failure)));
+            assert!(task.preview_ownership.coordinator.active().is_none());
+        }
     }
 
     fn context_with_tracks(context_uri: &str, track_uris: &[&str]) -> Context {
