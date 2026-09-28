@@ -51,6 +51,26 @@ Numeric request/response corpus: [`2026-09-19-style-responses.json`](../tools/ru
 - **HIGH CONFIDENCE native:** materializer resolves optional item_speed_a/b to1. For each side positive supplied BPM is used; otherwise clampedBars*240/outgoingDurationSeconds if positive, else120. Effective BPM=resolvedBPM*itemSpeedSide. Incoming fallback also uses outgoing duration. Evidence0x01040af4..0x01040bd0; constants0x01aaa27c=240f,0x01964478=120f,0x01902be0=1d.
 - **HIGH CONFIDENCE native:** durations/positions become ms with factor1000 at0x01042e62..0x01042ecc. Beatmatched incoming speed helper0x01047af8 receives incomingDuration/outgoingDuration*itemSpeedA plus targetItemSpeedB (0x01042ed3..0x01042f1c). Nonbeatmatched branch emits single speed point at0 for itemSpeedB differing from1 beyond epsilon (0x01042f5e..0x01042f9d). Exact ramp helper not inspected here; the main protocol specification records the recovered speed helper. Do not conflate item speed with overlap speed fields.
 
+## Spotify iOS editor label inventory, 2026-09-28
+
+The user transcribed the currently visible editor choices below. These labels
+are an inventory, not yet a proven label-to-style-ID mapping. `Smooth crossfade`
+with EQ and filter set to `None` was audibly validated on RPI-01. The editor's
+`Center bass swap` selection was observed on the wire as EQ style 4 and remains
+unsupported by the current renderer.
+
+- Volume: Smooth crossfade; Overlap; Fade in fade out; Cut in fade out; Fade in
+  cut out; Center cut; Crossfade; Fade in fast out.
+- EQ: Center bass swap; End bass swap; Start bass swap; 3-band fade; Quick bass
+  cut; Long bass cut; Start fade out; Bass fade out; None.
+- Filter: Low pass filter out; Low pass filter in; Low pass filter in low pass
+  filter out; Low pass filter in high pass filter out; High pass filter out;
+  High pass filter in; High pass filter in high pass filter out; High pass
+  filter in low pass filter out; High-pass filter half out; Noise out end; None.
+
+Exact EQ/filter physical mappings remain release blockers; labels alone do not
+authorize approximating their DSP.
+
 ## Curve coordinates, units, and omissions
 
 - **PROVEN data:** curve segment start/end and point x/y values are normalized in observed output (0..1); segment start/end span envelope, x is local segment coordinate. UI editor emits local x0,1/3,2/3,1 for cubic controls and0,1 for lines, global start/end positions; it clamps editable values0..1. **HIGH CONFIDENCE:** two/four points represent line/cubic Bezier; actual renderer evaluation/inversion still UNKNOWN from this subtask.

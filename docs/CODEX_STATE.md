@@ -1,17 +1,17 @@
 # Current objective
 
-Stabilize the `automix-preview` implementation without removing or extending it.
-Connect stability and ordinary playback/control correctness take precedence over
-audible Preview. Local fixes are complete; fixed-candidate RPI-01 validation is
-still required.
+Validate the immediate automix-preview admission reply on RPI-01. It must stop
+Spotify's three-second dealer websocket closure, connection prompt, duplicate
+signal, and frozen Preview UI without changing token ownership, restoration,
+ordinary playback, or live transitions. Effect-family support is separate and
+must not begin until this transport fix is runtime-validated.
 
-# Branch and commits
+# Branch and revisions
 
 - Branch: `codex/m3a-live-auto-metadata`.
-- Preview candidate investigated: `5891156`.
-- Avoid idle player authority churn: `abce5d5`.
-- Release dealer responders on transport loss: `bc2d61e`.
-- Bound duplicate preview reply waiters: `ae7a854`.
+- Preview regression fixes: `abce5d5`, `bc2d61e`, `ae7a854`.
+- Admission-reply implementation: `a8b8110` (acknowledge playable Preview after
+  admission and player command enqueue instead of terminal playback).
 - Approved preview spec:
   `docs/superpowers/specs/2026-09-21-spotify-automix-preview.md`.
 - Regression plan:
@@ -19,90 +19,77 @@ still required.
 
 # Architecture and invariants
 
-- SPIRC owns preview admission/authority; the player accepts only exact
-  `PreviewToken` ownership through loaders, PCM, rendering, and restoration.
-- A normal command always advances cheap SPIRC normal ownership. With no active
-  preview it sends no player preview command. With an active preview it drains
-  waiters and publishes one player-side invalidation before the normal action;
-  it never waits for teardown, rendering, restoration, or dealer reply work.
-- Malformed, unsupported, and non-renderable requests fail before player
-  ownership and leave ordinary playback untouched.
-- Preview never emits ordinary queue advancement, promotion, `TrackChanged`, or
-  `EndOfTrack`; stale terminal work is observational only.
-- Dealer requests run in independent tasks. A pending Preview reply does not
-  serialize later dealer commands, and its task now ends when its websocket
-  transport closes.
-- One identical active Preview retains at most eight reply waiters. Overflow
-  fails only the new waiter without replacing the token or audio. Cancellation,
-  session change, and shutdown drain admitted waiters.
+- SPIRC owns preview admission/authority; the player accepts only the complete
+  `PreviewToken` through loaders, PCM, rendering, cancellation, and restoration.
+- A playable dealer signal is acknowledged success after validation, admission,
+  `SetPreviewAuthority`, and `StartPreview` enqueue. Success means accepted, not
+  terminal playback success.
+- Terminal Preview events remain internal and never send a second dealer reply.
+- Malformed, unsupported, stale, and non-renderable requests still fail before
+  player ownership and leave ordinary playback untouched.
+- A normal command invalidates active preview ownership immediately and never
+  waits for decoder teardown, rendering, restoration, or dealer work.
+- Preview never advances the ordinary queue or emits ordinary promotion,
+  `TrackChanged`, or `EndOfTrack`; stale terminal work is observational only.
 
-# Confirmed findings and root causes
+# Confirmed root causes and findings
 
-- Ordinary-control regression: candidate `5891156` advanced preview authority
-  and enqueued `SetPreviewAuthority` for every normal command even when no
-  Preview existed. This unnecessary cross-thread work was added on the normal
-  hot path. `abce5d5` removes the player publication in the no-preview case
-  while retaining immediate ownership invalidation.
-- Dealer lifecycle defect: request handling was already concurrent, so one
-  pending Preview responder did not block subsequent requests. However, a
-  responder task could retain its reply receiver forever after websocket loss.
-  `bc2d61e` terminates that task on transport closure. This was a real leak but
-  is not proven to have caused the observed disconnects.
-- Preview reply growth: identical retries could append unbounded waiters.
-  `ae7a854` adds a fixed bound without cancelling/restarting the active Preview.
-- No-audio Preview: retained live traces reached signal decode, then failed in
-  `resolve_automix_preview` with `UnsupportedRenderer` for presets 1 and 17.
-  No token was allocated and no `StartPreview` reached the player. Supporting
-  those presets is new feature work and is intentionally out of scope.
-- Disconnects were recorded during long candidate intervals containing zero
-  Preview signals, including idle periods. Therefore the available evidence
-  does not support one shared Preview-request cause for lag, disconnects, and
-  no audio. Fixed-candidate runtime observation must determine whether session
-  stability improved or whether a separate transport issue remains.
-- Established `slow_operation=player_command` records around 620--640 ms also
-  occur on the pre-preview baseline and are not evidence for this regression.
+- Candidate `5891156` put `SetPreviewAuthority` on every ordinary command even
+  with no active Preview. `abce5d5` removes that hot-path churn.
+- Dealer responder tasks previously survived websocket transport loss.
+  `bc2d61e` ends them when their transport closes.
+- Duplicate pending Preview signals could grow responder waiters without bound.
+  `ae7a854` bounded them; immediate admission replies now keep the active count
+  at zero during normal operation.
+- The original no-audio attempt used preset 1 with volume style 6 and EQ style
+  4 (`Center/Centre bass swap`). Recipe resolution rejected unsupported EQ
+  before allocating a token or touching the player.
+- With EQ and filter set to `None`, preset 1 style `6/0/0/0/0/0` completed
+  audibly and restored normal playback three times. Therefore the playback
+  architecture works; unsupported physical EQ caused that no-audio case.
+- Every successful Preview retained its dealer reply for the roughly twelve
+  second audio lifetime. Spotify closed the websocket about three seconds after
+  each signal, retried identical signals, froze the editor progress display,
+  and prompted the user to reconnect to the speaker. This proves the terminal
+  reply contract is incompatible with the live client.
+- Rapid play/pause can grey the Spotify app button while lock-screen controls
+  still work. The same symptom reproduced on exact pre-preview `94b4a69`, so it
+  is not attributed to Preview.
 
-# Runtime A/B evidence (2026-09-26)
+# Runtime evidence
 
-- Candidate A: exact `5891156` binary SHA-256
-  `dfe890c8d8441288b24d91884415144a3486e2b9d946a72e3ebf528462d073d4`.
-  Same bounded control sequence produced 46 matched dealer-to-SPIRC commands:
-  p50 0.456 ms, p95 463.946 ms, max 954.047 ms. Four `skip_next`
-  requests measured 954.05, 762.51, 644.92, and 463.95 ms.
-- Baseline B: exact validated `94b4a69` binary SHA-256
-  `b148f34d2cd0e84d33625c1ef5ba0096f9428420318c4ea33427b690e4f460b5`.
-  The same sequence produced 28 matched commands: p50 0.405 ms, p95 13.402
-  ms, max 79.969 ms.
-- Neither bounded A nor B window contained a dealer disconnect. Retained
-  candidate history contained 18 receive-task drops over three days, including
-  no-Preview intervals; causation remains unresolved.
-- RPI-01 currently runs the known-good `94b4a69` rollback. Candidate `5891156`
-  is preserved at `/usr/local/bin/spotifyd.candidate-5891156-dfe890`.
-- Preserve rollback `/usr/local/bin/spotifyd.rollback-94b4a69-pre-5891156` and
-  older rollback `/usr/local/bin/spotifyd.rollback-90e1628-pre-b63949c`.
+- RPI-01 currently runs committed candidate `aca9a5f`; deployed binary SHA-256
+  `ed258012ffb58c2213d406db7ee3bec137d94dec3cf21082773e39f0872c5049`.
+- Preserved fixed binary: `/usr/local/bin/spotifyd.candidate-aca9a5f-ed2580`.
+- Preserved baseline: `/usr/local/bin/spotifyd.rollback-94b4a69-pre-5891156`,
+  SHA-256 `b148f34d2cd0e84d33625c1ef5ba0096f9428420318c4ea33427b690e4f460b5`.
+- Fixed candidate ordinary commands: 25 matched commands, p50 0.504 ms,
+  p95 2.205 ms, max 23.875 ms, with no Preview player commands or disconnect.
+- It also survived roughly 44 hours with one dealer websocket reset but no SPIRC
+  session end or unexpected shutdown.
+- Successful Preview samples started/completed at 16:59:42/16:59:54,
+  17:00:03/17:00:16, and 17:00:19/17:00:31 on 2026-09-28. Their dealer
+  websockets closed at 16:59:45, 17:00:06, and 17:00:22 respectively.
 
-# Local verification (2026-09-26)
+# Local verification
 
-- Red/green tests proved all three fixes: no-preview authority outcome,
-  responder termination on transport close, and bounded duplicate admission.
-- `cargo fmt --all -- --check`: passed.
-- `cargo check --workspace`: passed.
-- `cargo test -p librespot-playback`: 119 passed.
+- Admission-reply regression test was observed RED against the terminal-reply
+  implementation, then GREEN after the minimal change.
 - `cargo test -p librespot-connect`: 168 unit, 5 oracle, 1 doctest passed.
-- `cargo test -p librespot-core dealer::manager::tests`: 2 passed.
-- `git diff --check`: passed.
-- Existing warnings remain for two unread internal `SourceOwner` fields and a
-  future-incompatibility notice in `num-bigint-dig`; no gate failed.
+- The remaining full local gate and RPI build/deployment are not yet run for the
+  uncommitted admission-reply candidate.
 
-# Unresolved runtime claims
+# Effect inventory and unresolved work
 
-- Fixed-candidate normal command latency, rapid pause/play and seek behavior,
-  bounded idle Connect stability, and ordinary live-transition behavior are not
-  yet RPI-01 validated.
-- Preview is expected to fail cleanly at recipe resolution when Spotify sends
-  presets 1 or 17; no audible result should be claimed unless a supported
-  recipe is actually observed end-to-end.
+- User supplied 8 Volume, 9 EQ, and 11 Filter editor labels; preserved in
+  `docs/SPOTIFY_STYLE_CONTRACT.md`.
+- Volume-only Smooth crossfade is audible. Exact EQ/filter normalized-control to
+  physical DSP mappings remain unresolved; labels are not sufficient to claim
+  support or silently approximate them.
+- Runtime validation must determine whether immediate success makes the Preview
+  bar animate and removes the connection prompt. Do not claim either from unit
+  tests.
 
-NEXT ACTION: build and deploy the exact fixed commit on RPI-01, then validate
-ordinary controls, idle Connect stability, and live transitions before pressing
-Preview once.
+NEXT ACTION: finish the local gate, commit the admission-reply candidate, build
+it on RPI-01 without polling, deploy the exact binary, then ask for one Preview
+press and correlate UI behavior with dealer and lifecycle logs.
