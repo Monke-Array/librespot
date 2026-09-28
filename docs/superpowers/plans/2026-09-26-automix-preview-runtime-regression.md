@@ -10,6 +10,13 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-21-spotify-automix-preview.md`
 
+> **Runtime amendment (2026-09-28):** RPI-01 proved that the terminal-reply
+> contract is incompatible with Spotify's roughly three-second dealer request
+> lifetime. A playable Preview now replies success after admission and player
+> command enqueue, while terminal playback outcomes remain internal and
+> token-checked. This supersedes terminal-reply and pending-waiter requirements
+> below; those sections remain as the historical stabilization plan.
+
 ## Global Constraints
 
 - Preserve the preview subsystem and all token, stale-work, queue-isolation, and deterministic-renderer invariants.

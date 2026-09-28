@@ -379,6 +379,18 @@ impl PreviewCoordinator {
         self.active.as_ref()
     }
 
+    pub(crate) fn acknowledge_admission(&mut self, token: &PreviewToken) -> bool {
+        let Some(active) = self
+            .active
+            .as_mut()
+            .filter(|active| active.token() == token)
+        else {
+            return false;
+        };
+        drain_waiters(std::mem::take(&mut active.waiters), &Reply::Success);
+        true
+    }
+
     pub(crate) fn finish(&mut self, token: &PreviewToken, reply: Reply) -> bool {
         if self.active.as_ref().map(ActivePreviewSession::token) != Some(token) {
             return false;

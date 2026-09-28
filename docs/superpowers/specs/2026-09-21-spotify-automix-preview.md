@@ -62,8 +62,8 @@ The implementation MUST preserve all of these invariants:
 
 1. Connect owns the normal context, current row, next row, queue, play request,
    and queue advancement.
-2. A preview owns only temporary A/B sources, its renderer instance state, its
-   reply waiters, and its preview generation.
+2. A preview owns only temporary A/B sources, its renderer instance state, and
+   its preview generation. Dealer reply ownership ends at admission.
 3. Preview resolution MUST NOT call the ordinary live transition candidate
    resolver. In particular, preview cannot become a
    `SpotifyTransitionCandidate` accepted for a live edge.
@@ -206,16 +206,17 @@ fields.
 ### 7.2 Active SPIRC session
 
 SPIRC stores one `PreviewSession` containing the token, request fingerprint,
-sanitized A/B and recipe provenance, lifecycle state, and every pending dealer
-reply sender for that request.
+sanitized A/B and recipe provenance, and lifecycle state. It does not retain a
+dealer reply sender for the duration of playback.
 
 When a signal arrives:
 
-- no active preview: allocate a new generation and start it;
-- same session and identical validated fingerprint: attach its reply sender to
-  the existing session without restarting audio;
-- different fingerprint: fail all old pending replies, cancel the old token,
-  allocate a newer generation, and start the replacement;
+- no active preview: allocate a new generation, enqueue player ownership and
+  start commands, then acknowledge admission;
+- same session and identical validated fingerprint: acknowledge it without
+  restarting audio;
+- different fingerprint: cancel the old token, allocate a newer generation,
+  enqueue the replacement, then acknowledge admission;
 - stale session: reject without playback work.
 
 The fingerprint is over a canonical representation of every validated preview
@@ -226,24 +227,27 @@ recipe, or optional presence replaces the generation.
 
 ## 8. Dealer reply ownership
 
-Starting a playable preview transfers the signal's reply sender into the active
-preview session. The normal dealer-command handler does not immediately reply.
-The SPIRC event loop remains non-blocking while replies are pending.
+Runtime evidence on RPI-01 supersedes the original terminal-reply contract.
+Spotify closes the dealer websocket about three seconds after an admitted
+request remains unanswered, while a valid Preview takes roughly twelve seconds
+to complete. This freezes the editor progress display, prompts the user to
+reconnect to the speaker, and causes duplicate signal delivery.
 
-Every sender is resolved exactly once:
+Every signal sender is therefore resolved exactly once during request handling:
 
-- successful preview completion: success;
-- intentional `NONE`: immediate success;
-- malformed or unsupported request: immediate failure;
-- replacement by different preview: failure;
-- source/load/decoder/render failure: failure;
-- normal-command preemption: failure;
-- session replacement or shutdown: failure.
+- playable request: success after validation, admission, and player authority
+  plus start commands have been enqueued;
+- identical active request: immediate success without restarting audio;
+- intentional `NONE`: success with no player work;
+- malformed, unsupported, stale, or non-renderable request: failure before
+  player ownership;
+- generation exhaustion or admission failure: failure.
 
-Dropping SPIRC or losing the dealer still closes senders through existing
-channel semantics; the implementation additionally drains active waiters during
-explicit lifecycle teardown. No request can remain intentionally pending after
-its preview session reaches a terminal state.
+Success means that the Preview was accepted, not that asynchronous playback
+completed. Source, decoder, renderer, cancellation, restoration, and completion
+outcomes remain token-checked and observable internally, but they never attempt
+a second dealer reply. No playable signal request remains pending for the audio
+lifetime.
 
 ## 9. Player ownership model
 
@@ -330,7 +334,7 @@ change source ownership.
 
 Preemption occurs at both layers:
 
-- SPIRC retires the active preview token and resolves dealer waiters;
+- SPIRC retires the active preview token;
 - Player rejects or cancels work whose token is no longer current before
   running the normal command.
 
@@ -389,10 +393,11 @@ Implementation follows red/green tests and must cover at least:
    B=`start_b`, and a matching 3000 ms post-roll, while other windows reject;
 9. absolute-start and explicit-stop requests reject;
 10. identical duplicate attaches without a new generation or audio restart;
-11. materially different request replaces the generation and resolves old
-    waiters;
+11. materially different request replaces the generation without a second
+    reply to the already-acknowledged old request;
 12. stale loader, renderer, cancellation, and completion tokens have no effect;
-13. normal playback commands preempt and resolve all waiters;
+13. normal playback commands preempt immediately without sending a second
+    Preview reply;
 14. source load/decoder/PCM/render failure restores or yields to normal state;
 15. preview completion emits no normal promotion, preview `TrackChanged`, or
     `EndOfTrack`;
@@ -409,7 +414,7 @@ Expected production changes are narrowly scoped to:
 - `protocol/proto/automix_preview.proto` and protocol build inputs;
 - `core/src/dealer/protocol/request.rs` for typed signal ingress;
 - a focused Connect preview decode/resolution module;
-- `connect/src/spirc.rs` for preview coordination, reply waiters, and event
+- `connect/src/spirc.rs` for preview coordination, admission replies, and event
   handling;
 - `playback/src/player.rs` for temporary preview ownership and lifecycle;
 - minimal reusable helper changes in `playback/src/secondary.rs` only if required

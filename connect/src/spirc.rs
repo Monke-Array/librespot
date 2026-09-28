@@ -1852,6 +1852,11 @@ impl SpircTask {
                     PreviewLogEvent::Attached,
                 )
             );
+            let acknowledged = self
+                .preview_ownership
+                .coordinator
+                .acknowledge_admission(&token);
+            debug_assert!(acknowledged);
             return Ok(Some(token));
         }
 
@@ -1902,6 +1907,11 @@ impl SpircTask {
             PreviewCancelReason::Replaced,
         );
         self.player.start_preview(request);
+        let acknowledged = self
+            .preview_ownership
+            .coordinator
+            .acknowledge_admission(&token);
+        debug_assert!(acknowledged);
         Ok(Some(token))
     }
 
@@ -3768,7 +3778,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preview_signal_is_pending_until_matching_terminal_event() {
+    async fn preview_signal_replies_success_on_admission_before_terminal_event() {
         let mut task = queue_command_task();
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let token = task
@@ -3776,13 +3786,16 @@ mod tests {
             .expect("valid preview should be admitted")
             .expect("playable preview should return its token");
 
-        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        assert!(matches!(receiver.try_recv(), Ok(Reply::Success)));
         task.handle_player_event(PlayerEvent::PreviewCompleted {
             token,
             restore: librespot_playback::PreviewRestoreOutcome::Restored,
         })
         .unwrap();
-        assert!(matches!(receiver.try_recv(), Ok(Reply::Success)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
     }
 
     #[tokio::test]
@@ -3805,16 +3818,10 @@ mod tests {
                 .active()
                 .unwrap()
                 .waiter_count(),
-            2
+            0
         );
-        assert!(matches!(
-            first_receiver.try_recv(),
-            Err(TryRecvError::Empty)
-        ));
-        assert!(matches!(
-            duplicate_receiver.try_recv(),
-            Err(TryRecvError::Empty)
-        ));
+        assert!(matches!(first_receiver.try_recv(), Ok(Reply::Success)));
+        assert!(matches!(duplicate_receiver.try_recv(), Ok(Reply::Success)));
 
         let (replacement_sender, mut replacement_receiver) = mpsc::unbounded_channel();
         let replacement = task
@@ -3825,41 +3832,39 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(replacement, first);
-        assert!(matches!(first_receiver.try_recv(), Ok(Reply::Failure)));
-        assert!(matches!(duplicate_receiver.try_recv(), Ok(Reply::Failure)));
+        assert!(matches!(
+            first_receiver.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            duplicate_receiver.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
         assert!(matches!(
             replacement_receiver.try_recv(),
-            Err(TryRecvError::Empty)
+            Ok(Reply::Success)
         ));
     }
 
     #[tokio::test]
-    async fn excess_identical_preview_fails_without_replacing_active_preview() {
+    async fn repeated_identical_preview_acknowledges_without_accumulating_responders() {
         let mut task = queue_command_task();
-        let (first_sender, first_receiver) = mpsc::unbounded_channel();
+        let (first_sender, mut first_receiver) = mpsc::unbounded_channel();
         let first = task
             .handle_preview_signal(valid_preview_signal(), first_sender)
             .unwrap()
             .unwrap();
-        let mut retained_receivers = vec![first_receiver];
+        assert!(matches!(first_receiver.try_recv(), Ok(Reply::Success)));
 
-        for _ in 1..8 {
-            let (sender, receiver) = mpsc::unbounded_channel();
+        for _ in 0..16 {
+            let (sender, mut receiver) = mpsc::unbounded_channel();
             assert_eq!(
                 task.handle_preview_signal(valid_preview_signal(), sender)
                     .unwrap(),
                 Some(first.clone())
             );
-            retained_receivers.push(receiver);
+            assert!(matches!(receiver.try_recv(), Ok(Reply::Success)));
         }
-
-        let (overflow_sender, mut overflow_receiver) = mpsc::unbounded_channel();
-        assert!(
-            task.handle_preview_signal(valid_preview_signal(), overflow_sender)
-                .unwrap()
-                .is_none()
-        );
-        assert!(matches!(overflow_receiver.try_recv(), Ok(Reply::Failure)));
         assert_eq!(
             task.preview_ownership.coordinator.active().unwrap().token(),
             &first
@@ -3870,11 +3875,8 @@ mod tests {
                 .active()
                 .unwrap()
                 .waiter_count(),
-            8
+            0
         );
-        for receiver in &mut retained_receivers {
-            assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
-        }
     }
 
     #[tokio::test]
@@ -3897,10 +3899,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(bad_receiver.try_recv(), Ok(Reply::Failure)));
-        assert!(matches!(
-            active_receiver.try_recv(),
-            Err(TryRecvError::Empty)
-        ));
+        assert!(matches!(active_receiver.try_recv(), Ok(Reply::Success)));
         assert_eq!(
             task.preview_ownership.coordinator.active().unwrap().token(),
             &active
@@ -3923,10 +3922,7 @@ mod tests {
 
         assert!(none.is_none());
         assert!(matches!(none_receiver.try_recv(), Ok(Reply::Success)));
-        assert!(matches!(
-            active_receiver.try_recv(),
-            Err(TryRecvError::Empty)
-        ));
+        assert!(matches!(active_receiver.try_recv(), Ok(Reply::Success)));
         assert_eq!(
             task.preview_ownership.coordinator.active().unwrap().token(),
             &active
@@ -3946,7 +3942,8 @@ mod tests {
             .handle_preview_signal(valid_preview_signal_with_arm("replacement-arm"), new_sender)
             .unwrap()
             .unwrap();
-        assert!(matches!(old_receiver.try_recv(), Ok(Reply::Failure)));
+        assert!(matches!(old_receiver.try_recv(), Ok(Reply::Success)));
+        assert!(matches!(new_receiver.try_recv(), Ok(Reply::Success)));
         let before = (
             task.connect_state.current_track(|track| track.uri.clone()),
             task.connect_state
@@ -3966,7 +3963,10 @@ mod tests {
             task.preview_ownership.coordinator.active().unwrap().token(),
             &new
         );
-        assert!(matches!(new_receiver.try_recv(), Err(TryRecvError::Empty)));
+        assert!(matches!(
+            new_receiver.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
         assert_eq!(
             before,
             (
@@ -3981,15 +3981,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn normal_command_preempts_preview_and_resolves_waiter() {
+    async fn normal_command_preempts_preview_without_a_second_dealer_reply() {
         let mut task = queue_command_task();
         let (sender, mut receiver) = mpsc::unbounded_channel();
         task.handle_preview_signal(valid_preview_signal(), sender)
             .unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(Reply::Success)));
 
         let _ = task.handle_command(SpircCommand::Pause).await;
 
-        assert!(matches!(receiver.try_recv(), Ok(Reply::Failure)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
         assert!(task.preview_ownership.coordinator.active().is_none());
     }
 
@@ -4019,6 +4023,7 @@ mod tests {
             .handle_preview_signal(valid_preview_signal(), sender)
             .expect("valid preview should be admitted")
             .expect("playable preview should return its token");
+        assert!(matches!(receiver.try_recv(), Ok(Reply::Success)));
         let session_id = task.session.session_id();
 
         let advance = task
@@ -4027,12 +4032,15 @@ mod tests {
             .expect("normal ownership generation should advance");
 
         assert_eq!(advance.retired, Some(token));
-        assert!(matches!(receiver.try_recv(), Ok(Reply::Failure)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
         assert!(task.preview_ownership.coordinator.active().is_none());
     }
 
     #[tokio::test]
-    async fn session_and_shutdown_authority_changes_drain_all_preview_waiters() {
+    async fn session_and_shutdown_authority_changes_do_not_send_second_preview_replies() {
         for reason in [
             PreviewCancelReason::SessionChanged,
             PreviewCancelReason::Shutdown,
@@ -4049,6 +4057,8 @@ mod tests {
                     .unwrap(),
                 Some(token.clone())
             );
+            assert!(matches!(first_receiver.try_recv(), Ok(Reply::Success)));
+            assert!(matches!(duplicate_receiver.try_recv(), Ok(Reply::Success)));
 
             let advance = task
                 .preview_ownership
@@ -4056,8 +4066,14 @@ mod tests {
                 .expect("authority invalidation should succeed");
 
             assert_eq!(advance.retired, Some(token));
-            assert!(matches!(first_receiver.try_recv(), Ok(Reply::Failure)));
-            assert!(matches!(duplicate_receiver.try_recv(), Ok(Reply::Failure)));
+            assert!(matches!(
+                first_receiver.try_recv(),
+                Err(TryRecvError::Disconnected)
+            ));
+            assert!(matches!(
+                duplicate_receiver.try_recv(),
+                Err(TryRecvError::Disconnected)
+            ));
             assert!(task.preview_ownership.coordinator.active().is_none());
         }
     }
