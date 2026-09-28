@@ -59,6 +59,9 @@ with EQ and filter set to `None` was audibly validated on RPI-01. The editor's
 `Center bass swap` selection was observed on the wire as EQ style 4 and remains
 unsupported by the current renderer.
 
+The transition-length selector offers exactly 2 bars, 4 bars, and 8 bars in the
+observed iOS editor.
+
 - Volume: Smooth crossfade; Overlap; Fade in fade out; Cut in fade out; Fade in
   cut out; Center cut; Crossfade; Fade in fast out.
 - EQ: Center bass swap; End bass swap; Start bass swap; 3-band fade; Quick bass
